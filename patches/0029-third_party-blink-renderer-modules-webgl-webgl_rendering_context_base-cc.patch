@@ -1,5 +1,5 @@
 diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-index 8a2decf999..7f4cd85a10 100644
+index 8a2decf9995fef868e2b6acd3f5d32a8fdef4fb0..43f93d8dec58dec74e93775d3fe72fb9bf09a262 100644
 --- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 +++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 @@ -27,6 +27,7 @@
@@ -10,7 +10,15 @@ index 8a2decf999..7f4cd85a10 100644
  #include <memory>
  #include <utility>
  
-@@ -207,6 +208,56 @@
+@@ -39,6 +40,7 @@
+ #include "base/metrics/histogram_macros.h"
+ #include "base/notimplemented.h"
+ #include "base/numerics/checked_math.h"
++#include "base/uxr_config.h"
+ #include "base/strings/stringprintf.h"
+ #include "base/synchronization/lock.h"
+ #include "base/task/single_thread_task_runner.h"
+@@ -207,6 +209,56 @@ unsigned WebGLRenderingContextBase::max_active_webgl_contexts_on_worker_ = 0;
  
  namespace {
  
@@ -67,7 +75,7 @@ index 8a2decf999..7f4cd85a10 100644
  enum class WebGLANGLEImplementation {
    // These values are persisted to logs. Entries should not be renumbered and
    // numeric values should never be reused.
-@@ -4061,27 +4112,40 @@
+@@ -4061,27 +4113,40 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
      case GL_LINE_WIDTH:
        return GetFloatParameter(script_state, pname);
      case GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS:
@@ -120,7 +128,7 @@ index 8a2decf999..7f4cd85a10 100644
      case GL_PACK_ALIGNMENT:
        return GetIntParameter(script_state, pname);
      case GL_POLYGON_OFFSET_FACTOR:
-@@ -4115,9 +4179,7 @@
+@@ -4115,9 +4180,7 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
      case GL_SHADING_LANGUAGE_VERSION:
        return WebGLAny(
            script_state,
@@ -131,7 +139,7 @@ index 8a2decf999..7f4cd85a10 100644
      case GL_STENCIL_BACK_FAIL:
        return GetUnsignedIntParameter(script_state, pname);
      case GL_STENCIL_BACK_FUNC:
-@@ -4175,10 +4237,8 @@
+@@ -4175,10 +4238,8 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
      case GL_VENDOR:
        return WebGLAny(script_state, String("WebKit"));
      case GL_VERSION:
@@ -144,7 +152,7 @@ index 8a2decf999..7f4cd85a10 100644
      case GL_VIEWPORT:
        return GetWebGLIntArrayParameter(script_state, pname);
      case GL_FRAGMENT_SHADER_DERIVATIVE_HINT_OES:  // OES_standard_derivatives
-@@ -4191,10 +4251,8 @@
+@@ -4191,10 +4252,8 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
        return ScriptValue::CreateNull(script_state->GetIsolate());
      case WebGLDebugRendererInfo::kUnmaskedRendererWebgl:
        if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
@@ -156,7 +164,7 @@ index 8a2decf999..7f4cd85a10 100644
        }
        SynthesizeGLError(
            GL_INVALID_ENUM, "getParameter",
-@@ -4202,10 +4260,8 @@
+@@ -4202,10 +4261,8 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
        return ScriptValue::CreateNull(script_state->GetIsolate());
      case WebGLDebugRendererInfo::kUnmaskedVendorWebgl:
        if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {

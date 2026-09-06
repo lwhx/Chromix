@@ -1811,6 +1811,22 @@ Normalize-RestoredSource `
   -RelativePath "third_party\blink\renderer\modules\webgl\webgl_rendering_context_base.cc" `
   -Transform {
     param($content)
+    if ($content.Contains('base::UxrConfig::GetInstance()') -and
+        -not $content.Contains('#include "base/uxr_config.h"')) {
+      $anchor = '#include "base/numerics/checked_math.h"'
+      if (-not $content.Contains($anchor)) {
+        throw "resume source UXR config include anchor is missing: third_party\blink\renderer\modules\webgl\webgl_rendering_context_base.cc"
+      }
+      $content = $content.Replace(
+          $anchor, $anchor + "`n" + '#include "base/uxr_config.h"')
+    }
+    return $content
+  }
+
+Normalize-RestoredSource `
+  -RelativePath "third_party\blink\renderer\modules\webgl\webgl_rendering_context_base.cc" `
+  -Transform {
+    param($content)
     $content = [regex]::Replace(
         $content,
         '(?ms)String\(\s*(?:"ANGLE \(NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0\s*"\s*"ps_5_0, D3D11\)"|"ANGLE \(NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11\)")\s*\)',

@@ -13,6 +13,11 @@ TIMEZONE_PATCH = (
     / "patches"
     / "0019-third_party-blink-renderer-core-timezone-timezone_controller-cc.patch"
 )
+WEBGL1_PERSONA_PATCH = (
+    REPO
+    / "patches"
+    / "0029-third_party-blink-renderer-modules-webgl-webgl_rendering_context_base-cc.patch"
+)
 CANVAS2D_BRIDGE_PATCH = (
     REPO
     / "patches"
@@ -255,6 +260,8 @@ class RestoredSourceUpdateRegressionTest(unittest.TestCase):
         self.assertIn("uxr-webgl-vendor", update_source)
         self.assertIn("WebGLPersonaRenderer", update_source)
         self.assertIn("WebGLPersonaVendor", update_source)
+        self.assertIn("base::UxrConfig::GetInstance()", update_source)
+        self.assertIn('#include "base/uxr_config.h"', update_source)
         self.assertIn("ClampWebGLPersonaLimit", update_source)
         self.assertIn("ClampWebGL2PersonaLimit", update_source)
         self.assertIn("WebGL 2.0 (OpenGL ES 3.0 Chromium)", update_source)
@@ -321,6 +328,19 @@ class RestoredSourceUpdateRegressionTest(unittest.TestCase):
         self.assertIn("BUILDFLAG\\(IS_ANDROID\\)", update_source)
         self.assertIn("$($match.Groups[1].Value)", update_source)
         self.assertIn("-PreferCurrentMarker", update_source)
+
+    def test_webgl1_persona_includes_uxr_config(self):
+        patch = WEBGL1_PERSONA_PATCH.read_text(encoding="utf-8")
+        self.assertIn('+#include "base/uxr_config.h"', patch)
+        self.assertIn("base::UxrConfig::GetInstance()", patch)
+
+        update_source = RESTORED_SOURCE_UPDATE.read_text(encoding="utf-8")
+        self.assertIn("$content.Contains('base::UxrConfig::GetInstance()')", update_source)
+        self.assertIn("-not $content.Contains('#include \"base/uxr_config.h\"')", update_source)
+        self.assertIn(
+            "$anchor, $anchor + \"`n\" + '#include \"base/uxr_config.h\"'",
+            update_source,
+        )
 
     def test_canvas2d_bridge_patch_closes_readback_scope(self):
         patch = CANVAS2D_BRIDGE_PATCH.read_text(encoding="utf-8")
