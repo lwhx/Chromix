@@ -37,8 +37,13 @@ const ctx = await launchPersistentContext({ userDataDir: './chrome-profile', hea
 ## Install
 
 ```bash
-npm install chromix playwright-core
+npm install ./sdk/node playwright-core
 ```
+
+The unscoped npm name `chromix` belongs to an unrelated project, so this SDK is
+currently installed from a Chromix checkout rather than the public npm
+registry. After local installation, the package import name is still
+`chromix`.
 
 Requires `playwright-core` (or `playwright`) as a peer — the SDK itself has zero
 dependencies. On first launch the stealth Chromium binary is downloaded from this
@@ -91,3 +96,7 @@ npx chromix install       # pre-download the binary
 npx chromix info          # binary / cache info
 npx chromix clear-cache
 ```
+
+## License
+
+The Node SDK is available under the BSD 3-Clause License. See [`LICENSE`](LICENSE).

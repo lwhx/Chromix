@@ -10,6 +10,12 @@ FONTS_SRC="${CHROMIX_FONTS_DIR:-$REPO/assets/fonts}"
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/locales" "$STAGE/fonts" "$DEST"
+cp -a "$REPO/LICENSE" "$STAGE/LICENSE.chromix"
+if [ ! -f "$OUT/../../LICENSE" ]; then
+  echo "Chromium license is missing: $OUT/../../LICENSE" >&2
+  exit 1
+fi
+cp -a "$OUT/../../LICENSE" "$STAGE/LICENSE.chromium"
 
 copy_required() {
   local relative="$1"

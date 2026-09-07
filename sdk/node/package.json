@@ -5,10 +5,12 @@
   "type": "module",
   "main": "index.js",
   "bin": { "chromix": "cli.js" },
-  "files": ["index.js", "_binary.js", "_fonts.js", "cli.js", "README.md"],
+  "files": ["index.js", "_binary.js", "_fonts.js", "cli.js", "README.md", "LICENSE"],
   "engines": { "node": ">=18" },
   "keywords": ["chromium", "stealth", "browser", "automation", "anti-bot", "cloakbrowser"],
   "license": "BSD-3-Clause",
-  "repository": { "type": "git", "url": "https://github.com/xiaozhou26/Chromix.git" },
-  "homepage": "https://github.com/xiaozhou26/Chromix"
+  "author": "xiaozhou26",
+  "repository": { "type": "git", "url": "git+https://github.com/xiaozhou26/Chromix.git" },
+  "homepage": "https://github.com/xiaozhou26/Chromix#readme",
+  "bugs": { "url": "https://github.com/xiaozhou26/Chromix/issues" }
 }

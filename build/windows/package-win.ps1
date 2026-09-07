@@ -8,8 +8,15 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $Bundle = Join-Path $Dest "chromix"
+$Repo = (Resolve-Path "$PSScriptRoot\..\..").Path
 Remove-Item -Recurse -Force $Bundle -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Bundle | Out-Null
+Copy-Item (Join-Path $Repo "LICENSE") (Join-Path $Bundle "LICENSE.chromix")
+$chromiumLicense = Join-Path (Split-Path (Split-Path $Out -Parent) -Parent) "LICENSE"
+if (-not (Test-Path $chromiumLicense)) {
+  throw "Chromium license is missing: $chromiumLicense"
+}
+Copy-Item $chromiumLicense (Join-Path $Bundle "LICENSE.chromium")
 
 $required = @(
   "chrome.exe", "chrome.dll", "chrome_elf.dll",

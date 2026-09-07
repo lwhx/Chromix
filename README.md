@@ -170,6 +170,18 @@ npx chromix clear-cache
 See [`sdk/node/README.md`](sdk/node/README.md) for all options and intentional
 compatibility differences.
 
+### Package publication status
+
+Both SDK implementations are present in this repository and can be installed
+from the checkout paths shown above.
+
+- The Python import package is `chromix`. It is not currently published on
+  PyPI, so `pip install chromix` is not yet the supported installation path.
+- The unscoped npm name `chromix` belongs to an unrelated project published in
+  2017. This repository's Node SDK is not currently published to npm; do not
+  use `npm install chromix` expecting this project. Install `./sdk/node` from a
+  checkout until an official scoped package is published.
+
 ## Use a local browser binary
 
 Set `CLOAKBROWSER_BINARY_PATH` to bypass release download and run a local
@@ -292,6 +304,14 @@ git diff --check
 A full source preparation and compile is performed by the staged Windows GitHub
 Actions workflow because a Chromium build exceeds a single hosted runner's
 normal time budget.
+
+## License
+
+Chromix's original source code, patch integration, and SDKs are released under
+the [BSD 3-Clause License](LICENSE). Bundled Chromium and third-party components
+retain their own upstream licenses and notices; the BSD license does not replace
+those terms. Font assets likewise retain the terms documented by their original
+providers—see [`assets/fonts/SOURCE.md`](assets/fonts/SOURCE.md).
 
 ## Project status
 

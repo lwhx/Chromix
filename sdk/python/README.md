@@ -25,6 +25,9 @@ browser.close()
 pip install ./sdk/python playwright
 ```
 
+The Python package is not currently published on PyPI; install it from a
+Chromix checkout as shown above. The import name is `chromix`.
+
 On first launch the stealth Chromium binary is downloaded from this repo's GitHub
 Release, SHA256-verified, and cached under `~/.cache/chromix`. Point
 `CLOAKBROWSER_BINARY_PATH` at a local build (e.g. your own `chrome.exe`) to skip
@@ -94,3 +97,8 @@ python -m chromix clear-cache
 3. No `cloakbrowser/puppeteer` subpath — use the Playwright surface.
 4. Widevine is enabled automatically when a CDM is present (installed Chrome,
    `CLOAKBROWSER_WIDEVINE_CDM`, or `python -m chromix widevine`).
+
+## License
+
+The Python SDK is available under the BSD 3-Clause License. See
+[`LICENSE`](LICENSE).
