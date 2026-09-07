@@ -5,7 +5,7 @@
 // existing CloakBrowser scripts run on Chromix by changing only the import:
 //
 //   - import { launch } from "cloakbrowser";
-//   + import { launch } from "@xiaozhou26/chromix";
+//   + import { launch } from "@xiaoxiaofeihh/chromix";
 //
 // Same function names, same option names (camelCase, contextOptions/
 // launchOptions nesting), same return types (Playwright Browser / BrowserContext

@@ -140,13 +140,13 @@ The Node wrapper uses `playwright-core` and exposes the matching camelCase API.
 Install from npm:
 
 ```bash
-npm install @xiaozhou26/chromix playwright-core
+npm install @xiaoxiaofeihh/chromix playwright-core
 ```
 
 Launch Chromix:
 
 ```javascript
-import { launch } from "@xiaozhou26/chromix";
+import { launch } from "@xiaoxiaofeihh/chromix";
 
 const browser = await launch({
   proxy: "http://user:pass@proxy.example:8080",
@@ -175,7 +175,7 @@ compatibility differences.
 ### Package publication
 
 - The Python distribution and import package are both named [`chromix`](https://pypi.org/project/chromix/).
-- The Node SDK is [`@xiaozhou26/chromix`](https://www.npmjs.com/package/@xiaozhou26/chromix). The unscoped npm name `chromix` belongs to an unrelated project; always install and import the scoped package.
+- The Node SDK is [`@xiaoxiaofeihh/chromix`](https://www.npmjs.com/package/@xiaoxiaofeihh/chromix). The unscoped npm name `chromix` belongs to an unrelated project; always install and import the scoped package.
 
 ## Use a local browser binary
 

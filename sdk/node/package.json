@@ -1,5 +1,5 @@
 {
-  "name": "@xiaozhou26/chromix",
+  "name": "@xiaoxiaofeihh/chromix",
   "version": "0.1.0",
   "description": "Drive the Chromix stealth Chromium engine with a CloakBrowser-compatible API.",
   "type": "module",

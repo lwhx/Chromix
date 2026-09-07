@@ -1,4 +1,4 @@
-# @xiaozhou26/chromix
+# @xiaoxiaofeihh/chromix
 
 Drive the Chromix Chromium engine with a **CloakBrowser-compatible API**.
 Function names, option names (camelCase), and return types (Playwright
@@ -8,11 +8,11 @@ CloakBrowser scripts can migrate by changing the import:
 
 ```diff
 - import { launch } from 'cloakbrowser';
-+ import { launch } from '@xiaozhou26/chromix';
++ import { launch } from '@xiaoxiaofeihh/chromix';
 ```
 
 ```javascript
-import { launch } from '@xiaozhou26/chromix';
+import { launch } from '@xiaoxiaofeihh/chromix';
 
 const browser = await launch({
   proxy: 'http://user:pass@residential-proxy:port',
@@ -31,7 +31,7 @@ Convenience wrappers:
 import {
   launchContext,
   launchPersistentContext,
-} from '@xiaozhou26/chromix';
+} from '@xiaoxiaofeihh/chromix';
 
 const context = await launchContext({
   userAgent: 'Custom UA',
@@ -46,7 +46,7 @@ const persistentContext = await launchPersistentContext({
 ## Install
 
 ```bash
-npm install @xiaozhou26/chromix playwright-core
+npm install @xiaoxiaofeihh/chromix playwright-core
 ```
 
 The unscoped npm name `chromix` belongs to an unrelated project. This SDK is
@@ -112,7 +112,7 @@ npx chromix clear-cache
 Run the registry package without installing it first:
 
 ```bash
-npx @xiaozhou26/chromix --version
+npx @xiaoxiaofeihh/chromix --version
 ```
 
 ## Versioning
