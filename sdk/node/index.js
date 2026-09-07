@@ -24,7 +24,7 @@ import {
 } from "./_binary.js";
 import { fontLaunchEnv } from "./_fonts.js";
 
-export const CHROMIUM_VERSION = "151";
+export const CHROMIUM_VERSION = "152";
 export const DEFAULT_VIEWPORT = { width: 1920, height: 947 };
 
 // ---------------------------------------------------------------------------

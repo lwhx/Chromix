@@ -8,6 +8,10 @@ CI_STAGE = REPO / "build" / "windows" / "ci-stage.ps1"
 WORKFLOW = REPO / ".github" / "workflows" / "build-win-x64-github.yml"
 RESTORED_SOURCE_UPDATE = REPO / "build" / "windows" / "update-restored-source.ps1"
 PREPARE_UNGOOGLED = REPO / "build" / "windows" / "prepare-ungoogled.ps1"
+README = REPO / "README.md"
+PYTHON_BINARY = REPO / "sdk" / "python" / "chromix" / "_binary.py"
+NODE_BINARY = REPO / "sdk" / "node" / "_binary.js"
+NODE_INDEX = REPO / "sdk" / "node" / "index.js"
 TIMEZONE_PATCH = (
     REPO
     / "patches"
@@ -205,6 +209,23 @@ class ResumeWorkflowRegressionTest(unittest.TestCase):
             self.source,
         )
         self.assertNotIn("download-stage-artifacts.ps1", self.source)
+
+
+class ReleaseChannelRegressionTest(unittest.TestCase):
+    def test_sdk_channels_match_documented_verified_releases(self):
+        readme = README.read_text(encoding="utf-8")
+        python_binary = PYTHON_BINARY.read_text(encoding="utf-8")
+        node_binary = NODE_BINARY.read_text(encoding="utf-8")
+        node_index = NODE_INDEX.read_text(encoding="utf-8")
+        channels = {
+            "stable": "v151.0.7922.173",
+            "latest": "v152.0.7977.75",
+        }
+        for channel, tag in channels.items():
+            self.assertIn(f'"{channel}": {{"tag": "{tag}"}}', python_binary)
+            self.assertIn(f'{channel}: {{ tag: "{tag}" }}', node_binary)
+            self.assertIn(f"releases/tag/{tag}", readme)
+        self.assertIn('export const CHROMIUM_VERSION = "152";', node_index)
 
 
 class RestoredSourceUpdateRegressionTest(unittest.TestCase):
