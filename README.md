@@ -314,3 +314,7 @@ Chromix is under active development. Chromium rebases can require individual
 patch updates, and binaries are published only after the corresponding staged
 Windows build and package checks succeed. Use a fixed release tag and verify its
 checksum for reproducible automation.
+
+## community
+
+[LINUX DO](https://linux.do)
