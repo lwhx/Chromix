@@ -34,6 +34,9 @@ class LicenseMetadataRegressionTest(unittest.TestCase):
 
     def test_node_package_includes_license_and_repository_metadata(self):
         package = json.loads(NODE_PACKAGE.read_text(encoding="utf-8"))
+        self.assertEqual(package["name"], "@xiaozhou26/chromix")
+        self.assertEqual(package["version"], "0.1.0")
+        self.assertEqual(package["publishConfig"]["access"], "public")
         self.assertEqual(package["license"], "BSD-3-Clause")
         self.assertIn("LICENSE", package["files"])
         self.assertEqual(package["author"], "xiaozhou26")
@@ -57,9 +60,10 @@ class LicenseMetadataRegressionTest(unittest.TestCase):
         normalized_node_readme = " ".join(node_readme.split())
         self.assertIn("## License", readme)
         self.assertIn("BSD 3-Clause License", readme)
-        self.assertIn("not currently published on PyPI", normalized_readme)
-        self.assertIn("unrelated project published in", normalized_readme)
-        self.assertIn("not currently published on PyPI", normalized_python_readme)
+        self.assertIn("pip install chromix playwright", normalized_readme)
+        self.assertIn("npm install @xiaozhou26/chromix playwright-core", normalized_readme)
+        self.assertIn("pip install chromix playwright", normalized_python_readme)
+        self.assertIn("@xiaozhou26/chromix", normalized_node_readme)
         self.assertIn("unrelated project", normalized_node_readme)
         self.assertNotIn("npm install chromix playwright-core", node_readme)
 

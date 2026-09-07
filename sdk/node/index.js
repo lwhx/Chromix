@@ -5,7 +5,7 @@
 // existing CloakBrowser scripts run on Chromix by changing only the import:
 //
 //   - import { launch } from "cloakbrowser";
-//   + import { launch } from "chromix";
+//   + import { launch } from "@xiaozhou26/chromix";
 //
 // Same function names, same option names (camelCase, contextOptions/
 // launchOptions nesting), same return types (Playwright Browser / BrowserContext
@@ -20,11 +20,13 @@ import { randomBytes } from "node:crypto";
 import { existsSync, rmSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import {
-  CHANNELS, CACHE, hostFor, resolvePlatform, ensureNative,
+  VERSION as BROWSER_VERSION, CHANNELS, CACHE, hostFor, resolvePlatform, ensureNative,
 } from "./_binary.js";
 import { fontLaunchEnv } from "./_fonts.js";
 
+export const VERSION = "0.1.0";
 export const CHROMIUM_VERSION = "152";
+export const CHROMIUM_BUILD_VERSION = BROWSER_VERSION;
 export const DEFAULT_VIEWPORT = { width: 1920, height: 947 };
 
 // ---------------------------------------------------------------------------

@@ -22,11 +22,15 @@ browser.close()
 ## Install
 
 ```bash
-pip install ./sdk/python playwright
+pip install chromix playwright
 ```
 
-The Python package is not currently published on PyPI; install it from a
-Chromix checkout as shown above. The import name is `chromix`.
+The distribution and import package are both named `chromix`. To install the
+SDK directly from a repository checkout instead, run:
+
+```bash
+pip install ./sdk/python playwright
+```
 
 On first launch the stealth Chromium binary is downloaded from this repo's GitHub
 Release, SHA256-verified, and cached under `~/.cache/chromix`. Point

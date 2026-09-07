@@ -1,18 +1,18 @@
-# chromix (Node)
+# @xiaozhou26/chromix
 
-Drive the Chromix stealth Chromium engine with a **CloakBrowser-compatible API** —
-function names, option names (camelCase), and return types (Playwright
-`Browser` / `BrowserContext` via `playwright-core`) all match the
+Drive the Chromix Chromium engine with a **CloakBrowser-compatible API**.
+Function names, option names (camelCase), and return types (Playwright
+`Browser` / `BrowserContext` via `playwright-core`) match the
 [`cloakbrowser`](https://github.com/CloakHQ/CloakBrowser) wrapper, so existing
-CloakBrowser scripts run on Chromix by changing only the import:
+CloakBrowser scripts can migrate by changing the import:
 
 ```diff
 - import { launch } from 'cloakbrowser';
-+ import { launch } from 'chromix';
++ import { launch } from '@xiaozhou26/chromix';
 ```
 
 ```javascript
-import { launch } from 'chromix';
+import { launch } from '@xiaozhou26/chromix';
 
 const browser = await launch({
   proxy: 'http://user:pass@residential-proxy:port',
@@ -28,47 +28,57 @@ await browser.close();
 Convenience wrappers:
 
 ```javascript
-import { launchContext, launchPersistentContext } from 'chromix';
+import {
+  launchContext,
+  launchPersistentContext,
+} from '@xiaozhou26/chromix';
 
-const context = await launchContext({ userAgent: 'Custom UA', viewport: { width: 1920, height: 1080 } });
-const ctx = await launchPersistentContext({ userDataDir: './chrome-profile', headless: false });
+const context = await launchContext({
+  userAgent: 'Custom UA',
+  viewport: { width: 1920, height: 1080 },
+});
+const persistentContext = await launchPersistentContext({
+  userDataDir: './chrome-profile',
+  headless: false,
+});
 ```
 
 ## Install
 
 ```bash
-npm install ./sdk/node playwright-core
+npm install @xiaozhou26/chromix playwright-core
 ```
 
-The unscoped npm name `chromix` belongs to an unrelated project, so this SDK is
-currently installed from a Chromix checkout rather than the public npm
-registry. After local installation, the package import name is still
-`chromix`.
+The unscoped npm name `chromix` belongs to an unrelated project. This SDK is
+published under the `@xiaozhou26` scope; use the full scoped name when
+installing or importing it.
 
-Requires `playwright-core` (or `playwright`) as a peer — the SDK itself has zero
-dependencies. On first launch the stealth Chromium binary is downloaded from this
-repo's GitHub Release, SHA256-verified, and cached under `~/.cache/chromix`.
-Point `CLOAKBROWSER_BINARY_PATH` at a local build to skip the download.
+The SDK has no production dependencies of its own and loads an installed
+`playwright-core` or `playwright` package at launch time. On first launch, the
+Chromix binary is downloaded from this repository's GitHub Release,
+SHA256-verified when the release manifest is available, and cached under
+`~/.cache/chromix`. Point `CLOAKBROWSER_BINARY_PATH` at a local build to skip
+the download.
 
 ## Options
 
-All CloakBrowser options work unchanged: `headless, proxy, args, stealthArgs,
-timezone, locale, geoip, humanize, humanPreset, humanConfig, userAgent, viewport,
-colorScheme, extensionPaths, browserVersion, releaseChannel, licenseKey,
-contextOptions, launchOptions, userDataDir` (+ `startMaximized`).
+CloakBrowser options work unchanged: `headless, proxy, args, stealthArgs,
+timezone, locale, geoip, humanize, humanPreset, humanConfig, userAgent,
+viewport, colorScheme, extensionPaths, browserVersion, releaseChannel,
+licenseKey, contextOptions, launchOptions, userDataDir` (+ `startMaximized`).
 
-Env vars: `CLOAKBROWSER_BINARY_PATH`, `CLOAKBROWSER_VERSION`,
+Environment variables: `CLOAKBROWSER_BINARY_PATH`, `CLOAKBROWSER_VERSION`,
 `CLOAKBROWSER_RELEASE_CHANNEL`, `CLOAKBROWSER_GEOIP_TIMEOUT_SECONDS`,
-`CLOAKBROWSER_WIDEVINE_CDM` / `CLOAKBROWSER_WIDEVINE=0` (DRM),
+`CLOAKBROWSER_WIDEVINE_CDM` / `CLOAKBROWSER_WIDEVINE=0` (DRM), and
 `CHROMIX_CACHE_DIR` / `CHROMIX_DOWNLOAD_HOST` (cache / release host override).
 
 ## Intentional differences from CloakBrowser
 
 1. `licenseKey` is accepted and ignored (one open tier).
 2. `geoip` queries ip-api.com instead of a local GeoLite2 database.
-3. No `cloakbrowser/puppeteer` subpath — use the Playwright surface.
+3. No `cloakbrowser/puppeteer` subpath is provided; use the Playwright surface.
 4. Widevine/DRM is enabled automatically when a CDM is present (installed
-   Chrome or `CLOAKBROWSER_WIDEVINE_CDM`); on Linux fetch one with
+   Chrome or `CLOAKBROWSER_WIDEVINE_CDM`); on Linux, fetch one with
    `python -m chromix widevine`.
 
 High-risk engine ports are available only through explicit `args`:
@@ -90,12 +100,26 @@ UDP unless the separate `allow-udp` flag is supplied.
 
 ## CLI
 
+After installation, the package provides the `chromix` executable:
+
 ```bash
 npx chromix --version
 npx chromix install       # pre-download the binary
 npx chromix info          # binary / cache info
 npx chromix clear-cache
 ```
+
+Run the registry package without installing it first:
+
+```bash
+npx @xiaozhou26/chromix --version
+```
+
+## Versioning
+
+The npm package follows SemVer independently of Chromium's four-part version.
+The bundled SDK currently targets Chromium source `152.0.7977.82`; the actual
+binary release selected by `stable` or `latest` is shown by `chromix info`.
 
 ## License
 

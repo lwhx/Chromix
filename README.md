@@ -78,12 +78,14 @@ needed:
 The Python wrapper returns Playwright `Browser` and `BrowserContext` objects and
 uses CloakBrowser-compatible function names and keyword arguments.
 
-Install from this checkout:
+Install from PyPI:
 
 ```bash
-python -m pip install ./sdk/python playwright
+python -m pip install chromix playwright
 python -m playwright install-deps
 ```
+
+To install the current checkout instead, replace `chromix` with `./sdk/python`.
 
 Launch Chromix:
 
@@ -135,16 +137,16 @@ environment variables.
 
 The Node wrapper uses `playwright-core` and exposes the matching camelCase API.
 
-Install from this checkout:
+Install from npm:
 
 ```bash
-npm install ./sdk/node playwright-core
+npm install @xiaozhou26/chromix playwright-core
 ```
 
 Launch Chromix:
 
 ```javascript
-import { launch } from "chromix";
+import { launch } from "@xiaozhou26/chromix";
 
 const browser = await launch({
   proxy: "http://user:pass@proxy.example:8080",
@@ -170,17 +172,10 @@ npx chromix clear-cache
 See [`sdk/node/README.md`](sdk/node/README.md) for all options and intentional
 compatibility differences.
 
-### Package publication status
+### Package publication
 
-Both SDK implementations are present in this repository and can be installed
-from the checkout paths shown above.
-
-- The Python import package is `chromix`. It is not currently published on
-  PyPI, so `pip install chromix` is not yet the supported installation path.
-- The unscoped npm name `chromix` belongs to an unrelated project published in
-  2017. This repository's Node SDK is not currently published to npm; do not
-  use `npm install chromix` expecting this project. Install `./sdk/node` from a
-  checkout until an official scoped package is published.
+- The Python distribution and import package are both named [`chromix`](https://pypi.org/project/chromix/).
+- The Node SDK is [`@xiaozhou26/chromix`](https://www.npmjs.com/package/@xiaozhou26/chromix). The unscoped npm name `chromix` belongs to an unrelated project; always install and import the scoped package.
 
 ## Use a local browser binary
 
