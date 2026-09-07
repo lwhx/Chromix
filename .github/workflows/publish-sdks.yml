@@ -1,0 +1,193 @@
+name: publish-sdks
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'sdk/python/**'
+      - 'sdk/node/**'
+      - '.github/workflows/publish-sdks.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-sdks
+  cancel-in-progress: false
+
+jobs:
+  python:
+    name: Python SDK
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: sdk/python/pyproject.toml
+
+      - name: Install build and test tools
+        run: python -m pip install --upgrade build pytest twine
+
+      - name: Verify Python package version
+        run: |
+          python - <<'PY'
+          import re
+          import tomllib
+          from pathlib import Path
+
+          root = Path('sdk/python')
+          project = tomllib.loads((root / 'pyproject.toml').read_text(encoding='utf-8'))['project']
+          init_text = (root / 'chromix/__init__.py').read_text(encoding='utf-8')
+          match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', init_text, re.MULTILINE)
+          if not match:
+              raise SystemExit('sdk/python/chromix/__init__.py has no __version__')
+          if project['name'] != 'chromix':
+              raise SystemExit(f"unexpected PyPI package name: {project['name']}")
+          if project['version'] != match.group(1):
+              raise SystemExit(
+                  f"Python version mismatch: pyproject={project['version']} module={match.group(1)}")
+          print(f"{project['name']} {project['version']}")
+          PY
+
+      - name: Test Python SDK
+        run: python -m pytest -q sdk/python/tests
+
+      - name: Build Python SDK
+        run: python -m build sdk/python --sdist --wheel --outdir dist/python
+
+      - name: Check Python distributions
+        run: python -m twine check dist/python/*
+
+      - name: Check PyPI version
+        id: pypi
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          project = tomllib.loads(Path('sdk/python/pyproject.toml').read_text(encoding='utf-8'))['project']
+          name = project['name']
+          version = project['version']
+          url = (
+              'https://pypi.org/pypi/'
+              f"{urllib.parse.quote(name, safe='')}/{urllib.parse.quote(version, safe='')}/json")
+          try:
+              with urllib.request.urlopen(url, timeout=30) as response:
+                  response.read(1)
+              published = True
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+              published = False
+
+          with Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as output:
+              output.write(f'name={name}\n')
+              output.write(f'version={version}\n')
+              output.write(f'published={str(published).lower()}\n')
+          print(f"PyPI {name} {version}: {'already published' if published else 'ready to publish'}")
+          PY
+
+      - name: Publish Python SDK to PyPI
+        if: steps.pypi.outputs.published != 'true'
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          test -n "$TWINE_PASSWORD"
+          python -m twine upload --non-interactive dist/python/*
+
+      - name: Upload Python distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-sdk-${{ steps.pypi.outputs.version }}
+          path: dist/python/*
+          if-no-files-found: error
+          retention-days: 14
+
+  node:
+    name: Node SDK
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify Node package version
+        run: |
+          node --input-type=module - <<'JS'
+          import { readFile } from 'node:fs/promises';
+          import { VERSION } from './sdk/node/index.js';
+
+          const pkg = JSON.parse(await readFile('sdk/node/package.json', 'utf8'));
+          if (pkg.name !== '@xiaoxiaofeihh/chromix') {
+            throw new Error(`unexpected npm package name: ${pkg.name}`);
+          }
+          if (pkg.version !== VERSION) {
+            throw new Error(`Node version mismatch: package.json=${pkg.version} module=${VERSION}`);
+          }
+          console.log(`${pkg.name} ${pkg.version}`);
+          JS
+
+      - name: Test Node SDK
+        run: npm test --prefix sdk/node
+
+      - name: Build Node SDK
+        run: |
+          mkdir -p dist/node
+          cd sdk/node
+          npm pack --json --pack-destination "$GITHUB_WORKSPACE/dist/node"
+
+      - name: Check npm version
+        id: npm
+        run: |
+          node --input-type=module - <<'JS'
+          import { appendFile, readFile } from 'node:fs/promises';
+
+          const pkg = JSON.parse(await readFile('sdk/node/package.json', 'utf8'));
+          const response = await fetch(
+            `https://registry.npmjs.org/${encodeURIComponent(pkg.name)}`,
+            { signal: AbortSignal.timeout(30000) },
+          );
+          if (!response.ok && response.status !== 404) {
+            throw new Error(`npm registry returned HTTP ${response.status}`);
+          }
+          const metadata = response.ok ? await response.json() : { versions: {} };
+          const published = Object.hasOwn(metadata.versions || {}, pkg.version);
+          await appendFile(
+            process.env.GITHUB_OUTPUT,
+            `name=${pkg.name}\nversion=${pkg.version}\npublished=${published}\n`,
+          );
+          console.log(
+            `npm ${pkg.name} ${pkg.version}: ${published ? 'already published' : 'ready to publish'}`,
+          );
+          JS
+
+      - name: Publish Node SDK to npm
+        if: steps.npm.outputs.published != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          test -n "$NODE_AUTH_TOKEN"
+          npm publish dist/node/*.tgz --access public
+
+      - name: Upload Node package
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-sdk-${{ steps.npm.outputs.version }}
+          path: dist/node/*.tgz
+          if-no-files-found: error
+          retention-days: 14
