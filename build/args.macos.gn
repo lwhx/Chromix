@@ -20,7 +20,6 @@ ffmpeg_branding = "Chrome"
 is_chrome_branded = false
 chrome_pgo_phase = 0
 
-enable_nacl = false
 # Widevine adapter in; CDM library fetched at runtime
 # (tools/fetch-widevine.py + --uxr-widevine-cdm=<dir>, patch 0048).
 enable_widevine = true

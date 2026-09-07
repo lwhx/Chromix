@@ -27,7 +27,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any, TypedDict
 
-from ._binary import _CACHE, _CHANNELS, _download, _host, resolve_platform
+from ._binary import (
+    _CACHE, _CHANNELS, _binary_path, _bundle_complete, _download, _host, resolve_platform,
+)
 from ._fonts import apply_font_env
 from .humanize import HumanConfig, HumanConfigOverrides, HumanPreset, resolve_human_config
 
@@ -70,9 +72,7 @@ def _channel_for(browser_version: str | None, release_channel: str | None) -> st
 
 
 def _chrome_binary(plat: str, tag: str) -> Path:
-    root = _CACHE / tag / plat
-    name = "chrome.exe" if plat == "win-x64" else "chrome"
-    return root / "chromix" / name
+    return _binary_path(plat, _CACHE / tag / plat)
 
 
 def ensure_binary(license_key: str | None = None,
@@ -91,13 +91,11 @@ def ensure_binary(license_key: str | None = None,
     plat = resolve_platform()
     if plat is None:
         raise RuntimeError(
-            "No native Chromix binary for this platform (supported: Linux x64, "
-            "Windows x64, macOS); or point CLOAKBROWSER_BINARY_PATH at a local build.")
+            "No native Chromix binary for this platform (Linux x64/arm64, "
+            "Windows x64, macOS x64/arm64); or point CLOAKBROWSER_BINARY_PATH at a local build.")
     ch = _channel_for(browser_version, release_channel)
     tag = _CHANNELS[ch]["tag"]
     chrome = _chrome_binary(plat, tag)
-    if chrome.exists():
-        return chrome
     _download(plat, _host(tag), tag)
     if not chrome.exists():
         raise RuntimeError(f"bundle extracted but chrome binary missing: {chrome}")
@@ -110,13 +108,14 @@ def binary_info(browser_version: str | None = None,
     tag = _CHANNELS[ch]["tag"]
     plat = resolve_platform() or "unknown"
     chrome = _chrome_binary(plat, tag)
+    installed = _bundle_complete(plat, _CACHE / tag / plat)
     return {
         "tier": "open-source",
         "version": tag.lstrip("v"),
         "channel": ch,
         "platform": plat,
-        "path": str(chrome) if chrome.exists() else None,
-        "installed": chrome.exists(),
+        "path": str(chrome) if installed else None,
+        "installed": installed,
         "cache_dir": str(_CACHE),
     }
 

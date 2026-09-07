@@ -14,6 +14,7 @@ PYTHON_README = REPO / "sdk" / "python" / "README.md"
 NODE_README = REPO / "sdk" / "node" / "README.md"
 PACKAGE_WIN = REPO / "build" / "windows" / "package-win.ps1"
 PACKAGE_LINUX = REPO / "build" / "linux" / "package-linux.sh"
+PACKAGE_MACOS = REPO / "build" / "macos" / "package-macos.sh"
 
 
 class LicenseMetadataRegressionTest(unittest.TestCase):
@@ -30,6 +31,8 @@ class LicenseMetadataRegressionTest(unittest.TestCase):
         pyproject = PYPROJECT.read_text(encoding="utf-8")
         self.assertIn('license = { file = "LICENSE" }', pyproject)
         self.assertIn('"License :: OSI Approved :: BSD License"', pyproject)
+        self.assertIn('"Operating System :: POSIX :: Linux"', pyproject)
+        self.assertIn('"Operating System :: MacOS :: MacOS X"', pyproject)
         self.assertIn('Issues = "https://github.com/xiaozhou26/Chromix/issues"', pyproject)
 
     def test_node_package_includes_license_and_repository_metadata(self):
@@ -45,11 +48,13 @@ class LicenseMetadataRegressionTest(unittest.TestCase):
     def test_browser_packages_keep_chromix_and_chromium_licenses(self):
         windows = PACKAGE_WIN.read_text(encoding="utf-8")
         linux = PACKAGE_LINUX.read_text(encoding="utf-8")
-        for source in (windows, linux):
+        macos = PACKAGE_MACOS.read_text(encoding="utf-8")
+        for source in (windows, linux, macos):
             self.assertIn("LICENSE.chromix", source)
             self.assertIn("LICENSE.chromium", source)
         self.assertIn("Chromium license is missing", windows)
         self.assertIn("Chromium license is missing", linux)
+        self.assertIn("Chromium license is missing", macos)
 
     def test_docs_state_license_and_registry_status(self):
         readme = README.read_text(encoding="utf-8")

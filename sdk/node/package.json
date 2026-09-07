@@ -9,6 +9,7 @@
   "files": ["index.js", "_binary.js", "_fonts.js", "cli.js", "README.md", "LICENSE"],
   "scripts": { "test": "node --test test/*.test.*" },
   "engines": { "node": ">=18" },
+  "dependencies": { "yauzl": "^3.4.0" },
   "keywords": ["chromium", "stealth", "browser", "automation", "anti-bot", "cloakbrowser"],
   "license": "BSD-3-Clause",
   "author": "xiaozhou26",

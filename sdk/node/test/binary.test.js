@@ -7,7 +7,7 @@
 // Run:  node --test sdk/node/test/*.test.*
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -45,6 +45,7 @@ const okText = (body) => async () => ({ ok: true, text: async () => body });
 test("resolvePlatform maps supported platform/arch pairs", () => {
   const cases = [
     ["linux", "x64", "linux-x64"],
+    ["linux", "arm64", "linux-arm64"],
     ["win32", "x64", "win-x64"],
     ["darwin", "arm64", "mac-arm64"],
     ["darwin", "x64", "mac-x64"],
@@ -56,7 +57,6 @@ test("resolvePlatform maps supported platform/arch pairs", () => {
 
 test("resolvePlatform returns null for unsupported combos", () => {
   const cases = [
-    ["linux", "arm64"],   // no arm64 Linux bundle yet
     ["linux", "ia32"],
     ["win32", "arm64"],
     ["win32", "ia32"],
@@ -70,8 +70,9 @@ test("resolvePlatform returns null for unsupported combos", () => {
 
 // --- checksums -------------------------------------------------------------
 
-test("sha256 matches Node crypto for a known buffer", async () => {
+test("sha256 matches Node crypto for a known buffer", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "chromix-sdk-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
   const file = join(dir, "blob.bin");
   const data = Buffer.from("chromix".repeat(4096));
   writeFileSync(file, data);
@@ -115,11 +116,12 @@ test("expectedSha swallows a network error instead of throwing", async () => {
 test("ASSETS stays consistent with resolvePlatform", () => {
   // Every key resolvePlatform() can return must exist in ASSETS, and each launcher path must
   // live under chromix/ so extraction lands where ensureNative expects.
-  const resolvable = ["linux-x64", "win-x64", "mac-arm64", "mac-x64"];
+  const resolvable = ["linux-x64", "linux-arm64", "win-x64", "mac-arm64", "mac-x64"];
   for (const key of resolvable) assert.ok(key in ASSETS, `missing asset for ${key}`);
   for (const [plat, { asset, kind, launcher }] of Object.entries(ASSETS)) {
     assert.ok(asset.startsWith("chromix-") && asset.includes(plat), `${plat}: ${asset}`);
-    assert.ok(["tar", "zip"].includes(kind), `${plat}: kind ${kind}`);
+    assert.equal(kind, "zip", `${plat}: kind ${kind}`);
+    assert.equal(asset, `chromix-${plat}.zip`);
     assert.ok(launcher.startsWith("chromix/"), `${plat}: launcher ${launcher}`);
   }
 });

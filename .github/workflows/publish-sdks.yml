@@ -7,6 +7,8 @@ on:
     paths:
       - 'sdk/python/**'
       - 'sdk/node/**'
+      - 'build/ungoogled-revisions.psd1'
+      - '.github/workflows/build-cross-platform.yml'
       - '.github/workflows/publish-sdks.yml'
   workflow_dispatch:
 
@@ -53,6 +55,24 @@ jobs:
               raise SystemExit(
                   f"Python version mismatch: pyproject={project['version']} module={match.group(1)}")
           print(f"{project['name']} {project['version']}")
+          PY
+
+      - name: Verify Python browser asset mapping
+        run: |
+          PYTHONPATH=sdk/python python - <<'PY'
+          from chromix._binary import _ASSETS
+
+          expected = {
+              'linux-x64': 'chromix-linux-x64.zip',
+              'linux-arm64': 'chromix-linux-arm64.zip',
+              'win-x64': 'chromix-win-x64.zip',
+              'mac-arm64': 'chromix-mac-arm64.zip',
+              'mac-x64': 'chromix-mac-x64.zip',
+          }
+          actual = {platform: values[0] for platform, values in _ASSETS.items()}
+          if actual != expected:
+              raise SystemExit(f'Python browser assets mismatch: {actual}')
+          print('Python browser assets match all build outputs')
           PY
 
       - name: Test Python SDK
@@ -125,6 +145,9 @@ jobs:
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
+
+      - name: Install Node SDK dependencies
+        run: npm ci --prefix sdk/node --ignore-scripts
 
       - name: Verify Node package version
         run: |

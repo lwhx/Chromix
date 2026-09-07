@@ -1,6 +1,6 @@
 <#
   Prepare a pinned native-Windows source tree:
-    Chromium tarball -> ungoogled core -> Windows overlay -> Chromix patches.
+    Chromium tarball -> ungoogled core -> Windows overlay -> prune -> Chromix patches.
 
   The script is resumable. Each completed layer writes a versioned marker under
   the source tree. A mismatched marker stops the build instead of mixing layers.
@@ -312,10 +312,6 @@ if (-not (Test-Marker ".chromix-source-unpacked" $Revisions.ChromiumVersion)) {
     (Join-Path $Ungoogled "utils\downloads.py"), "retrieve",
     "-c", $DownloadCache, "-i", (Join-Path $Windows "downloads.ini")
   )
-  Invoke-Checked $Python @(
-    (Join-Path $Ungoogled "utils\prune_binaries.py"),
-    $Src, (Join-Path $Ungoogled "pruning.list")
-  )
   foreach ($directory in @(
     (Join-Path $Src "third_party\microsoft_dxheaders\src"),
     (Join-Path $Src "third_party\microsoft_webauthn\src"),
@@ -360,6 +356,15 @@ if (-not (Test-Marker ".chromix-ungoogled-windows" $Revisions.UngoogledWindowsCo
   Invoke-PatchDirectory (Join-Path $Windows "patches")
   Set-Marker ".chromix-ungoogled-windows" $Revisions.UngoogledWindowsCommit
   Remove-Item (Join-Path $Src ".chromix-layer-in-progress") -Force
+}
+
+if (-not (Test-Marker ".chromix-binaries-pruned" $Revisions.UngoogledCommit)) {
+  Write-Host "==> pruning unneeded binaries"
+  Invoke-Checked $Python @(
+    (Join-Path $Ungoogled "utils\prune_binaries.py"),
+    $Src, (Join-Path $Ungoogled "pruning.list")
+  )
+  Set-Marker ".chromix-binaries-pruned" $Revisions.UngoogledCommit
 }
 
 if (-not (Test-Marker ".chromix-patches" $patchSetKey)) {

@@ -1,0 +1,254 @@
+name: build-cross-platform
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'build/**'
+      - 'patches/**'
+      - 'assets/fonts/**'
+      - '.github/workflows/build-cross-platform.yml'
+      - 'CHROMIUM_VERSION'
+      - 'UNGOOGLED_VERSION'
+      - 'UNGOOGLED_WINDOWS_VERSION'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: build-cross-platform-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CHROMIUM_VERSION: '152.0.7977.82'
+  DEPOT_TOOLS_METRICS: '0'
+  DEPOT_TOOLS_COLLECT_METRICS: '0'
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            runner: ubuntu-22.04
+            platform: linux
+            arch: x64
+            artifact: chromix-linux-x64
+          - name: Linux arm64
+            runner: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+            artifact: chromix-linux-arm64
+          - name: macOS Intel
+            runner: macos-15-intel
+            platform: macos
+            arch: x64
+            artifact: chromix-mac-x64
+          - name: macOS Apple Silicon
+            runner: macos-14
+            platform: macos
+            arch: arm64
+            artifact: chromix-mac-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record runner resources
+        run: |
+          mkdir -p "${RUNNER_TEMP}/chromix-logs"
+          { uname -a; df -h; } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/runner.log"
+
+      - name: Free runner disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/local/.ghcup /usr/lib/jvm \
+            /usr/lib/google-cloud-sdk /usr/lib/dotnet /usr/share/swift
+          df -h
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison clang clang-format cmake flex g++ git golang gperf \
+            libasound2-dev libatk1.0-dev libcups2-dev libdrm-dev libegl1-mesa-dev \
+            libevent-dev libflac-dev libgbm-dev libglib2.0-dev libgtk-3-dev \
+            libjpeg-dev libnss3-dev libopus-dev libpam0g-dev libpci-dev \
+            libpipewire-0.3-dev libpulse-dev libspeechd-dev libudev-dev \
+            libva-dev libvpx-dev libwebp-dev libx11-xcb-dev libxcb-dri3-dev \
+            libxshmfence-dev libxslt1-dev libxss-dev libxtst-dev mesa-common-dev \
+            ninja-build nodejs npm pkg-config python3-httplib2 python3-jinja2 \
+            python3-pyparsing python3-setuptools python3-six python-is-python3 \
+            rsync uuid-dev xz-utils yasm zip unzip
+
+      - name: Inspect macOS toolchain
+        if: runner.os == 'macOS'
+        run: |
+          {
+            sw_vers
+            xcode-select -p
+            xcodebuild -version
+            xcrun --sdk macosx --show-sdk-version
+            xcrun --sdk macosx --show-sdk-path
+          } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/xcode.log"
+
+      - name: Install macOS build and packaging tools
+        if: runner.os == 'macOS'
+        run: brew install go ninja coreutils gpatch
+
+      - name: Set up Linux Node.js
+        if: runner.os == 'Linux'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Prepare pinned ungoogled source
+        timeout-minutes: 90
+        env:
+          PREPARE_WORK: ${{ runner.temp }}/chromix-build
+        run: |
+          set -euo pipefail
+          build/prepare-ungoogled.sh "$PREPARE_WORK" '${{ matrix.platform }}' '${{ matrix.arch }}' \
+            2>&1 | tee "${RUNNER_TEMP}/chromix-logs/prepare.log"
+
+      - name: Check macOS SDK floor from pinned source
+        if: runner.os == 'macOS'
+        run: |
+          python3 - <<'PY' 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/sdk-check.log"
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          config = Path(os.environ["RUNNER_TEMP"]) / "chromix-build/src/build/config/mac"
+          minimum = re.search(r'mac_sdk_min\s*=\s*"([\d.]+)"',
+                              (config / "mac_sdk_overrides.gni").read_text()).group(1)
+          official = re.search(r'mac_sdk_official_version\s*=\s*"([\d.]+)"',
+                               (config / "mac_sdk.gni").read_text()).group(1)
+          selected = subprocess.check_output(
+              ["xcrun", "--sdk", "macosx", "--show-sdk-version"], text=True).strip()
+
+          def version(value):
+              parts = tuple(map(int, value.split(".")))
+              return parts + (0,) * (3 - len(parts))
+
+          print(f"Selected macOS SDK {selected}; source floor {minimum}; upstream reference {official}")
+          if version(selected) < version(minimum):
+              raise SystemExit("Selected Xcode SDK is below the pinned Chromium minimum")
+          if version(selected) < version(official):
+              print("::warning::SDK is older than Chromium's reference SDK; a full build is still required")
+          PY
+
+      - name: Build Chromium
+        timeout-minutes: 210
+        env:
+          CHROMIX_SKIP_DEPS: '1'
+          CHROMIX_WORKDIR: ${{ runner.temp }}/chromix-build
+        run: |
+          set -euo pipefail
+          {
+            if [ '${{ matrix.platform }}' = linux ]; then
+              build/build.sh "$CHROMIX_WORKDIR" '${{ matrix.arch }}'
+            else
+              build/macos/build.sh "$CHROMIX_WORKDIR" '${{ matrix.arch }}'
+            fi
+          } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/build.log"
+
+      - name: Package Linux bundle
+        if: matrix.platform == 'linux'
+        run: |
+          build/linux/package-linux.sh "${RUNNER_TEMP}/chromix-build/src/out/Chromix" \
+            "${RUNNER_TEMP}/chromix-dist" '${{ matrix.arch }}' \
+            2>&1 | tee "${RUNNER_TEMP}/chromix-logs/package.log"
+
+      - name: Package macOS bundle
+        if: matrix.platform == 'macos'
+        run: |
+          build/macos/package-macos.sh "${RUNNER_TEMP}/chromix-build/src/out/Chromix/Chromium.app" \
+            "${RUNNER_TEMP}/chromix-dist" '${{ matrix.arch }}' \
+            2>&1 | tee "${RUNNER_TEMP}/chromix-logs/package.log"
+
+      - name: Verify package and checksum
+        run: |
+          set -euo pipefail
+          {
+            cd "${RUNNER_TEMP}/chromix-dist"
+            test -s '${{ matrix.artifact }}.zip'
+            grep -E '^[0-9a-fA-F]{64}  ${{ matrix.artifact }}\.zip$' SHA256SUMS
+            if [ '${{ matrix.platform }}' = linux ]; then
+              command -v sha256sum
+              sha256sum -c SHA256SUMS
+            else
+              command -v shasum
+              shasum -a 256 -c SHA256SUMS
+            fi
+          } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/checksum.log"
+
+      - name: Smoke test extracted ZIP
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          SMOKE_DIR="${RUNNER_TEMP}/chromix-smoke"
+          mkdir -p "$SMOKE_DIR"
+          unzip -q "${RUNNER_TEMP}/chromix-dist/${{ matrix.artifact }}.zip" -d "$SMOKE_DIR"
+          export SMOKE_DIR
+          python3 - <<'PY' 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/smoke.log"
+          import os
+          import subprocess
+          from pathlib import Path
+
+          root = Path(os.environ["SMOKE_DIR"])
+          launcher = root / "chromix/chromix"
+          version = subprocess.run([str(launcher), "--version"],
+                                   text=True, capture_output=True, timeout=30)
+          print(version.stdout, end="", flush=True)
+          print(version.stderr, end="", flush=True)
+          version.check_returncode()
+          if os.environ["CHROMIUM_VERSION"] not in version.stdout:
+              raise SystemExit("Extracted browser version does not match the source pin")
+          result = subprocess.run([
+              str(launcher), "--headless", "--disable-gpu", "--no-first-run",
+              "--no-default-browser-check", f"--user-data-dir={root / 'profile'}",
+              "--dump-dom", "data:text/html,<p>chromix-smoke-ok</p>",
+          ], text=True, capture_output=True, timeout=60)
+          print(result.stdout, end="", flush=True)
+          print(result.stderr, end="", flush=True)
+          result.check_returncode()
+          if "<p>chromix-smoke-ok</p>" not in result.stdout:
+              raise SystemExit("Extracted browser did not render the smoke page")
+          PY
+
+      - name: Upload browser artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ runner.temp }}/chromix-dist/${{ matrix.artifact }}.zip
+            ${{ runner.temp }}/chromix-dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}-logs
+          path: |
+            ${{ runner.temp }}/chromix-logs/
+            ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
+          if-no-files-found: warn
+          retention-days: 14

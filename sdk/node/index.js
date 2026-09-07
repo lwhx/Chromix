@@ -21,6 +21,7 @@ import { existsSync, rmSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import {
   VERSION as BROWSER_VERSION, CHANNELS, CACHE, hostFor, resolvePlatform, ensureNative,
+  binaryPath, bundleComplete,
 } from "./_binary.js";
 import { fontLaunchEnv } from "./_fonts.js";
 
@@ -34,8 +35,7 @@ export const DEFAULT_VIEWPORT = { width: 1920, height: 947 };
 // ---------------------------------------------------------------------------
 
 function chromeBinaryPath(plat, tag) {
-  const name = plat === "win-x64" ? "chrome.exe" : "chrome";
-  return join(CACHE, tag, plat, "chromix", name);
+  return binaryPath(plat, join(CACHE, tag, plat));
 }
 
 function channelFor(browserVersion, releaseChannel) {
@@ -56,11 +56,10 @@ export async function ensureBinary({ browserVersion, releaseChannel } = {}) {
     return explicit;
   }
   const plat = resolvePlatform();
-  if (!plat) throw new Error("No native Chromix binary for this platform (Linux/Windows x64, macOS); or point CLOAKBROWSER_BINARY_PATH at a local build.");
+  if (!plat) throw new Error("No native Chromix binary for this platform (Linux x64/arm64, Windows x64, macOS x64/arm64); or point CLOAKBROWSER_BINARY_PATH at a local build.");
   const ch = channelFor(browserVersion, releaseChannel);
   const tag = CHANNELS[ch].tag;
   const chrome = chromeBinaryPath(plat, tag);
-  if (existsSync(chrome)) return chrome;
   await ensureNative(plat, hostFor(tag), tag);
   if (!existsSync(chrome)) throw new Error(`bundle extracted but chrome binary missing: ${chrome}`);
   return chrome;
@@ -71,9 +70,10 @@ export function binaryInfo({ browserVersion, releaseChannel } = {}) {
   const tag = CHANNELS[ch].tag;
   const plat = resolvePlatform() || "unknown";
   const path = chromeBinaryPath(plat, tag);
+  const installed = bundleComplete(plat, join(CACHE, tag, plat));
   return { tier: "open-source", version: tag.replace(/^v/, ""), channel: ch,
-           platform: plat, path: existsSync(path) ? path : null,
-           installed: existsSync(path), cacheDir: CACHE };
+           platform: plat, path: installed ? path : null,
+           installed, cacheDir: CACHE };
 }
 
 export function clearCache() { rmSync(CACHE, { recursive: true, force: true }); }

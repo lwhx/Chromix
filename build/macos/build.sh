@@ -1,44 +1,47 @@
 #!/usr/bin/env bash
-# Chromix native macOS build.
-#
-# Prereqs: Xcode + command line tools, depot_tools on PATH
-#   - Xcode + `xcode-select --install`
-#   - ~100 GB free disk, long build time
-#   - git, python3
-#
-# Usage:
-#   build/macos/build.sh [workdir] [arm64|x64]
+# Native macOS build using pinned ungoogled-chromium source layers.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK="${1:-$REPO/.chromix-build-mac}"
-ARCH="${2:-arm64}"
-VER="${CHROMIUM_VERSION:-$(cat "$REPO/CHROMIUM_VERSION")}"
+HOST_ARCH="$(uname -m)"
+[ "$HOST_ARCH" = x86_64 ] && HOST_ARCH=x64
+ARCH="${2:-$HOST_ARCH}"
+case "$ARCH" in arm64|x64) ;; *) echo "unsupported macOS architecture: $ARCH" >&2; exit 2 ;; esac
+if [ "$(uname -s)" != Darwin ] || [ "$HOST_ARCH" != "$ARCH" ]; then
+  echo "a native macOS $ARCH host is required" >&2; exit 2
+fi
 mkdir -p "$WORK"
-
-echo "==> Chromix macOS build | Chromium $VER | $ARCH | $WORK"
-
-# 1. depot_tools
-if [ ! -d "$WORK/depot_tools" ]; then
-  git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$WORK/depot_tools"
+WORK="$(cd "$WORK" && pwd)"
+SRC="$WORK/src"
+OUT="$SRC/out/Chromix"
+"$REPO/build/prepare-ungoogled.sh" "$WORK" macos "$ARCH"
+cd "$SRC"
+if [ ! -f "$SRC/.chromix-toolchain-ready" ]; then
+  if [ -f "$SRC/.chromix-domain-substituted" ]; then
+    echo "toolchain is incomplete in a domain-substituted source tree; use a clean work directory" >&2; exit 1
+  fi
+  python3 tools/rust/build_bindgen.py --skip-test
+  touch "$SRC/.chromix-toolchain-ready"
 fi
-export PATH="$WORK/depot_tools:$PATH"
-
-# 2. fetch + sync
-if [ ! -d "$WORK/chromium/src" ]; then
-  mkdir -p "$WORK/chromium"; ( cd "$WORK/chromium" && fetch --nohooks --no-history chromium )
+if [ -f "$SRC/.chromix-domain-substitution-in-progress" ]; then
+  echo "domain substitution was interrupted; use a clean work directory" >&2; exit 1
 fi
-cd "$WORK/chromium/src"
-git fetch --depth 1 origin "refs/tags/$VER:refs/tags/$VER"
-git checkout -f "tags/$VER"
-gclient sync -D --no-history --reset
-
-# 3. apply Chromix patches
-"$REPO/build/apply-patches.sh" "$WORK/chromium/src"
-
-# 4. configure (override target_cpu for Intel) + build
-ARGS="$(cat "$REPO/build/args.macos.gn")"
-[ "$ARCH" = "x64" ] && ARGS="${ARGS/target_cpu = \"arm64\"/target_cpu = \"x64\"}"
-gn gen out/Chromix --args="$ARGS"
-autoninja -C out/Chromix chrome
-
-echo "==> Done: $WORK/chromium/src/out/Chromix/Chromium.app"
+if [ "${CHROMIX_APPLY_DOMAIN_SUBSTITUTION:-1}" = 1 ] && [ ! -f "$SRC/.chromix-domain-substituted" ]; then
+  touch "$SRC/.chromix-domain-substitution-in-progress"
+  python3 "$WORK/tooling/ungoogled-chromium/utils/domain_substitution.py" apply \
+    -r "$WORK/tooling/ungoogled-chromium/domain_regex.list" \
+    -f "$WORK/tooling/ungoogled-chromium/domain_substitution.list" "$SRC"
+  mv "$SRC/.chromix-domain-substitution-in-progress" "$SRC/.chromix-domain-substituted"
+fi
+mkdir -p "$OUT"
+printf 'target_cpu = "%s"\nv8_target_cpu = "%s"\n' "$ARCH" "$ARCH" > "$WORK/target.gn"
+python3 "$REPO/tools/merge_gn_args.py" "$OUT/args.gn" \
+  "$WORK/tooling/ungoogled-chromium/flags.gn" \
+  "$WORK/tooling/ungoogled-chromium-macos/flags.macos.gn" \
+  "$REPO/build/args.macos.gn" "$WORK/target.gn"
+if [ ! -x "$OUT/gn" ]; then
+  python3 tools/gn/bootstrap/bootstrap.py -o "$OUT/gn" --skip-generate-buildfiles
+fi
+"$OUT/gn" gen "$OUT" --fail-on-unused-args
+ninja -C "$OUT" -j "${CHROMIX_JOBS:-$(sysctl -n hw.ncpu)}" chrome
+printf '==> Done: %s\n' "$OUT/Chromium.app"

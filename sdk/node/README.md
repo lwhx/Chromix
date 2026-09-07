@@ -50,10 +50,10 @@ npm install @xiaoxiaofeihh/chromix playwright-core
 ```
 
 The unscoped npm name `chromix` belongs to an unrelated project. This SDK is
-published under the `@xiaozhou26` scope; use the full scoped name when
+published under the `@xiaoxiaofeihh` scope; use the full scoped name when
 installing or importing it.
 
-The SDK has no production dependencies of its own and loads an installed
+The SDK uses the lightweight `yauzl` ZIP reader and loads an installed
 `playwright-core` or `playwright` package at launch time. On first launch, the
 Chromix binary is downloaded from this repository's GitHub Release,
 SHA256-verified when the release manifest is available, and cached under

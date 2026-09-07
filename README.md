@@ -5,8 +5,10 @@
 
 Chromix is a Chromium-based browser build focused on presenting a coherent,
 per-launch browser persona across JavaScript-visible surfaces. It is built on
-pinned `ungoogled-chromium` and `ungoogled-chromium-windows` sources, then adds
-a reviewed Chromium 152 patch series and lightweight Python and Node SDKs.
+pinned `ungoogled-chromium` sources and the matching Windows/Linux/macOS platform
+layer, then adds a reviewed Chromium 152 patch series and lightweight Python and
+Node SDKs. Current Releases are Windows x64 only; Linux/macOS builds remain
+experimental and need real native build and runtime verification.
 
 > Chromix is intended for browser automation, compatibility testing, privacy
 > research, and controlled fingerprinting experiments. A custom browser does
@@ -24,25 +26,31 @@ a reviewed Chromium 152 patch series and lightweight Python and Node SDKs.
   Node scripts can usually migrate by changing the import.
 - **Proxy-aware setup:** optional GeoIP resolution can align locale, timezone,
   and the declared WebRTC address with the proxy exit.
-- **Portable Windows package:** release archives include Chromium runtime files,
-  locales, and a `chromix.cmd` launcher.
-- **Reproducible source layers:** Chromium, ungoogled core, and Windows overlay
-  revisions are pinned in the repository.
+- **Portable packages:** Windows x64 Releases include runtime files, locales,
+  fonts, and a launcher. Linux/macOS ZIP packaging and CI targets are available
+  for validation, not yet verified Releases.
+- **Reproducible source layers:** the Chromium source archive, ungoogled core,
+  and Windows/Linux/macOS platform revisions are pinned in the repository.
 - **Integrity checks:** releases include `SHA256SUMS`; the SDK verifies a bundle
   before extracting it when the manifest is available.
 
 ## Downloads
 
-Prebuilt packages are published on the
+Prebuilt **Windows x64 only** packages are published on the
 [GitHub Releases page](https://github.com/xiaozhou26/Chromix/releases).
+Linux x64/arm64 and macOS x64/arm64 still require real build/runtime validation;
+successful CI candidates go to Actions artifacts, not Releases. The SDK asset
+mapping does not mean a POSIX asset exists on a current release tag.
 
 | Browser version | Platform | Release |
 |---|---|---|
 | `152.0.7977.75` | Windows x64 | [`v152.0.7977.75`](https://github.com/xiaozhou26/Chromix/releases/tag/v152.0.7977.75) |
 | `151.0.7922.173` | Windows x64 | [`v151.0.7922.173`](https://github.com/xiaozhou26/Chromix/releases/tag/v151.0.7922.173) |
 
-The source tree is currently pinned to Chromium `152.0.7977.82`. Binary releases
-can lag behind the source pin while the staged Windows build completes.
+The source tree is pinned to Chromium `152.0.7977.82`; binary releases can lag
+behind that pin. Machine-readable source pins are in
+`build/ungoogled-revisions.psd1`; legacy version files remain available for
+tooling compatibility. SDK package versions and release channels are unchanged.
 
 ### Verify and run on Windows
 
@@ -51,7 +59,7 @@ verify the archive in PowerShell:
 
 ```powershell
 $actual = (Get-FileHash .\chromix-win-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
-$expected = (Get-Content .\SHA256SUMS).Split()[0].ToLowerInvariant()
+$expected = ((Get-Content .\SHA256SUMS | Where-Object { $_ -match '\s+\*?chromix-win-x64\.zip$' }) -split '\s+')[0].ToLowerInvariant()
 if ($actual -ne $expected) { throw "Chromix archive checksum mismatch" }
 ```
 
@@ -179,12 +187,31 @@ compatibility differences.
 
 ## Use a local browser binary
 
-Set `CLOAKBROWSER_BINARY_PATH` to bypass release download and run a local
-Chromix build:
+Set `CLOAKBROWSER_BINARY_PATH` to bypass release download in either SDK. Point
+to the actual executable, not a ZIP, directory, Windows `.cmd`, or macOS `.app`
+directory. Keep the rest of the extracted bundle alongside it.
+
+Windows example:
 
 ```powershell
 $env:CLOAKBROWSER_BINARY_PATH = "D:\chromix-build\src\out\Chromix\chrome.exe"
 ```
+
+For an extracted Linux candidate use `/absolute/path/chromix/chrome`; on macOS
+use `/absolute/path/chromix/Chromium.app/Contents/MacOS/Chromium`. Export that
+path in the shell running the SDK, then call the usual `launch(...)`. Verify the
+inner ZIP's checksum and preserve executable bits/framework symlinks when
+extracting it; see [BUILDING.md](BUILDING.md#verify-and-run-a-posix-candidate).
+
+The current Python `chromix.launch`/`launch_async` wrappers resolve the binary
+first and pass their own `executable_path` to Playwright. Supplying
+`chromix.launch(executable_path=...)` is **not supported**: it does not bypass
+download and results in duplicate keyword arguments at launch. Direct Playwright
+`chromium.launch(executable_path=...)` is a different API and does accept that
+option. Similarly, Node's top-level `executablePath` is not a local-binary
+selector; `launchOptions.executablePath` overrides Playwright's option only
+*after* `ensureBinary()` runs. Use `CLOAKBROWSER_BINARY_PATH` for download-free
+local use in both wrappers.
 
 Other useful environment variables:
 
@@ -197,6 +224,11 @@ Other useful environment variables:
 | `CLOAKBROWSER_WIDEVINE=0` | Disable Widevine discovery |
 | `CHROMIX_CACHE_DIR` | Override the SDK binary cache directory |
 | `CHROMIX_DOWNLOAD_HOST` | Override the release asset host |
+
+Configured native bundle targets are Windows x64, Linux x64/arm64, and macOS
+x64/arm64. All use ZIP archives, but only Windows has current Releases. POSIX
+Actions artifacts still need real build/runtime validation; macOS candidates
+are unsigned for distribution and not notarized.
 
 ## Persona options
 
@@ -239,18 +271,24 @@ Use these only in controlled environments. More implementation detail is in
 
 ## Build from source
 
-Chromix currently packages Windows x64. The pinned layers are:
+Chromix packages Windows x64, Linux x64/arm64, and macOS x64/arm64. The pinned layers are:
 
 | Layer | Pin |
 |---|---|
 | Chromium | `152.0.7977.82` |
 | ungoogled-chromium | `152.0.7977.82-1` |
 | ungoogled-chromium-windows | `152.0.7977.82-1.1` |
+| ungoogled-chromium-portablelinux | `152.0.7977.82-1` |
+| ungoogled-chromium-macos | `152.0.7977.82-1.1` |
 | Chromix | 110 patches listed in `patches/series` |
 
 Requirements include Visual Studio 2022 with Desktop development with C++, the
 Windows 11 SDK 10.0.26100 Debugging Tools, Python 3, Git, PowerShell 7, 7-Zip,
-and roughly 120 GB of free disk space.
+and roughly 120 GB of free disk space for Windows. Linux additionally needs
+Chromium's Debian/Ubuntu build dependencies, Node.js, Go, and Ninja. macOS
+needs Xcode, the command-line tools, Node.js, Ninja, and `zip` for packaging.
+macOS artifacts are unsigned and not notarized because Developer ID and Apple
+notary credentials are not part of this build.
 
 From a Developer PowerShell:
 
@@ -297,8 +335,8 @@ git diff --check
 ```
 
 A full source preparation and compile is performed by the staged Windows GitHub
-Actions workflow because a Chromium build exceeds a single hosted runner's
-normal time budget.
+Actions workflow and the parallel Linux/macOS workflow; Chromium builds exceed a
+single hosted runner's normal time budget.
 
 ## License
 

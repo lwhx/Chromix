@@ -1,8 +1,8 @@
 # Chromix patches
 
-Surface-coherence patches applied after the pinned `ungoogled-chromium` core
-and Windows overlay (see `CHROMIUM_VERSION` and
-`build/ungoogled-revisions.psd1`): in-tree Chromium/Blink modifications that read a
+Surface-coherence patches applied after the pinned `ungoogled-chromium` core,
+matching Windows/Linux/macOS platform layer, and binary pruning (see
+`CHROMIUM_VERSION` and `build/ungoogled-revisions.psd1`): in-tree Chromium/Blink modifications that read a
 per-launch persona and present it consistently across the JS-observable
 fingerprint surfaces (user-agent, platform, WebGL, timezone, languages, screen,
 keyboard, media, geolocation, detailed-screen, codec capability, and so on),
@@ -28,6 +28,15 @@ including inside worker and iframe realms where the upstream API permits it.
   (the `--fingerprint-*` aliases from the SDKs are normalized to `--uxr-*` by
   patch 0036). Run `python tools/check_patches.py` to enforce the invariants.
 
+For Windows x64, Linux x64/arm64, and macOS x64/arm64, the source-layer order is
+**Chromium archive → ungoogled core → platform patches → prune → Chromix**.
+The matching platform repository is `ungoogled-chromium-windows`,
+`ungoogled-chromium-portablelinux`, or `ungoogled-chromium-macos`; exact commits
+come from `build/ungoogled-revisions.psd1`. A successful patch/fixture check is
+not a successful build: current Releases are Windows-only, and POSIX candidates
+remain Actions artifacts pending real native compile and runtime verification.
+
 To build the pinned ungoogled source layers and then apply this series, see
-`BUILDING.md`, `build/windows/build.ps1`, or the staged
-`.github/workflows/build-win-x64-github.yml` CI.
+`BUILDING.md`, `build/prepare-ungoogled.sh`, `build/windows/build.ps1`, or the
+staged `.github/workflows/build-win-x64-github.yml` and
+`.github/workflows/build-cross-platform.yml` CI workflows.
