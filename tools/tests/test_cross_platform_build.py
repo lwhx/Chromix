@@ -55,7 +55,14 @@ class CrossPlatformBuildRegressionTest(unittest.TestCase):
             self.assertIn(asset, source)
         self.assertIn("ubuntu-22.04", source)
         self.assertIn("macos-15-intel", source)
-        self.assertIn("macos-14", source)
+        self.assertIn("macos-15", source)
+        self.assertNotIn("macos-14", source)
+
+    def test_build_arguments_cover_host_toolchain_compatibility(self):
+        linux = (REPO / "build" / "build.sh").read_text(encoding="utf-8")
+        macos = (REPO / "build" / "args.macos.gn").read_text(encoding="utf-8")
+        self.assertIn("-Wno-deprecated-declarations", linux)
+        self.assertIn("use_unified_system_module = false", macos)
 
     def test_macos_packager_normalizes_intel_name_and_uses_portable_tools(self):
         source = PACKAGE_MACOS.read_text(encoding="utf-8")

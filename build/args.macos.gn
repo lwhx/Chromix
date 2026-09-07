@@ -24,6 +24,9 @@ chrome_pgo_phase = 0
 # (tools/fetch-widevine.py + --uxr-widevine-cdm=<dir>, patch 0048).
 enable_widevine = true
 
+# System Xcode SDK links need Chromium's manual module-map path.
+use_unified_system_module = false
+
 # Override on the command line for Intel:  target_cpu="x64"
 target_cpu = "arm64"
 target_os = "mac"

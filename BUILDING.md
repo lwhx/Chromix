@@ -109,7 +109,7 @@ parallel, retaining these exact runner/architecture/ZIP mappings:
 | `ubuntu-22.04` | Linux x64 | `chromix-linux-x64.zip` |
 | `ubuntu-24.04-arm` | Linux arm64 | `chromix-linux-arm64.zip` |
 | `macos-15-intel` | macOS x64 | `chromix-mac-x64.zip` |
-| `macos-14` | macOS arm64 | `chromix-mac-arm64.zip` |
+| `macos-15` | macOS arm64 | `chromix-mac-arm64.zip` |
 
 Windows x64 remains in the separate staged
 `.github/workflows/build-win-x64-github.yml` workflow and keeps

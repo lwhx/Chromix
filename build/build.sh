@@ -84,7 +84,9 @@ python3 "$REPO/tools/merge_gn_args.py" "$OUT/args.gn" \
   "$WORK/tooling/ungoogled-chromium-portablelinux/flags.linux.gn" \
   "$REPO/build/args.gn" "$WORK/target.gn"
 if [ ! -x "$OUT/gn" ]; then
-  python3 tools/gn/bootstrap/bootstrap.py -o "$OUT/gn" --skip-generate-buildfiles
+  # GN's standalone bootstrap still treats this libstdc++ warning as an error.
+  CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }-Wno-deprecated-declarations" \
+    python3 tools/gn/bootstrap/bootstrap.py -o "$OUT/gn" --skip-generate-buildfiles
 fi
 "$OUT/gn" gen "$OUT" --fail-on-unused-args
 ninja -C "$OUT" -j "${CHROMIX_JOBS:-$(getconf _NPROCESSORS_ONLN)}" chrome chrome_crashpad_handler chrome_sandbox

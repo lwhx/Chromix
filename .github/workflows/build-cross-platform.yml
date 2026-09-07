@@ -52,7 +52,7 @@ jobs:
             arch: x64
             artifact: chromix-mac-x64
           - name: macOS Apple Silicon
-            runner: macos-14
+            runner: macos-15
             platform: macos
             arch: arm64
             artifact: chromix-mac-arm64
