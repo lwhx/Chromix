@@ -7,9 +7,9 @@ then applies the Chromium 152 patch series in `patches/series`.
 
 | Layer | Version | Commit |
 |---|---|---|
-| Chromium | `152.0.7977.75` | source archive selected by ungoogled-chromium |
-| ungoogled-chromium | `152.0.7977.75-1` | `cacf0f0fd2446a837528c54df1880b75874b9580` |
-| ungoogled-chromium-windows | `152.0.7977.75-1.1` | `c8b4eadc799fb40fb0d7acd30b542f130e1f0a17` |
+| Chromium | `152.0.7977.82` | source archive selected by ungoogled-chromium |
+| ungoogled-chromium | `152.0.7977.82-1` | `e71b91c6e336d0f25cfc6b9ef09298a9d2506e24` |
+| ungoogled-chromium-windows | `152.0.7977.82-1.1` | `333bc7dfff72ff4abc4d9cc76bc41de300a46e06` |
 | Chromix patches | `patches/series` | content hash stored in source markers |
 
 The machine-readable pins are in `CHROMIUM_VERSION`, `UNGOOGLED_VERSION`,

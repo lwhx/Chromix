@@ -1,10 +1,22 @@
 diff --git a/third_party/blink/renderer/core/dom/element.cc b/third_party/blink/renderer/core/dom/element.cc
-index 5227c6b..5ec5590 100644
+index e6c93c609ccfa2000a5652031117a1c3949eb503..26fd0c0425c50fa3e108c10b49c57e440df56bfa 100644
 --- a/third_party/blink/renderer/core/dom/element.cc
 +++ b/third_party/blink/renderer/core/dom/element.cc
-@@ -3449,4 +3449,5 @@ void Element::ClientQuads(Vector<gfx::QuadF>& quads) const {
+@@ -3340,16 +3340,17 @@ void Element::ClientQuads(Vector<gfx::QuadF>& quads) const {
+     }
+     return;
+   }
+ 
+   // FIXME: Handle table/inline-table with a caption.
    if (element_layout_object->IsBoxModelObject() ||
        element_layout_object->IsBR()) {
      element_layout_object->AbsoluteQuads(quads);
 +    // UXR: keep Element and Range geometry on the native shared path.
+   }
+ }
+ 
+ DOMRectList* Element::getClientRects() {
+   Vector<gfx::RectF> rects = GetClientRectsNoAdjustment();
+   if (rects.empty()) {
+     return MakeGarbageCollected<DOMRectList>();
    }

@@ -18,7 +18,7 @@ _REPO = "xiaozhou26/Chromix"
 # real users run). "latest" = 152 (newest engine). See build/versions.txt.
 _CHANNELS = {
     "stable": {"tag": "v149.0.7827.200"},
-    "latest": {"tag": "v152.0.7977.75"},
+    "latest": {"tag": "v152.0.7977.82"},
 }
 _CACHE = Path(os.environ.get("CHROMIX_CACHE_DIR",
                              Path.home() / ".cache" / "chromix"))
