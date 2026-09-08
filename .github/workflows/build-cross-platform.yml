@@ -2,12 +2,22 @@ name: build-cross-platform
 
 on:
   workflow_dispatch:
+    inputs:
+      use_upstream_cache:
+        description: 'Try pinned upstream toolchain/build artifacts; incompatible caches fall back'
+        type: boolean
+        default: true
   push:
     branches: [main]
     paths:
       - 'build/**'
       - 'patches/**'
       - 'assets/fonts/**'
+      - 'tools/*upstream_cache.py'
+      - 'tools/upstream_object_cache.py'
+      - 'tools/upstream_script_identity.py'
+      - 'tools/gen_posix_workflow.py'
+      - 'tools/merge_gn_args.py'
       - '.github/workflows/build-cross-platform.yml'
       - '.github/workflows/build-posix-github.yml'
       - '.github/workflows/build-win-x64-github.yml'
@@ -42,6 +52,7 @@ jobs:
       runner: ubuntu-22.04
       artifact: chromix-linux-x64
       max-stages: 8
+      use_upstream_cache: ${{ github.event_name != 'workflow_dispatch' || inputs.use_upstream_cache }}
     secrets: inherit
 
   linux-arm64:
@@ -53,6 +64,7 @@ jobs:
       runner: ubuntu-24.04-arm
       artifact: chromix-linux-arm64
       max-stages: 8
+      use_upstream_cache: ${{ github.event_name != 'workflow_dispatch' || inputs.use_upstream_cache }}
     secrets: inherit
 
   macos-intel:
@@ -64,6 +76,7 @@ jobs:
       runner: macos-15-intel
       artifact: chromix-mac-x64
       max-stages: 8
+      use_upstream_cache: ${{ github.event_name != 'workflow_dispatch' || inputs.use_upstream_cache }}
     secrets: inherit
 
   macos-apple-silicon:
@@ -75,9 +88,12 @@ jobs:
       runner: macos-15
       artifact: chromix-mac-arm64
       max-stages: 8
+      use_upstream_cache: ${{ github.event_name != 'workflow_dispatch' || inputs.use_upstream_cache }}
     secrets: inherit
 
   windows-x64:
     name: Windows x64 (12-stage snapshot/resume)
     uses: ./.github/workflows/build-win-x64-github.yml
+    with:
+      use_upstream_cache: ${{ github.event_name != 'workflow_dispatch' || inputs.use_upstream_cache }}
     secrets: inherit

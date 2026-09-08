@@ -176,6 +176,57 @@ placed in `actions/cache`: their size, runner/toolchain coupling, and file
 metadata make a blind restore unreliable. A POSIX retry instead restores the
 explicit tar/zstd stage snapshots — never a cache guess.
 
+### Pinned upstream cache import
+
+Fresh unified builds try the five upstream Actions artifacts pinned in
+`build/upstream-cache.json`. The manifest records the repository, source commit,
+run, artifact ID, size, and SHA256 digest for each native target. This is explicit
+cross-repository artifact download, not shared `actions/cache` access. A manual
+unified dispatch can set `use_upstream_cache` to false for a full source build.
+An optional `UPSTREAM_ACTIONS_TOKEN` secret can grant access to public upstream
+Actions artifacts; otherwise the workflow tries its own `github.token`. A 403,
+404, expired artifact, checksum failure, or compatibility rejection records a
+cache miss and follows the normal build path.
+
+The importer runs **after canonical source preparation**. It never adopts the
+upstream source as Chromix source or writes source-layer markers on its behalf.
+Compiler/Rust/bindgen reuse is assessed separately from Chromium object reuse.
+The existing source-layer order, GN settings, SDK selection, and five-platform
+release checks remain authoritative. In particular, upstream `out/Default` is
+not blindly renamed to `out/Chromix`: differing flags, compiler inputs, SDKs,
+paths, or unverified external dependencies must prevent stale object reuse.
+Windows/macOS PGO and symbol settings differ from Chromix, so matching Chromium
+versions alone do not establish a usable object cache.
+
+Download and extraction occur in a separate, owned directory. Signed blob
+redirects receive no GitHub authorization header; the outer ZIP is hashed before
+its inner archive is extracted. Traversal, escaping links, and unsupported archive
+members cause fallback. Linux retains the complete donor source and generated
+inputs during the first build stage. After canonical GN generation, a compiler
+wrapper checks individual C/C++ commands, compiler/sysroot contents, Ninja records,
+input hashes, and both trees' preprocessor output. Compatible objects are copied
+with canonical dependency files; unsupported or changed inputs compile normally.
+PCM-consuming module builds, PCH, and response-file commands are not reused.
+For pinned GNU tar archives with second-resolution mtimes, object times must
+match the recorded timestamp's exact truncation, and inputs must predate the
+entire compilation-start second; ambiguous same-second inputs are misses.
+Windows/macOS currently reuse only compatible toolchain components, not objects.
+
+The donor and unused candidates are removed before first-stage handoff; copied
+objects and Ninja's own dependency records remain in the normal stage snapshot.
+The compiler wrapper stays configured on resumed stages to avoid changing Ninja
+commands, and passes through when no donor is available. Own-stage resume takes
+precedence and does not fetch upstream artifacts again.
+
+Diagnostics include `upstream-cache-import.json`, `upstream-object-cache.json`
+(actual first-stage hits, misses, and reused bytes), the downloader's `result.json`,
+and a `ninja -n` planned-work log when the build reaches graph generation. A
+successful download is not an object-cache hit, and a planned-work count is not
+a measured speedup. Native CI is required to establish actual hits and elapsed
+time; local regression tests use small fixtures and never compile Chromium.
+Artifact expiry requires updating the pinned manifest after checking the new
+upstream run and digest, rather than silently selecting the newest upload.
+
 Host toolchains follow the host architecture, not the target: Node resolves
 through `third_party/node/linux/node-linux-$HOST_ARCH/bin/node` with an extra
 x64 link for hardcoded generator paths, Go is linked as
@@ -290,12 +341,13 @@ Resume an interrupted compile with the same work directory:
 pwsh build/windows/build.ps1 -WorkDir D:\chromix-build -Resume -Jobs 8
 ```
 
-For GitHub Actions, stage 1 can optionally import a live `build-artifact` from a
-matching public `ungoogled-chromium-windows` x64 run. Set the workflow input
-`upstream_run_id` and repository secret `UPSTREAM_ACTIONS_TOKEN` (a token with
-Actions read access). The imported source and object tree is reused where GN and
-Ninja inputs remain compatible; Chromix patches and differing GN arguments
-invalidate affected outputs automatically.
+For GitHub Actions, stage 1 defaults to the pinned Windows `build-artifact`
+through `use_upstream_cache`. An optional `upstream_run_id` must equal the run in
+`build/upstream-cache.json`; it cannot select an arbitrary upload. The
+`UPSTREAM_ACTIONS_TOKEN` secret grants Actions read access. Windows keeps its
+canonical prepared source and only imports bindgen when the compiler and Rust
+contents match. Chromium object reuse on Windows remains disabled because SDK
+and relocation compatibility have not been established.
 
 `-Resume` still validates the prepared source marker against the current
 ungoogled pins and patch-content hash. A stale or mixed source tree is rejected.
@@ -304,9 +356,10 @@ ungoogled pins and patch-content hash. A stale or mixed source tree is rejected.
 
 Linux and macOS apply ungoogled domain substitution by default after all source
 and platform toolchain resources have been downloaded. Set
-`CHROMIX_APPLY_DOMAIN_SUBSTITUTION=0` only for build debugging. Windows keeps it
-explicit because its separate staged download flow can still need original tool
-URLs; use:
+`CHROMIX_APPLY_DOMAIN_SUBSTITUTION=0` only for build debugging. Windows Actions
+apply the Windows overlay's domain list after toolchain bootstrap/bindgen and
+before GN generation, with explicit interruption and completion markers. The
+standalone Windows build keeps substitution explicit; use:
 
 ```powershell
 pwsh build/windows/build.ps1 -WorkDir D:\chromix-build -Resume -ApplyDomainSubstitution

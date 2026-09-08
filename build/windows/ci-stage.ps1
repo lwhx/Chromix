@@ -10,7 +10,8 @@ param(
   [int]$StageIndex = 1,
   [int]$MaxStages = 12,
   [switch]$FromArtifact,
-  [string]$UpstreamArtifactPath = "",
+  [switch]$UseUpstreamCache,
+  [ValidatePattern('\A[0-9]*\z')] [string]$UpstreamRunId = "",
   [switch]$ValidateOnly
 )
 $ErrorActionPreference = "Stop"
@@ -22,6 +23,8 @@ $WorkDir = "$Root\chromix"
 $Src = "$WorkDir\src"
 $OutDir = "$Src\out\Chromix"
 $PartsDir = "C:\parts"
+$UpstreamCacheDir = "C:\u"
+$ImportUpstreamCache = $false
 $Deadline = (Get-Date).AddMinutes(300)
 $PackReserveMin = 40
 
@@ -310,57 +313,6 @@ $env:DEPOT_TOOLS_WIN_TOOLCHAIN = "0"
 $env:DEPOT_TOOLS_METRICS = "0"
 $env:DEPOT_TOOLS_COLLECT_METRICS = "0"
 
-if ($UpstreamArtifactPath) {
-  if ($StageIndex -ne 1) { throw "upstream artifact import must start at stage 1" }
-  $upstreamExtract = "C:\upstream-build-artifact"
-  Remove-Item $upstreamExtract -Recurse -Force -ErrorAction SilentlyContinue
-  New-Item -ItemType Directory -Force -Path $upstreamExtract | Out-Null
-  Write-Host "==> importing ungoogled-chromium-windows artifact from $UpstreamArtifactPath"
-  $innerArchive = Join-Path $UpstreamArtifactPath "artifacts.zip"
-  if (-not (Test-Path $innerArchive)) { throw "upstream artifact does not contain artifacts.zip" }
-  Remove-Item $WorkDir -Recurse -Force -ErrorAction SilentlyContinue
-  New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
-  $sevenZip = Resolve-7Zip
-  & $sevenZip x $innerArchive -o"$WorkDir" -y | Select-Object -Last 3
-  if ($LASTEXITCODE -ne 0) { throw "upstream build tree extraction failed" }
-  $upstreamSrc = Join-Path $WorkDir "src"
-  if (-not (Test-Path (Join-Path $upstreamSrc "BUILD.gn"))) {
-    $upstreamSrc = Join-Path $WorkDir "build\src"
-  }
-  if (-not (Test-Path (Join-Path $upstreamSrc "BUILD.gn"))) {
-    throw "upstream artifact is missing src/BUILD.gn"
-  }
-  $versionFile = Join-Path $upstreamSrc "chrome\VERSION"
-  if (-not (Test-Path $versionFile)) { throw "upstream artifact is missing chrome/VERSION" }
-  $versionParts = @{}
-  foreach ($line in Get-Content $versionFile) {
-    if ($line -match '^([A-Z]+)=(\d+)$') { $versionParts[$Matches[1]] = $Matches[2] }
-  }
-  $upstreamVersion = @("MAJOR", "MINOR", "BUILD", "PATCH") |
-    ForEach-Object { $versionParts[$_] }
-  $upstreamVersion = $upstreamVersion -join "."
-  if ($upstreamVersion -ne $Revisions.ChromiumVersion) {
-    throw "upstream artifact targets Chromium $upstreamVersion, expected $($Revisions.ChromiumVersion)"
-  }
-  if ((Resolve-Path $upstreamSrc).Path -ne $Src) {
-    Move-Item $upstreamSrc $Src
-  }
-  Remove-Item (Join-Path $WorkDir "build") -Recurse -Force -ErrorAction SilentlyContinue
-  $upstreamOut = Join-Path $Src "out\Default"
-  if (Test-Path $upstreamOut) {
-    New-Item -ItemType Directory -Force -Path (Split-Path $OutDir) | Out-Null
-    Move-Item $upstreamOut $OutDir
-  }
-  Set-Content -Path (Join-Path $Src ".chromix-source-unpacked") `
-    -Value $Revisions.ChromiumVersion -Encoding ASCII
-  Set-Content -Path (Join-Path $Src ".chromix-ungoogled-core") `
-    -Value $Revisions.UngoogledCommit -Encoding ASCII
-  Set-Content -Path (Join-Path $Src ".chromix-ungoogled-windows") `
-    -Value $Revisions.UngoogledWindowsCommit -Encoding ASCII
-  Remove-Item $upstreamExtract -Recurse -Force -ErrorAction SilentlyContinue
-  Write-Host "==> upstream Chromium source/object tree imported; Chromix patches remain to apply"
-}
-
 if ($FromArtifact -and -not (Test-Path "C:\restore\tree.7z.001")) {
   throw "resume artifact missing: C:\restore\tree.7z.001"
 }
@@ -374,7 +326,15 @@ if ($FromArtifact) {
   & $sevenZip x "C:\restore\tree.7z.001" -o"$Root" -y | Select-Object -Last 3
   if ($LASTEXITCODE -ne 0) { throw "7z restore failed" }
   Remove-Item C:\restore -Recurse -Force -ErrorAction SilentlyContinue
+}
 
+$domainProgress = Join-Path $Src ".chromix-domain-substitution-in-progress"
+$domainMarker = Join-Path $Src ".chromix-domain-substituted"
+if (Test-Path $domainProgress) {
+  throw "domain substitution was interrupted; use a clean work directory"
+}
+
+if ($FromArtifact) {
   $unpackedMarker = Join-Path $Src ".chromix-source-unpacked"
   $readyMarker = Join-Path $Src ".chromix-source-ready"
   $restoredVersion = ""
@@ -411,6 +371,38 @@ if (-not (Test-Path (Join-Path $Src ".chromix-source-ready"))) {
   }
 }
 
+if ($StageIndex -eq 1 -and -not $ValidateOnly -and -not $FromArtifact -and
+    ($UseUpstreamCache -or $UpstreamRunId)) {
+  # Leave time for bootstrap/compile and the normal snapshot reserve.
+  if ((Get-RemainingMin) -lt ($PackReserveMin + 60)) {
+    Write-Host "==> skipping optional upstream cache: insufficient stage budget"
+  } else {
+    $fetchArgs = @(
+      (Join-Path $Repo "tools\fetch_upstream_cache.py"),
+      "--platform", "windows", "--arch", "x64", "--destination", $UpstreamCacheDir
+    )
+    if ($UpstreamRunId) { $fetchArgs += @("--run-id", $UpstreamRunId) }
+    # Bound the optional download/extraction within the five-hour stage budget.
+    $fetchCommandLine = ($fetchArgs | ForEach-Object { "`"$_`"" }) -join " "
+    $fetchRc = Invoke-Tracked -File (Get-Command python -ErrorAction Stop).Source `
+      -ArgList $fetchCommandLine -Cwd $Repo -TimeoutSec 1200
+    if ($fetchRc -eq 124) {
+      Write-Host "==> optional upstream cache timed out; continuing with the prepared source"
+    } elseif ($fetchRc -ne 0) {
+      throw "upstream cache fetch helper failed (exit $fetchRc)"
+    } else {
+      $ImportUpstreamCache = $true
+    }
+  }
+}
+
+if ($ImportUpstreamCache) {
+  # Optional misses return zero; the prepared source remains authoritative.
+  python (Join-Path $Repo "tools\import_upstream_cache.py") --phase toolchain `
+    --platform windows --arch x64 --workdir $WorkDir --cache-dir $UpstreamCacheDir
+  if ($LASTEXITCODE -ne 0) { throw "upstream toolchain import helper failed (exit $LASTEXITCODE)" }
+}
+
 $UngoogledTooling = Join-Path $WorkDir "tooling\ungoogled-chromium"
 $WindowsTooling = Join-Path $WorkDir "tooling\ungoogled-chromium-windows"
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
@@ -445,8 +437,35 @@ try {
     python tools\rust\build_bindgen.py --skip-test
     if ($LASTEXITCODE -ne 0) { throw "bindgen build failed" }
   }
+  if (-not (Test-Path $domainMarker)) {
+    # The pinned helper selects compression from the cache filename's suffix.
+    $domainCache = Join-Path $WorkDir "domain_substitution_cache.tar.gz"
+    if ((Test-Path $domainCache) -or
+        (Test-Path (Join-Path $WorkDir "domain_substitution_cache.tar"))) {
+      throw "domain substitution cache exists without a completion marker; use a clean work directory"
+    }
+    Set-Content -Path $domainProgress -Value $Revisions.UngoogledCommit -Encoding ASCII
+    Write-Host "==> applying ungoogled domain substitution"
+    python (Join-Path $UngoogledTooling "utils\domain_substitution.py") apply `
+      -r (Join-Path $UngoogledTooling "domain_regex.list") `
+      -f (Join-Path $WindowsTooling "domain_substitution.list") `
+      -c $domainCache $Src
+    if ($LASTEXITCODE -ne 0) { throw "domain substitution failed" }
+    Move-Item -LiteralPath $domainProgress -Destination $domainMarker
+  }
+  if ($ImportUpstreamCache) {
+    # The helper may reject incompatible objects without replacing args.gn or the output layout.
+    python (Join-Path $Repo "tools\import_upstream_cache.py") --phase objects `
+      --platform windows --arch x64 --workdir $WorkDir --cache-dir $UpstreamCacheDir
+    if ($LASTEXITCODE -ne 0) { throw "upstream object import helper failed (exit $LASTEXITCODE)" }
+  }
   & $gn gen $OutDir --fail-on-unused-args
   if ($LASTEXITCODE -ne 0) { throw "gn gen failed" }
+  if ($ImportUpstreamCache) {
+    & (Join-Path $Src "third_party\ninja\ninja.exe") -C $OutDir -n chrome `
+      *> (Join-Path $WorkDir "upstream-cache-plan.log")
+    if ($LASTEXITCODE -ne 0) { throw "upstream cache build-plan check failed" }
+  }
 } finally {
   Pop-Location
 }

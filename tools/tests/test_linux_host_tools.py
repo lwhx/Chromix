@@ -21,6 +21,8 @@ class LinuxHostToolTest(unittest.TestCase):
         tools.mkdir()
         (work / "src").mkdir(parents=True)
         shutil.copy2(REPO / "build/build.sh", repo / "build/build.sh")
+        (repo / "build/posix").mkdir()
+        shutil.copy2(REPO / "build/posix/upstream-cache.sh", repo / "build/posix/upstream-cache.sh")
         prepare = repo / "build/prepare-ungoogled.sh"
         prepare.write_text("#!/bin/sh\nexit 0\n")
         prepare.chmod(0o755)

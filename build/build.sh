@@ -2,6 +2,7 @@
 # Native Linux build using pinned ungoogled-chromium source layers.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$REPO/build/posix/upstream-cache.sh"
 WORK="${1:-$REPO/.chromix-build-linux}"
 HOST_ARCH="$(uname -m)"
 case "$HOST_ARCH" in x86_64) HOST_ARCH=x64 ;; aarch64) HOST_ARCH=arm64 ;; esac
@@ -59,7 +60,10 @@ if [ ! -f "$SRC/.chromix-toolchain-ready" ]; then
   if [ -f "$SRC/.chromix-domain-substituted" ]; then
     echo "toolchain is incomplete in a domain-substituted source tree; use a clean work directory" >&2; exit 1
   fi
-  if [ "$ARCH" = x64 ]; then
+  chromix_import_upstream_cache toolchain linux
+  if chromix_has_upstream_toolchain; then
+    echo "==> reusing verified upstream LLVM/Rust toolchains"
+  elif [ "$ARCH" = x64 ]; then
     python3 tools/rust/update_rust.py
     python3 tools/clang/scripts/update.py
   else
@@ -70,7 +74,7 @@ if [ ! -f "$SRC/.chromix-toolchain-ready" ]; then
     python3 tools/rust/build_rust.py --skip-test
   fi
   python3 build/linux/sysroot_scripts/install-sysroot.py --arch="$SYSROOT_ARCH"
-  if [ "$ARCH" = arm64 ]; then
+  if [ "$ARCH" = arm64 ] && [ ! -x third_party/rust-toolchain/bin/bindgen ]; then
     python3 tools/rust/build_bindgen.py --skip-test
   fi
   test -x third_party/rust-toolchain/bin/bindgen
@@ -101,6 +105,9 @@ if [ ! -x "$OUT/gn" ]; then
   CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }-Wno-deprecated-declarations" \
     python3 tools/gn/bootstrap/bootstrap.py -o "$OUT/gn" --skip-generate-buildfiles
 fi
+chromix_configure_upstream_objects
 "$OUT/gn" gen "$OUT" --fail-on-unused-args
+chromix_import_upstream_cache objects linux
+chromix_report_upstream_plan chrome chrome_crashpad_handler chrome_sandbox
 ninja -C "$OUT" -j "${CHROMIX_JOBS:-$(getconf _NPROCESSORS_ONLN)}" chrome chrome_crashpad_handler chrome_sandbox
 "$OUT/chrome" --version

@@ -147,6 +147,198 @@ class ValidateOnlyRegressionTest(unittest.TestCase):
         self.assertNotIn("Test-Path", source)
 
 
+class DomainSubstitutionRegressionTest(unittest.TestCase):
+    def setUp(self):
+        self.stage = CI_STAGE.read_text(encoding="utf-8")
+        guard_start = self.stage.index('$domainProgress = Join-Path $Src')
+        guard_end = self.stage.index('\nif ($FromArtifact) {', guard_start)
+        self.guard = self.stage[guard_start:guard_end]
+        start = self.stage.index('  if (-not (Test-Path $domainMarker)) {')
+        end = self.stage.index('  if ($ImportUpstreamCache) {', start)
+        self.substitution = self.stage[start:end]
+
+    def test_matches_native_windows_substitution_after_tool_setup(self):
+        native = (REPO / "build/windows/build.ps1").read_text(encoding="utf-8")
+        for argument in (
+            'python (Join-Path $UngoogledTooling "utils\\domain_substitution.py") apply',
+            '-r (Join-Path $UngoogledTooling "domain_regex.list")',
+            '-f (Join-Path $WindowsTooling "domain_substitution.list")',
+        ):
+            self.assertIn(argument, native)
+            self.assertIn(argument, self.substitution)
+        self.assertIn('-c $domainCache $Src', self.substitution)
+        self.assertIn('domain_substitution_cache.tar.gz', self.substitution)
+        start = self.stage.index(self.substitution)
+        self.assertLess(self.stage.index('throw "bindgen build failed"'), start)
+        self.assertLess(self.stage.index('throw "GN bootstrap failed"'), start)
+        self.assertLess(start, self.stage.index('--phase objects'))
+        self.assertLess(start, self.stage.index('& $gn gen $OutDir'))
+        self.assertNotIn('$ValidateOnly', self.substitution)
+        self.assertNotIn('$ImportUpstreamCache', self.substitution)
+
+    def test_interrupted_restore_is_rejected_before_source_migration_or_import(self):
+        guard = self.stage.index(self.guard)
+        restore = self.stage.index('& $sevenZip x "C:\\restore\\tree.7z.001"')
+        self.assertLess(restore, guard)
+        self.assertLess(guard, self.stage.index('update-restored-source.ps1', restore))
+        self.assertLess(guard, self.stage.index('prepare-ungoogled.ps1', restore))
+        self.assertLess(guard, self.stage.index('--phase toolchain'))
+        self.assertIn('if (Test-Path $domainProgress)', self.guard)
+        self.assertNotIn('Test-Path $domainMarker', self.guard)
+        self.assertNotIn('Remove-Item', self.guard)
+        progress = self.substitution.index('Set-Content -Path $domainProgress')
+        apply = self.substitution.index('python (Join-Path $UngoogledTooling')
+        checked = self.substitution.index('if ($LASTEXITCODE -ne 0)')
+        completed = self.substitution.index('Move-Item -LiteralPath $domainProgress -Destination $domainMarker')
+        self.assertLess(progress, apply)
+        self.assertLess(apply, checked)
+        self.assertLess(checked, completed)
+        self.assertNotIn('Set-Content -Path $domainMarker', self.stage)
+
+    def fixture(self, fail=False):
+        import os
+        import shutil
+        import sys
+        import tempfile
+
+        powershell = shutil.which("pwsh")
+        if not powershell:
+            self.skipTest("pwsh is unavailable")
+        utils = (REPO / ".chromix-build-verify/tooling/ungoogled-chromium/utils")
+        if not (utils / "domain_substitution.py").is_file():
+            self.skipTest("pinned ungoogled-chromium verification tooling is unavailable")
+        temp = tempfile.TemporaryDirectory(prefix="chromix domain substitution ")
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        src = root / "src"
+        src.mkdir()
+        core = root / "tooling/ungoogled-chromium"
+        windows = root / "tooling/ungoogled-chromium-windows"
+        (core / "utils").mkdir(parents=True)
+        windows.mkdir(parents=True)
+        for name in ("domain_substitution.py", "_common.py", "_extraction.py"):
+            shutil.copy2(utils / name, core / "utils" / name)
+        (core / "domain_regex.list").write_text(r"google\.test#blocked.test" + "\n")
+        (windows / "domain_substitution.list").write_text(
+            "source.cc\n" + ("invalid|entry\n" if fail else ""))
+        (src / "source.cc").write_text('const char* url = "https://google.test/path";\n')
+        # A core-only entry must not replace the Windows platform file list.
+        (core / "domain_substitution.list").write_text("untouched.cc\n")
+        (src / "untouched.cc").write_text("google.test\n")
+        (root / "gn.ps1").write_text(
+            'Add-Content -Path $env:DOMAIN_TEST_CALLS -Value "gn"\n'
+            '$global:LASTEXITCODE = 0\n')
+        end = self.stage.index('  if ($ImportUpstreamCache) {',
+                               self.stage.index('throw "gn gen failed"'))
+        pipeline = self.stage[self.stage.index(self.substitution):end]
+        script = root / "fixture.ps1"
+        script.write_text(r'''
+$ErrorActionPreference = "Stop"
+$WorkDir = $env:DOMAIN_TEST_ROOT
+$Src = Join-Path $WorkDir "src"
+$Repo = $WorkDir
+$OutDir = Join-Path $Src "out"
+$UngoogledTooling = Join-Path $WorkDir "tooling/ungoogled-chromium"
+$WindowsTooling = Join-Path $WorkDir "tooling/ungoogled-chromium-windows"
+$Revisions = @{ UngoogledCommit = "fixture-core-commit" }
+$ImportUpstreamCache = ($env:DOMAIN_TEST_IMPORT -eq "1")
+$UpstreamCacheDir = Join-Path $WorkDir "cache"
+$gn = Join-Path $WorkDir "gn.ps1"
+function python {
+  if ($args[0] -like '*import_upstream_cache.py') {
+    Add-Content -Path $env:DOMAIN_TEST_CALLS -Value "objects"
+    $global:LASTEXITCODE = 0
+    return
+  }
+  Add-Content -Path $env:DOMAIN_TEST_CALLS -Value "substitution"
+  & $env:DOMAIN_TEST_PYTHON @args
+  $global:LASTEXITCODE = $LASTEXITCODE
+}
+''' + self.guard + "\n" + pipeline)
+        env = {**os.environ, "DOMAIN_TEST_ROOT": str(root),
+               "DOMAIN_TEST_PYTHON": sys.executable,
+               "DOMAIN_TEST_CALLS": str(root / "calls"),
+               "PYTHONDONTWRITEBYTECODE": "1"}
+        return root, [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], env
+
+    def run_fixture(self, command, env, imported=True):
+        import subprocess
+
+        return subprocess.run(command, env={**env, "DOMAIN_TEST_IMPORT": str(int(imported))},
+                              capture_output=True, text=True, timeout=20)
+
+    def test_real_substitution_then_objects_and_gn_and_idempotent_resume(self):
+        import tarfile
+
+        root, command, env = self.fixture()
+        src = root / "src"
+        original = (src / "source.cc").read_bytes()
+        result = self.run_fixture(command, env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(b"https://blocked.test/path", (src / "source.cc").read_bytes())
+        self.assertEqual((src / "untouched.cc").read_text(), "google.test\n")
+        self.assertFalse((src / ".chromix-domain-substitution-in-progress").exists())
+        self.assertEqual((src / ".chromix-domain-substituted").read_text().strip(),
+                         "fixture-core-commit")
+        cache = root / "domain_substitution_cache.tar.gz"
+        with tarfile.open(cache) as archive:
+            self.assertEqual(archive.extractfile("orig/source.cc").read(), original)
+            self.assertIn(b"source.cc|", archive.extractfile("cache_index.list").read())
+        self.assertEqual((root / "calls").read_text().splitlines(),
+                         ["substitution", "objects", "gn"])
+        modified = (src / "source.cc").stat().st_mtime_ns
+        cache_bytes = cache.read_bytes()
+        resumed = self.run_fixture(command, env)
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertEqual((src / "source.cc").stat().st_mtime_ns, modified)
+        self.assertEqual(cache.read_bytes(), cache_bytes)
+        self.assertEqual((root / "calls").read_text().splitlines(),
+                         ["substitution", "objects", "gn", "objects", "gn"])
+
+    def test_substitution_is_required_without_upstream_cache(self):
+        root, command, env = self.fixture()
+        result = self.run_fixture(command, env, imported=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((root / "calls").read_text().splitlines(), ["substitution", "gn"])
+        self.assertTrue((root / "src/.chromix-domain-substituted").is_file())
+
+    def test_partial_failure_is_not_stamped_or_retried_on_restore(self):
+        root, command, env = self.fixture(fail=True)
+        result = self.run_fixture(command, env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("domain substitution failed", result.stderr)
+        src = root / "src"
+        self.assertIn("blocked.test", (src / "source.cc").read_text())
+        self.assertTrue((src / ".chromix-domain-substitution-in-progress").is_file())
+        self.assertFalse((src / ".chromix-domain-substituted").exists())
+        self.assertEqual((root / "calls").read_text().splitlines(), ["substitution"])
+        resumed = self.run_fixture(command, env)
+        self.assertNotEqual(resumed.returncode, 0)
+        self.assertIn("domain substitution was interrupted", resumed.stderr)
+        self.assertEqual((root / "calls").read_text().splitlines(), ["substitution"])
+        self.assertFalse((src / ".chromix-domain-substituted").exists())
+
+    def test_interrupted_marker_wins_over_completion_marker_on_restore(self):
+        root, command, env = self.fixture()
+        for marker in (".chromix-domain-substitution-in-progress", ".chromix-domain-substituted"):
+            (root / "src" / marker).touch()
+        result = self.run_fixture(command, env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("domain substitution was interrupted", result.stderr)
+        self.assertFalse((root / "calls").exists())
+
+    def test_existing_cache_without_marker_never_manufactures_completion(self):
+        for name in ("domain_substitution_cache.tar.gz", "domain_substitution_cache.tar"):
+            with self.subTest(cache=name):
+                root, command, env = self.fixture()
+                (root / name).write_bytes(b"unproven cache")
+                result = self.run_fixture(command, env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("cache exists without a completion marker", result.stderr)
+                self.assertFalse((root / "src/.chromix-domain-substituted").exists())
+                self.assertFalse((root / "calls").exists())
+
+
 class ResumeWorkflowRegressionTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -155,7 +347,7 @@ class ResumeWorkflowRegressionTest(unittest.TestCase):
     def test_resume_skips_predecessors_and_starts_requested_stage(self):
         self.assertIn("resume_run_id:", self.source)
         self.assertIn(
-            "if: ${{ inputs.resume_run_id == '' && inputs.upstream_run_id == '' }}",
+            "if: ${{ inputs.resume_run_id == '' }}",
             self.source,
         )
         for stage in range(2, 13):
@@ -178,7 +370,7 @@ class ResumeWorkflowRegressionTest(unittest.TestCase):
             ),
             12,
         )
-        self.assertEqual(self.source.count("if: ${{ always() }}"), 48)
+        self.assertEqual(len(re.findall(r"- name: Upload tree part [1-4]\n        if: \$\{\{ always\(\) \}\}", self.source)), 48)
         self.assertEqual(self.source.count("- name: Upload tree part 1"), 12)
         self.assertEqual(self.source.count("- name: Upload tree part 4"), 12)
         self.assertNotIn("if: steps.stage.outputs.upload_parts == 'true'", self.source)
@@ -190,13 +382,14 @@ class ResumeWorkflowRegressionTest(unittest.TestCase):
             12,
         )
 
-    def test_upstream_cache_skips_standalone_validation_and_imports_stage_one(self):
+    def test_upstream_cache_keeps_validation_and_imports_only_stage_one(self):
         self.assertIn("upstream_run_id:", self.source)
-        self.assertIn("inputs.resume_run_id == '' && inputs.upstream_run_id == ''", self.source)
-        self.assertIn("repository: ungoogled-software/ungoogled-chromium-windows", self.source)
-        self.assertIn("name: build-artifact", self.source)
-        self.assertIn("github-token: ${{ secrets.UPSTREAM_ACTIONS_TOKEN }}", self.source)
-        self.assertIn("-UpstreamArtifactPath C:\\upstream", self.source)
+        self.assertIn("use_upstream_cache:", self.source)
+        self.assertIn("inputs.resume_run_id == '' && needs.validate.result == 'success'", self.source)
+        self.assertIn("GH_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_TOKEN || github.token }}", self.source)
+        self.assertIn("UPSTREAM_RUN_ID: ${{ inputs.upstream_run_id }}", self.source)
+        self.assertEqual(self.source.count("UseUpstreamCache ="), 1)
+        self.assertNotIn("-UpstreamArtifactPath", self.source)
 
     def test_resume_uses_official_cross_run_artifact_download(self):
         self.assertIn("actions: read", self.source)
@@ -229,25 +422,16 @@ class ReleaseChannelRegressionTest(unittest.TestCase):
 
 
 class RestoredSourceUpdateRegressionTest(unittest.TestCase):
-    def test_upstream_artifact_import_reuses_source_and_objects_before_chromix_patches(self):
+    def test_upstream_cache_never_adopts_source_or_stamps_unproven_layers(self):
         stage = CI_STAGE.read_text(encoding="utf-8")
-        self.assertIn('[string]$UpstreamArtifactPath = ""', stage)
-        self.assertIn('Join-Path $UpstreamArtifactPath "artifacts.zip"', stage)
-        self.assertIn('Join-Path $WorkDir "src"', stage)
-        self.assertIn('Join-Path $WorkDir "build\\src"', stage)
-        self.assertIn('upstream artifact is missing src/BUILD.gn', stage)
-        self.assertIn('Join-Path $upstreamSrc "chrome\\VERSION"', stage)
-        self.assertIn('$upstreamVersion -ne $Revisions.ChromiumVersion', stage)
-        self.assertIn('upstream artifact targets Chromium $upstreamVersion', stage)
-        self.assertIn('if ((Resolve-Path $upstreamSrc).Path -ne $Src)', stage)
-        self.assertIn('Move-Item $upstreamSrc $Src', stage)
-        self.assertIn('Join-Path $Src "out\\Default"', stage)
-        self.assertIn('Move-Item $upstreamOut $OutDir', stage)
-        self.assertIn('Set-Content -Path (Join-Path $Src ".chromix-ungoogled-core")', stage)
-        self.assertIn('Set-Content -Path (Join-Path $Src ".chromix-ungoogled-windows")', stage)
-        imported = stage.index('if ($UpstreamArtifactPath) {')
-        prepare = stage.index('prepare-ungoogled.ps1', imported)
-        self.assertLess(imported, prepare)
+        self.assertIn('[switch]$UseUpstreamCache', stage)
+        self.assertNotIn('$UpstreamArtifactPath', stage)
+        self.assertNotIn('Move-Item $upstreamSrc $Src', stage)
+        self.assertNotIn('Set-Content -Path (Join-Path $Src ".chromix-ungoogled-core")', stage)
+        self.assertNotIn('Set-Content -Path (Join-Path $Src ".chromix-ungoogled-windows")', stage)
+        prepare = stage.index('& "$PSScriptRoot\\prepare-ungoogled.ps1"')
+        imported = stage.index('--phase toolchain')
+        self.assertLess(prepare, imported)
 
     def test_resume_source_update_avoids_powershell_host_automatic_variable(self):
         update_source = RESTORED_SOURCE_UPDATE.read_text(encoding="utf-8")
@@ -543,6 +727,75 @@ class RestoredSourceUpdateRegressionTest(unittest.TestCase):
             'third_party\\blink\\renderer\\modules\\webgl\\webgl2_rendering_context_base.cc',
             update,
         )
+
+
+class WindowsPruningRegressionTest(unittest.TestCase):
+    def prune_options(self):
+        prepare = PREPARE_UNGOOGLED.read_text(encoding="utf-8")
+        call = re.search(
+            r'Invoke-Checked \$Python @\(\s*'
+            r'\(Join-Path \$Ungoogled "utils\\prune_binaries\.py"\),'
+            r'(?P<options>.*?)\$Src, '
+            r'\(Join-Path \$Ungoogled "pruning\.list"\)\s*\)',
+            prepare,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(call)
+        return re.findall(r'"(--[^"\s]+)"', call["options"])
+
+    def test_pruning_preserves_installed_tools_but_still_uses_pruning_list(self):
+        self.assertEqual(self.prune_options(), ["--keep-contingent-paths"])
+
+    def run_prune_fixture(self, options):
+        import subprocess
+        import sys
+        import tempfile
+
+        pruner = (REPO / ".chromix-build-verify/tooling/ungoogled-chromium"
+                  / "utils/prune_binaries.py")
+        if not pruner.is_file():
+            self.skipTest("pinned ungoogled-chromium verification tooling is unavailable")
+        temp = tempfile.TemporaryDirectory(prefix="chromix windows prune ")
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        src = root / "src"
+        tools = [
+            "third_party/rust-toolchain/bin/cargo.exe",
+            "third_party/rust-toolchain/bin/rustc.exe",
+            "third_party/rust-toolchain/lib/rustlib/x86_64-pc-windows-msvc/lib/std.rlib",
+            "third_party/llvm-build/Release+Asserts/bin/clang-cl.exe",
+            "third_party/ninja/ninja.exe",
+            "third_party/devtools-frontend/src/third_party/esbuild/esbuild.exe",
+        ]
+        for relative in tools:
+            path = src / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"installed toolchain fixture")
+        unwanted = src / "unneeded.bin"
+        unwanted.write_bytes(b"prune this listed binary")
+        pruning_list = root / "pruning.list"
+        pruning_list.write_text("unneeded.bin\n", encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, "-B", str(pruner), *options, str(src), str(pruning_list)],
+            cwd=root, capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(unwanted.exists())
+        return src, tools, result
+
+    def test_old_invocation_removes_toolchains_despite_absent_diagnostics(self):
+        src, tools, result = self.run_prune_fixture([])
+        self.assertIn("Absent: third_party/rust-toolchain/", result.stderr)
+        for relative in tools:
+            with self.subTest(path=relative):
+                self.assertFalse((src / relative).exists())
+
+    def test_prepare_invocation_keeps_toolchains_through_pruning(self):
+        src, tools, result = self.run_prune_fixture(self.prune_options())
+        self.assertIn("Keeping Contingent Paths", result.stderr)
+        for relative in tools:
+            with self.subTest(path=relative):
+                self.assertEqual((src / relative).read_bytes(), b"installed toolchain fixture")
 
 
 class RustToolchainMergeRegressionTest(unittest.TestCase):

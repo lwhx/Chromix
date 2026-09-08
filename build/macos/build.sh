@@ -2,6 +2,7 @@
 # Native macOS build using pinned ungoogled-chromium source layers.
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$REPO/build/posix/upstream-cache.sh"
 WORK="${1:-$REPO/.chromix-build-mac}"
 HOST_ARCH="$(uname -m)"
 [ "$HOST_ARCH" = x86_64 ] && HOST_ARCH=x64
@@ -22,7 +23,10 @@ if [ ! -f "$SRC/.chromix-toolchain-ready" ]; then
   if [ -f "$SRC/.chromix-domain-substituted" ]; then
     echo "toolchain is incomplete in a domain-substituted source tree; use a clean work directory" >&2; exit 1
   fi
-  python3 tools/rust/build_bindgen.py --skip-test
+  chromix_import_upstream_cache toolchain macos
+  if [ ! -x third_party/rust-toolchain/bin/bindgen ]; then
+    python3 tools/rust/build_bindgen.py --skip-test
+  fi
   touch "$SRC/.chromix-toolchain-ready"
 fi
 if [ -f "$SRC/.chromix-domain-substitution-in-progress" ]; then
@@ -44,6 +48,8 @@ python3 "$REPO/tools/merge_gn_args.py" "$OUT/args.gn" \
 if [ ! -x "$OUT/gn" ]; then
   python3 tools/gn/bootstrap/bootstrap.py -o "$OUT/gn" --skip-generate-buildfiles
 fi
+chromix_import_upstream_cache objects macos
 "$OUT/gn" gen "$OUT" --fail-on-unused-args
+chromix_report_upstream_plan chrome
 ninja -C "$OUT" -j "${CHROMIX_JOBS:-$(sysctl -n hw.ncpu)}" chrome
 printf '==> Done: %s\n' "$OUT/Chromium.app"

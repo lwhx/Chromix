@@ -26,6 +26,13 @@ on:
         required: false
         type: number
         default: 8
+      use_upstream_cache:
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      UPSTREAM_ACTIONS_TOKEN:
+        required: false
   workflow_dispatch:
 
 permissions:
@@ -146,6 +153,9 @@ jobs:
             ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
       - name: Run stage 1
         id: stage
+        env:
+          CHROMIX_USE_UPSTREAM_CACHE: ${{ inputs.use_upstream_cache && '1' || '0' }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_TOKEN || github.token }}
         run: |
           set -euo pipefail
           DEADLINE_EPOCH=$(( $(date +%s) + 300 * 60 ))
@@ -217,6 +227,10 @@ jobs:
           path: |
             ${{ runner.temp }}/chromix-logs/
             ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
+            ${{ runner.temp }}/chromix-build/upstream-cache-import.json
+            ${{ runner.temp }}/chromix-build/upstream-cache-plan.log
+            ${{ runner.temp }}/chromix-build/upstream-object-cache.json
+            ${{ runner.temp }}/chromix-upstream/result.json
           if-no-files-found: warn
           retention-days: 14
 
@@ -337,6 +351,9 @@ jobs:
             ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
       - name: Run stage 2
         id: stage
+        env:
+          CHROMIX_USE_UPSTREAM_CACHE: ${{ inputs.use_upstream_cache && '1' || '0' }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_TOKEN || github.token }}
         run: |
           set -euo pipefail
           DEADLINE_EPOCH=$(( $(date +%s) + 300 * 60 ))
@@ -409,6 +426,10 @@ jobs:
           path: |
             ${{ runner.temp }}/chromix-logs/
             ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
+            ${{ runner.temp }}/chromix-build/upstream-cache-import.json
+            ${{ runner.temp }}/chromix-build/upstream-cache-plan.log
+            ${{ runner.temp }}/chromix-build/upstream-object-cache.json
+            ${{ runner.temp }}/chromix-upstream/result.json
           if-no-files-found: warn
           retention-days: 14
 
@@ -529,6 +550,9 @@ jobs:
             ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
       - name: Run stage 3
         id: stage
+        env:
+          CHROMIX_USE_UPSTREAM_CACHE: ${{ inputs.use_upstream_cache && '1' || '0' }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_TOKEN || github.token }}
         run: |
           set -euo pipefail
           DEADLINE_EPOCH=$(( $(date +%s) + 300 * 60 ))
@@ -601,6 +625,10 @@ jobs:
           path: |
             ${{ runner.temp }}/chromix-logs/
             ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
+            ${{ runner.temp }}/chromix-build/upstream-cache-import.json
+            ${{ runner.temp }}/chromix-build/upstream-cache-plan.log
+            ${{ runner.temp }}/chromix-build/upstream-object-cache.json
+            ${{ runner.temp }}/chromix-upstream/result.json
           if-no-files-found: warn
           retention-days: 14
 
@@ -721,6 +749,9 @@ jobs:
             ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
       - name: Run stage 4
         id: stage
+        env:
+          CHROMIX_USE_UPSTREAM_CACHE: ${{ inputs.use_upstream_cache && '1' || '0' }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_TOKEN || github.token }}
         run: |
           set -euo pipefail
           DEADLINE_EPOCH=$(( $(date +%s) + 300 * 60 ))
@@ -793,6 +824,10 @@ jobs:
           path: |
             ${{ runner.temp }}/chromix-logs/
             ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
+            ${{ runner.temp }}/chromix-build/upstream-cache-import.json
+            ${{ runner.temp }}/chromix-build/upstream-cache-plan.log
+            ${{ runner.temp }}/chromix-build/upstream-object-cache.json
+            ${{ runner.temp }}/chromix-upstream/result.json
           if-no-files-found: warn
           retention-days: 14
 
@@ -913,6 +948,9 @@ jobs:
             ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
       - name: Run stage 5
         id: stage
+        env:
+          CHROMIX_USE_UPSTREAM_CACHE: ${{ inputs.use_upstream_cache && '1' || '0' }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_TOKEN || github.token }}
         run: |
           set -euo pipefail
           DEADLINE_EPOCH=$(( $(date +%s) + 300 * 60 ))
@@ -985,6 +1023,10 @@ jobs:
           path: |
             ${{ runner.temp }}/chromix-logs/
             ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
+            ${{ runner.temp }}/chromix-build/upstream-cache-import.json
+            ${{ runner.temp }}/chromix-build/upstream-cache-plan.log
+            ${{ runner.temp }}/chromix-build/upstream-object-cache.json
+            ${{ runner.temp }}/chromix-upstream/result.json
           if-no-files-found: warn
           retention-days: 14
 
@@ -1105,6 +1147,9 @@ jobs:
             ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
       - name: Run stage 6
         id: stage
+        env:
+          CHROMIX_USE_UPSTREAM_CACHE: ${{ inputs.use_upstream_cache && '1' || '0' }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_TOKEN || github.token }}
         run: |
           set -euo pipefail
           DEADLINE_EPOCH=$(( $(date +%s) + 300 * 60 ))
@@ -1177,6 +1222,10 @@ jobs:
           path: |
             ${{ runner.temp }}/chromix-logs/
             ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
+            ${{ runner.temp }}/chromix-build/upstream-cache-import.json
+            ${{ runner.temp }}/chromix-build/upstream-cache-plan.log
+            ${{ runner.temp }}/chromix-build/upstream-object-cache.json
+            ${{ runner.temp }}/chromix-upstream/result.json
           if-no-files-found: warn
           retention-days: 14
 
@@ -1297,6 +1346,9 @@ jobs:
             ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
       - name: Run stage 7
         id: stage
+        env:
+          CHROMIX_USE_UPSTREAM_CACHE: ${{ inputs.use_upstream_cache && '1' || '0' }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_TOKEN || github.token }}
         run: |
           set -euo pipefail
           DEADLINE_EPOCH=$(( $(date +%s) + 300 * 60 ))
@@ -1369,6 +1421,10 @@ jobs:
           path: |
             ${{ runner.temp }}/chromix-logs/
             ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
+            ${{ runner.temp }}/chromix-build/upstream-cache-import.json
+            ${{ runner.temp }}/chromix-build/upstream-cache-plan.log
+            ${{ runner.temp }}/chromix-build/upstream-object-cache.json
+            ${{ runner.temp }}/chromix-upstream/result.json
           if-no-files-found: warn
           retention-days: 14
 
@@ -1489,6 +1545,9 @@ jobs:
             ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
       - name: Run stage 8
         id: stage
+        env:
+          CHROMIX_USE_UPSTREAM_CACHE: ${{ inputs.use_upstream_cache && '1' || '0' }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_TOKEN || github.token }}
         run: |
           set -euo pipefail
           DEADLINE_EPOCH=$(( $(date +%s) + 300 * 60 ))
@@ -1561,5 +1620,9 @@ jobs:
           path: |
             ${{ runner.temp }}/chromix-logs/
             ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
+            ${{ runner.temp }}/chromix-build/upstream-cache-import.json
+            ${{ runner.temp }}/chromix-build/upstream-cache-plan.log
+            ${{ runner.temp }}/chromix-build/upstream-object-cache.json
+            ${{ runner.temp }}/chromix-upstream/result.json
           if-no-files-found: warn
           retention-days: 14

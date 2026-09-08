@@ -106,6 +106,16 @@ else
   "$REPO/build/prepare-ungoogled.sh" "$WORK" "$PLATFORM" "$ARCH"
 fi
 
+# Upstream trees are donors only; source preparation above remains authoritative.
+if [ "$STAGE_INDEX" -eq 1 ] && [ -z "$FROM_SNAPSHOT" ] &&
+   [ "${CHROMIX_USE_UPSTREAM_CACHE:-0}" = 1 ] &&
+   [ "$(remaining_min)" -ge 90 ]; then
+  UPSTREAM_CACHE_DIR="${RUNNER_TEMP:-$(dirname "$WORK")}/chromix-upstream"
+  bash "$REPO/build/posix/fetch-upstream-cache.sh" \
+    --platform "$PLATFORM" --arch "$ARCH" --destination "$UPSTREAM_CACHE_DIR"
+  export CHROMIX_UPSTREAM_CACHE_DIR="$UPSTREAM_CACHE_DIR"
+fi
+
 # ---- bounded compile ------------------------------------------------------
 NINJA_BUDGET=$(( $(remaining_min) - RESERVE_MINUTES ))
 if [ "$NINJA_BUDGET" -le 20 ]; then
@@ -139,6 +149,11 @@ set +e
     "$BUILD_SCRIPT" "$WORK" "$ARCH"
 RC=$?
 set -e
+if [ -n "${CHROMIX_UPSTREAM_CACHE_DIR:-}" ]; then
+  python3 "$REPO/tools/import_upstream_cache.py" --phase finalize \
+    --platform "$PLATFORM" --arch "$ARCH" --workdir "$WORK" \
+    --cache-dir "$CHROMIX_UPSTREAM_CACHE_DIR"
+fi
 # Mirror the Windows chain's last-stage guard: a green run without a finished
 # build would let release-browser accept an incomplete artifact set.
 

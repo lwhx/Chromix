@@ -39,6 +39,13 @@ on:
         required: false
         type: number
         default: 8
+      use_upstream_cache:
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      UPSTREAM_ACTIONS_TOKEN:
+        required: false
   workflow_dispatch:
 
 permissions:
@@ -169,6 +176,9 @@ def run_step(stage: int) -> str:
     return (
         """      - name: Run stage __STAGE__
         id: stage
+        env:
+          CHROMIX_USE_UPSTREAM_CACHE: ${{ inputs.use_upstream_cache && '1' || '0' }}
+          GH_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_TOKEN || github.token }}
         run: |
           set -euo pipefail
           DEADLINE_EPOCH=$(( $(date +%s) + 300 * 60 ))
@@ -255,6 +265,10 @@ FINAL_UPLOADS = """      - name: Upload final bundle
           path: |
             ${{ runner.temp }}/chromix-logs/
             ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
+            ${{ runner.temp }}/chromix-build/upstream-cache-import.json
+            ${{ runner.temp }}/chromix-build/upstream-cache-plan.log
+            ${{ runner.temp }}/chromix-build/upstream-object-cache.json
+            ${{ runner.temp }}/chromix-upstream/result.json
           if-no-files-found: warn
           retention-days: 14
 """

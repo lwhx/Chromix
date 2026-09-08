@@ -235,6 +235,8 @@ class MacOSToolchainTest(unittest.TestCase):
         repo = self.root / "repo"
         (repo / "build/macos").mkdir(parents=True)
         shutil.copy2(BUILD, repo / "build/macos/build.sh")
+        (repo / "build/posix").mkdir()
+        shutil.copy2(REPO / "build/posix/upstream-cache.sh", repo / "build/posix/upstream-cache.sh")
         shutil.copy2(SELECT_XCODE, repo / "build/macos/select-xcode.sh")
         prepare = repo / "build/prepare-ungoogled.sh"
         prepare.write_text('#!/bin/sh\nprintenv DEVELOPER_DIR > "$1/selected"\nexit 77\n')

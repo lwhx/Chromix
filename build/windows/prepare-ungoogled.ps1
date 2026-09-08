@@ -366,8 +366,10 @@ if (-not (Test-Marker ".chromix-ungoogled-windows" $Revisions.UngoogledWindowsCo
 
 if (-not (Test-Marker ".chromix-binaries-pruned" $Revisions.UngoogledCommit)) {
   Write-Host "==> pruning unneeded binaries"
+  # Contingent paths include the Windows toolchains already installed above.
   Invoke-Checked $Python @(
     (Join-Path $Ungoogled "utils\prune_binaries.py"),
+    "--keep-contingent-paths",
     $Src, (Join-Path $Ungoogled "pruning.list")
   )
   Set-Marker ".chromix-binaries-pruned" $Revisions.UngoogledCommit
