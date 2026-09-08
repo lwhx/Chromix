@@ -50,6 +50,13 @@ with a launcher, fonts, and Chromium/Chromix license files. These are runtime
 bundles, not fully static binaries; the target host still needs compatible
 system libraries and a working Chromium sandbox.
 
+The pinned portablelinux ARM64 patch has an incorrect Rust import hunk count
+(`7/7` instead of `8/8`). GNU patch can skip the following four Rust hunks,
+leaving x86_64 host-tool assumptions in place. Linux preparation corrects this
+specific patch header before applying the platform layer; the intended source
+changes and layer order stay unchanged. Prepared trees created with the old
+preparation hash require a clean work directory.
+
 ## Native macOS builds
 
 Use Xcode 26 or newer with a macOS 26 SDK or newer, the command-line tools,

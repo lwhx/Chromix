@@ -76,6 +76,31 @@ if [ "$PLATFORM" = macos ]; then
 else
   test "$CORE_VERSION" = "$PLATFORM_VERSION"
 fi
+if [ "$PLATFORM" = linux ]; then
+  # The pinned patch's short import hunk silently hides four Rust ARM64 hunks.
+  python3 - "$PLATFORM_PATCHES/ungoogled-chromium/portablelinux/fix-compiling-on-arm64.patch" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    content = path.read_bytes()
+except FileNotFoundError:
+    raise SystemExit(f'missing portablelinux ARM64 patch: {path}')
+bad = (b'--- a/tools/rust/build_rust.py\n'
+       b'+++ b/tools/rust/build_rust.py\n'
+       b'@@ -55,7 +55,7 @@')
+good = bad.replace(b'-55,7 +55,7', b'-55,8 +55,8')
+corrected = content.replace(bad, good, 1)
+# Exact corrected payload from portablelinux 02c59ed68d1963a647bb478064823d114e466ffb.
+expected = 'bf1e5d6978c5b3b5121336b673ea5138941e9d1e28d00cf47c232ec08521f0e1'
+if hashlib.sha256(corrected).hexdigest() != expected:
+    raise SystemExit(f'unexpected portablelinux ARM64 patch; review pinned workaround: {path}')
+if corrected != content:
+    path.write_bytes(corrected)
+PY
+fi
 PATCH_BIN="${PATCH_BIN:-$(command -v gpatch || command -v patch)}"
 export PATCH_BIN
 mkdir -p "$SRC"
