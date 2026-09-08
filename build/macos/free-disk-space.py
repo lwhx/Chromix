@@ -11,9 +11,8 @@ import sys
 
 APPLICATIONS = Path("/Applications")
 SIMULATOR_RUNTIMES = Path("/Library/Developer/CoreSimulator/Profiles/Runtimes")
-# Reserve for the compressed archive, full source + out/Default, and build/handoff.
-# Unmeasured conservative budget; it does not guarantee full restore capacity.
-MIN_FREE_BYTES = 120 * 1024**3
+# Best-effort cleanup target; actual archive/chunk admission belongs to the fetcher.
+CLEANUP_TARGET_BYTES = 120 * 1024**3
 MOBILE_PLATFORMS = {
     "iPhoneOS": "iPhoneOS",
     "iPhoneSimulator": "iPhoneSimulator",
@@ -117,7 +116,7 @@ def remove_target(path):
 def record_space(label, work_volume):
     usage = shutil.disk_usage(work_volume)
     log(f"{label}: volume={work_volume}; free_bytes={usage.free}; "
-        f"free_GiB={usage.free / 1024**3:.2f}; required_free_GiB={MIN_FREE_BYTES / 1024**3:.0f}")
+        f"free_GiB={usage.free / 1024**3:.2f}; cleanup_target_GiB={CLEANUP_TARGET_BYTES / 1024**3:.0f}")
     subprocess.run(["df", "-h", str(work_volume)], check=True)
     return usage.free
 
@@ -207,10 +206,10 @@ def cleanup():
                                "*.simruntime", "runtime"))
                 groups.append((mobile / "Developer/SDKs", sdk_name + "*.sdk", "sdk"))
         for root, pattern, kind in groups:
-            if shutil.disk_usage(work_volume).free >= MIN_FREE_BYTES:
+            if shutil.disk_usage(work_volume).free >= CLEANUP_TARGET_BYTES:
                 break
             for path, allowed_root, allowed_pattern, allowed_kind in candidates(root, pattern, kind):
-                if shutil.disk_usage(work_volume).free >= MIN_FREE_BYTES:
+                if shutil.disk_usage(work_volume).free >= CLEANUP_TARGET_BYTES:
                     break
                 if not safe_target(path, allowed_root, allowed_pattern, allowed_kind, selected_paths, protected):
                     continue
@@ -222,11 +221,12 @@ def cleanup():
     finally:
         after = record_space("after", work_volume)
         log(f"net_reclaimed_bytes={after - before}")
-    if after < MIN_FREE_BYTES:
-        raise CleanupError("insufficient disk after confined cleanup; refusing to start full restore "
-                           f"(free_bytes={after}, required_bytes={MIN_FREE_BYTES}). "
-                           "Use a larger GitHub-hosted runner; no source/object pruning or cold fallback.")
-    log("conservative disk reserve reached; full source + out/Default restore capacity is not guaranteed")
+    if after < CLEANUP_TARGET_BYTES:
+        log("cleanup target not reached after confined cleanup; "
+            f"free_bytes={after}; cleanup_target_bytes={CLEANUP_TARGET_BYTES}; "
+            "deferring capacity admission to actual archive/chunk space checks")
+    log("confined cleanup complete; restore capacity is not guaranteed; "
+        "required restoration still fails on insufficient space")
 
 
 def main():

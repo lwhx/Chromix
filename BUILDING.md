@@ -105,10 +105,14 @@ On GitHub-hosted macOS runners, each stage then runs
 `build/macos/free-disk-space.py` before downloading a handoff or upstream tree.
 It preserves the selected Xcode, macOS SDK, runner/work directories, and tool
 paths while removing only confined unused Xcode bundles, then mobile SDKs and
-simulator runtimes if necessary. It requires 120 GiB free after cleanup and fails
-before restoration if that reserve cannot be reached. The reserve is a capacity
-budget, not proof that a particular expanded tree and subsequent link will fit;
-before/after space and each deletion are recorded in `disk-cleanup.log`.
+simulator runtimes if necessary. Cleanup stops at a best-effort 120 GiB target or
+when its allowlist is exhausted. That target is not an admission requirement:
+run `34261688438` reclaimed space from 42.35 to 78.49 GiB, and the old arbitrary
+120 GiB gate rejected it before examining an archive. The fetcher instead checks
+space for the actual archive sizes and retains 4 GiB headroom during extraction;
+required-restoration mode fails on a real space rejection, without cold fallback.
+Before/after space and each deletion are recorded in `disk-cleanup.log`. Neither
+cleanup nor successful extraction proves capacity for a subsequent link or package.
 
 The September 2026 `macos-15` and `macos-15-intel` runner inventories include
 Xcode 26 while their default Xcode 16.4 supplies SDK 15.5. The pinned upstream

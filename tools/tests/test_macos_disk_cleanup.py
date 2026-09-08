@@ -52,7 +52,7 @@ class MacOSDiskCleanupTest(unittest.TestCase):
         self.system = "Darwin"
         self.fail_remove = False
         for name, value in (("APPLICATIONS", self.apps), ("SIMULATOR_RUNTIMES", self.runtimes),
-                            ("MIN_FREE_BYTES", 120)):
+                            ("CLEANUP_TARGET_BYTES", 120)):
             patcher = mock.patch.object(cleanup, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -224,7 +224,7 @@ class MacOSDiskCleanupTest(unittest.TestCase):
         shutil.rmtree(sdks / "iPhoneOS26.sdk")
         (sdks / "iPhoneOS26.sdk").symlink_to(self.sdk, target_is_directory=True)
         status, output = self.run_cleanup()
-        self.assertEqual(status, 1, output)
+        self.assertEqual(status, 0, output)
         self.assertFalse(self.removed)
         self.assertIn("refused unsafe target", output)
         self.assertIn("refused non-Xcode bundle", output)
@@ -241,7 +241,7 @@ class MacOSDiskCleanupTest(unittest.TestCase):
         mobile.symlink_to(outside, target_is_directory=True)
         self.runtime("iPhoneOS26.sdk", outside / "Developer/SDKs")
         status, output = self.run_cleanup()
-        self.assertEqual(status, 1, output)
+        self.assertEqual(status, 0, output)
         self.assertFalse(self.removed)
         self.assertTrue((old / "keep").exists())
         self.assertIn("refused unsafe allowlist directory", output)
@@ -253,7 +253,7 @@ class MacOSDiskCleanupTest(unittest.TestCase):
         custom_mobile = self.runtime("iPhoneOS26.sdk", custom / "Contents/Developer/Platforms/"
                                      "iPhoneOS.platform/Developer/SDKs")
         status, output = self.run_cleanup()
-        self.assertEqual(status, 1, output)
+        self.assertEqual(status, 0, output)
         self.assertFalse(self.removed)
         self.assertTrue(custom_mobile.exists())
         self.assertTrue((custom / "keep").exists())
@@ -269,7 +269,7 @@ class MacOSDiskCleanupTest(unittest.TestCase):
         external = self.xcode("Xcode_external_sdk.app")
         self.sdk_output = str(external / "Contents/Developer/Platforms/MacOSX.platform")
         status, output = self.run_cleanup()
-        self.assertEqual(status, 1, output)
+        self.assertEqual(status, 0, output)
         self.assertFalse(self.removed)
         self.assertIn("refused protected target", output)
 
@@ -286,7 +286,7 @@ class MacOSDiskCleanupTest(unittest.TestCase):
         (external / "sdk").symlink_to(self.sdk, target_is_directory=True)
         self.sdk_output = str(external / "sdk")
         status, output = self.run_cleanup()
-        self.assertEqual(status, 1, output)
+        self.assertEqual(status, 0, output)
         self.assertFalse(self.removed)
         self.assertIn("refused protected target", output)
 
@@ -427,24 +427,37 @@ class MacOSDiskCleanupTest(unittest.TestCase):
         old = self.xcode("Xcode_mount.app")
         with mock.patch.object(Path, "is_mount", return_value=True):
             status, output = self.run_cleanup()
-        self.assertEqual(status, 1, output)
+        self.assertEqual(status, 0, output)
         self.assertFalse(self.removed)
         self.assertTrue(old.exists())
 
-    def test_low_space_and_removal_failure_fail_closed_with_after_resources(self):
-        for fail in (False, True):
-            with self.subTest(fail_remove=fail):
-                self.fail_remove = fail
-                if fail:
-                    self.xcode("Xcode_16.app")
-                status, output = self.run_cleanup()
-                self.assertEqual(status, 1, output)
-                self.assertIn("after:", output)
-                self.assertIn("::error::macOS disk cleanup failed", output)
-                self.assertFalse(self.removed)
-                self.assert_selected_preserved()
-                if not fail:
-                    self.assertIn("refusing to start full restore", output)
+    def test_unreached_cleanup_target_defers_to_actual_space_checks(self):
+        old = self.xcode("Xcode_16.app")
+        self.gain = 36
+        status, output = self.run_cleanup()
+        self.assertEqual(status, 0, output)
+        self.assertEqual(self.free, 78)
+        self.assertEqual(self.removed, [old])
+        self.assertIn("cleanup target not reached", output)
+        self.assertIn("actual archive/chunk space checks", output)
+        self.assertIn("free_bytes=78", output)
+        self.assertNotIn("::error::", output)
+        self.assert_selected_preserved()
+
+    def test_no_reclaimable_space_is_reported_and_deletion_errors_still_fail(self):
+        status, output = self.run_cleanup()
+        self.assertEqual(status, 0, output)
+        self.assertIn("cleanup target not reached", output)
+        self.assertIn("required restoration still fails on insufficient space", output)
+        self.assertFalse(self.removed)
+        self.fail_remove = True
+        self.xcode("Xcode_16.app")
+        status, output = self.run_cleanup()
+        self.assertEqual(status, 1, output)
+        self.assertIn("after:", output)
+        self.assertIn("::error::macOS disk cleanup failed", output)
+        self.assertFalse(self.removed)
+        self.assert_selected_preserved()
 
     def test_guards_do_not_probe_or_delete_on_local_linux_or_self_hosted(self):
         for variable, value in (("CI", "false"), ("GITHUB_ACTIONS", "false"),
