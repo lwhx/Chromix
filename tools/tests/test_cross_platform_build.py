@@ -46,6 +46,8 @@ class CrossPlatformBuildRegressionTest(unittest.TestCase):
 
     def test_workflow_matches_sdk_asset_names(self):
         source = WORKFLOW.read_text(encoding="utf-8")
+        posix_workflow = REPO / ".github" / "workflows" / "build-posix-github.yml"
+        posix_source = posix_workflow.read_text(encoding="utf-8")
         for asset in (
             "chromix-linux-x64",
             "chromix-linux-arm64",
@@ -53,15 +55,18 @@ class CrossPlatformBuildRegressionTest(unittest.TestCase):
             "chromix-mac-arm64",
         ):
             self.assertIn(asset, source)
-        self.assertIn("ubuntu-22.04", source)
-        self.assertIn("macos-15-intel", source)
-        self.assertIn("macos-15", source)
+        # The POSIX reusable workflow receives the artifact name as an input.
+        self.assertIn("${{ inputs.artifact }}", posix_source)
+        self.assertIn("artifact:", source)
+        # All five targets are reusable staged workflows now; runner names,
+        # caches, and stage chains live in the called workflow files.
         self.assertNotIn("macos-14", source)
-        self.assertIn("actions/cache@v4", source)
-        self.assertIn("download_cache", source)
+        self.assertIn("actions/cache@v4", posix_source)
+        self.assertIn("download_cache", posix_source)
         self.assertIn("./.github/workflows/build-win-x64-github.yml", source)
         self.assertIn("12-stage snapshot/resume", source)
-        self.assertIn(".github/workflows/build-win-x64-github.yml", source)
+        self.assertIn("8-stage snapshot/resume", source)
+        self.assertIn(".github/workflows/build-posix-github.yml", source)
 
     def test_build_arguments_cover_host_toolchain_compatibility(self):
         linux = (REPO / "build" / "build.sh").read_text(encoding="utf-8")

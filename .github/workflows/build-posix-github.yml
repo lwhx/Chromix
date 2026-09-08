@@ -1,0 +1,1533 @@
+# GitHub-hosted POSIX (Linux x64/arm64, macOS x64/arm64) build, modeled on
+# ungoogled-chromium-portablelinux's prep/build_part_01..10 chain and
+# ungoogled-chromium-macos' retrieve-resources/build_job_01..20 chain: a full
+# Chromium build exceeds the 6h single-job limit, so posix-1..posix-8 run
+# under a self-imposed ~5h budget via `timeout -k`, then snapshot the work
+# tree with tar|zstd (mtimes preserved for ninja) uploaded as artifacts; the
+# next stage restores and resumes ninja incrementally until it returns 0.
+name: build-posix-github
+
+on:
+  workflow_call:
+    inputs:
+      platform:
+        required: true
+        type: string
+      arch:
+        required: true
+        type: string
+      runner:
+        required: true
+        type: string
+      artifact:
+        required: true
+        type: string
+      max-stages:
+        required: false
+        type: number
+        default: 8
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: build-posix-${{ inputs.platform }}-${{ inputs.arch }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DEPOT_TOOLS_METRICS: '0'
+  DEPOT_TOOLS_COLLECT_METRICS: '0'
+  CHROMIUM_VERSION: '152.0.7977.82'
+
+jobs:
+  posix-1:
+    name: ${{ inputs.platform }}-${{ inputs.arch }} stage 1 (prepare + first compile)
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 355
+    outputs:
+      finished: ${{ steps.stage.outputs.finished }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record runner resources
+        run: |
+          mkdir -p "${RUNNER_TEMP}/chromix-logs"
+          { uname -a; df -h; } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/runner.log"
+
+      - name: Free Linux disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/local/.ghcup /usr/lib/jvm \
+            /usr/local/share/boost /usr/share/swift \
+            /usr/lib/dotnet /usr/lib/google-cloud-sdk
+          sudo docker system prune -af || true
+          df -h
+
+      # Upstream portablelinux pins a Debian Docker image whose packages match
+      # Chromium's install-build-deps and whose Go is new enough for Dawn's
+      # go.mod toolchain line (go 1.25.0). The preinstalled /usr/local/go is
+      # replaced by the pinned version below; arm64 runners download
+      # linux-arm64 and x64 runners download linux-amd64, matching upstream's
+      # host-architecture Go selection.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison clang clang-format cmake curl flex g++ git gperf \
+            libasound2-dev libatk1.0-dev libcups2-dev libdrm-dev libegl1-mesa-dev \
+            libevent-dev libflac-dev libgbm-dev libglib2.0-dev libgtk-3-dev \
+            libjpeg-dev libnss3-dev libopus-dev libpam0g-dev libpci-dev \
+            libpipewire-0.3-dev libpulse-dev libspeechd-dev libudev-dev \
+            libva-dev libvpx-dev libwebp-dev libx11-xcb-dev libxcb-dri3-dev \
+            libxshmfence-dev libxslt1-dev libxss-dev libxtst-dev mesa-common-dev \
+            ninja-build pkg-config python3-jinja2 python3-pyparsing \
+            python3-setuptools python3-six rsync uuid-dev xz-utils yasm zip unzip \
+            zstd patch file
+          GO_VERSION="$(curl -fsSL "https://go.dev/VERSION?m=text" | head -n1)"
+          case "$GO_VERSION" in go1.*) ;; *) echo "unexpected Go version: $GO_VERSION" >&2; exit 1;; esac
+          case "${GOARCH:-$(uname -m)}" in
+            x86_64|amd64|x64) GO_ARCHIVE_TAIL="amd64" ;;
+            aarch64|arm64) GO_ARCHIVE_TAIL="arm64" ;;
+            *) echo "unsupported Go host architecture" >&2; exit 1 ;;
+          esac
+          curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCHIVE_TAIL}.tar.gz" -o /tmp/go.tgz
+          sudo rm -rf /usr/local/go /opt/hostedtoolcache/go*
+          sudo tar -C /usr/local -xzf /tmp/go.tgz
+          hash -r
+          go version
+      - name: Inspect macOS toolchain
+        if: runner.os == 'macOS'
+        run: |
+          {
+            sw_vers
+            xcode-select -p
+            xcodebuild -version
+            xcrun --sdk macosx --show-sdk-version
+            xcrun --sdk macosx --show-sdk-path
+          } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/xcode.log"
+
+      - name: Disable Spotlight indexing
+        if: runner.os == 'macOS'
+        run: sudo mdutil -a -i off
+
+      # Upstream macOS CI uses Homebrew for ninja/Go only; clang comes from
+      # Chromium's own downloaded LLVM resources per target architecture.
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        run: brew install ninja go coreutils gpatch zstd
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      # The pinned download cache is deliberately outside the tree snapshot;
+      # re-warm it first so a resumed preparation does not redownload archives.
+      - name: Restore pinned source downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/chromix-build/download_cache
+          key: ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-${{ env.CHROMIUM_VERSION }}-${{ hashFiles('build/ungoogled-revisions.psd1', 'build/prepare-ungoogled.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
+      - name: Run stage 1
+        id: stage
+        run: |
+          set -euo pipefail
+          DEADLINE_EPOCH=$(( $(date +%s) + 300 * 60 ))
+          build/posix/ci-stage.sh \
+            --platform '${{ inputs.platform }}' --arch '${{ inputs.arch }}' \
+            --workdir "${RUNNER_TEMP}/chromix-build" \
+            --stage-index 1 --max-stages '${{ inputs.max_stages }}' --deadline-epoch "$DEADLINE_EPOCH" \
+            2>&1 | tee "${RUNNER_TEMP}/chromix-logs/stage-1.log"
+      - name: Ensure tree snapshot exists even when handoff failed to pack
+        if: always()
+        run: |
+          WORK="${RUNNER_TEMP}/chromix-build"
+          SNAP="$WORK/.snapshot-stage-1"
+          rm -rf "$SNAP"
+          mkdir -p "$SNAP"
+          [ -d "$WORK/src" ] || { echo "no work tree to snapshot"; exit 0; }
+          bash build/posix/ci-parts.sh "$WORK" "$SNAP" >/dev/null && echo "snapshot packed at $SNAP"
+
+      - name: Upload tree part 1
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s1-attempt-${{ github.run_attempt }}-part1
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-1/p1/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 2
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s1-attempt-${{ github.run_attempt }}-part2
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-1/p2/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 3
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s1-attempt-${{ github.run_attempt }}-part3
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-1/p3/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 4
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s1-attempt-${{ github.run_attempt }}-part4
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-1/p4/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload final bundle
+        if: steps.stage.outputs.finished == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}
+          path: |
+            ${{ runner.temp }}/chromix-build/dist/${{ inputs.artifact }}.zip
+            ${{ runner.temp }}/chromix-build/dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-logs-s1-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/chromix-logs/
+            ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
+          if-no-files-found: warn
+          retention-days: 14
+
+  posix-2:
+    name: ${{ inputs.platform }}-${{ inputs.arch }} stage 2 (resume compile)
+    needs: posix-1
+    if: >-
+      always() &&
+      needs.posix-1.result == 'success' &&
+      needs.posix-1.outputs.finished != 'true'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 355
+    outputs:
+      finished: ${{ steps.stage.outputs.finished }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record runner resources
+        run: |
+          mkdir -p "${RUNNER_TEMP}/chromix-logs"
+          { uname -a; df -h; } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/runner.log"
+
+      - name: Download tree from previous stage
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.artifact }}-tree-s1-attempt-*-part*
+          merge-multiple: true
+          path: ${{ runner.temp }}/chromix-restore
+
+      - name: Free Linux disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/local/.ghcup /usr/lib/jvm \
+            /usr/local/share/boost /usr/share/swift \
+            /usr/lib/dotnet /usr/lib/google-cloud-sdk
+          sudo docker system prune -af || true
+          df -h
+
+      # Upstream portablelinux pins a Debian Docker image whose packages match
+      # Chromium's install-build-deps and whose Go is new enough for Dawn's
+      # go.mod toolchain line (go 1.25.0). The preinstalled /usr/local/go is
+      # replaced by the pinned version below; arm64 runners download
+      # linux-arm64 and x64 runners download linux-amd64, matching upstream's
+      # host-architecture Go selection.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison clang clang-format cmake curl flex g++ git gperf \
+            libasound2-dev libatk1.0-dev libcups2-dev libdrm-dev libegl1-mesa-dev \
+            libevent-dev libflac-dev libgbm-dev libglib2.0-dev libgtk-3-dev \
+            libjpeg-dev libnss3-dev libopus-dev libpam0g-dev libpci-dev \
+            libpipewire-0.3-dev libpulse-dev libspeechd-dev libudev-dev \
+            libva-dev libvpx-dev libwebp-dev libx11-xcb-dev libxcb-dri3-dev \
+            libxshmfence-dev libxslt1-dev libxss-dev libxtst-dev mesa-common-dev \
+            ninja-build pkg-config python3-jinja2 python3-pyparsing \
+            python3-setuptools python3-six rsync uuid-dev xz-utils yasm zip unzip \
+            zstd patch file
+          GO_VERSION="$(curl -fsSL "https://go.dev/VERSION?m=text" | head -n1)"
+          case "$GO_VERSION" in go1.*) ;; *) echo "unexpected Go version: $GO_VERSION" >&2; exit 1;; esac
+          case "${GOARCH:-$(uname -m)}" in
+            x86_64|amd64|x64) GO_ARCHIVE_TAIL="amd64" ;;
+            aarch64|arm64) GO_ARCHIVE_TAIL="arm64" ;;
+            *) echo "unsupported Go host architecture" >&2; exit 1 ;;
+          esac
+          curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCHIVE_TAIL}.tar.gz" -o /tmp/go.tgz
+          sudo rm -rf /usr/local/go /opt/hostedtoolcache/go*
+          sudo tar -C /usr/local -xzf /tmp/go.tgz
+          hash -r
+          go version
+      - name: Inspect macOS toolchain
+        if: runner.os == 'macOS'
+        run: |
+          {
+            sw_vers
+            xcode-select -p
+            xcodebuild -version
+            xcrun --sdk macosx --show-sdk-version
+            xcrun --sdk macosx --show-sdk-path
+          } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/xcode.log"
+
+      - name: Disable Spotlight indexing
+        if: runner.os == 'macOS'
+        run: sudo mdutil -a -i off
+
+      # Upstream macOS CI uses Homebrew for ninja/Go only; clang comes from
+      # Chromium's own downloaded LLVM resources per target architecture.
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        run: brew install ninja go coreutils gpatch zstd
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      # The pinned download cache is deliberately outside the tree snapshot;
+      # re-warm it first so a resumed preparation does not redownload archives.
+      - name: Restore pinned source downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/chromix-build/download_cache
+          key: ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-${{ env.CHROMIUM_VERSION }}-${{ hashFiles('build/ungoogled-revisions.psd1', 'build/prepare-ungoogled.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
+      - name: Run stage 2
+        id: stage
+        run: |
+          set -euo pipefail
+          DEADLINE_EPOCH=$(( $(date +%s) + 300 * 60 ))
+          build/posix/ci-stage.sh \
+            --platform '${{ inputs.platform }}' --arch '${{ inputs.arch }}' \
+            --workdir "${RUNNER_TEMP}/chromix-build" \
+            --stage-index 2 --max-stages '${{ inputs.max_stages }}' --from-snapshot "${RUNNER_TEMP}/chromix-restore" \
+            --deadline-epoch "$DEADLINE_EPOCH" \
+            2>&1 | tee "${RUNNER_TEMP}/chromix-logs/stage-2.log"
+      - name: Ensure tree snapshot exists even when handoff failed to pack
+        if: always()
+        run: |
+          WORK="${RUNNER_TEMP}/chromix-build"
+          SNAP="$WORK/.snapshot-stage-2"
+          rm -rf "$SNAP"
+          mkdir -p "$SNAP"
+          [ -d "$WORK/src" ] || { echo "no work tree to snapshot"; exit 0; }
+          bash build/posix/ci-parts.sh "$WORK" "$SNAP" >/dev/null && echo "snapshot packed at $SNAP"
+
+      - name: Upload tree part 1
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s2-attempt-${{ github.run_attempt }}-part1
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-2/p1/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 2
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s2-attempt-${{ github.run_attempt }}-part2
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-2/p2/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 3
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s2-attempt-${{ github.run_attempt }}-part3
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-2/p3/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 4
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s2-attempt-${{ github.run_attempt }}-part4
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-2/p4/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload final bundle
+        if: steps.stage.outputs.finished == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}
+          path: |
+            ${{ runner.temp }}/chromix-build/dist/${{ inputs.artifact }}.zip
+            ${{ runner.temp }}/chromix-build/dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-logs-s2-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/chromix-logs/
+            ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
+          if-no-files-found: warn
+          retention-days: 14
+
+  posix-3:
+    name: ${{ inputs.platform }}-${{ inputs.arch }} stage 3 (resume compile)
+    needs: posix-2
+    if: >-
+      always() &&
+      needs.posix-2.result == 'success' &&
+      needs.posix-2.outputs.finished != 'true'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 355
+    outputs:
+      finished: ${{ steps.stage.outputs.finished }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record runner resources
+        run: |
+          mkdir -p "${RUNNER_TEMP}/chromix-logs"
+          { uname -a; df -h; } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/runner.log"
+
+      - name: Download tree from previous stage
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.artifact }}-tree-s2-attempt-*-part*
+          merge-multiple: true
+          path: ${{ runner.temp }}/chromix-restore
+
+      - name: Free Linux disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/local/.ghcup /usr/lib/jvm \
+            /usr/local/share/boost /usr/share/swift \
+            /usr/lib/dotnet /usr/lib/google-cloud-sdk
+          sudo docker system prune -af || true
+          df -h
+
+      # Upstream portablelinux pins a Debian Docker image whose packages match
+      # Chromium's install-build-deps and whose Go is new enough for Dawn's
+      # go.mod toolchain line (go 1.25.0). The preinstalled /usr/local/go is
+      # replaced by the pinned version below; arm64 runners download
+      # linux-arm64 and x64 runners download linux-amd64, matching upstream's
+      # host-architecture Go selection.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison clang clang-format cmake curl flex g++ git gperf \
+            libasound2-dev libatk1.0-dev libcups2-dev libdrm-dev libegl1-mesa-dev \
+            libevent-dev libflac-dev libgbm-dev libglib2.0-dev libgtk-3-dev \
+            libjpeg-dev libnss3-dev libopus-dev libpam0g-dev libpci-dev \
+            libpipewire-0.3-dev libpulse-dev libspeechd-dev libudev-dev \
+            libva-dev libvpx-dev libwebp-dev libx11-xcb-dev libxcb-dri3-dev \
+            libxshmfence-dev libxslt1-dev libxss-dev libxtst-dev mesa-common-dev \
+            ninja-build pkg-config python3-jinja2 python3-pyparsing \
+            python3-setuptools python3-six rsync uuid-dev xz-utils yasm zip unzip \
+            zstd patch file
+          GO_VERSION="$(curl -fsSL "https://go.dev/VERSION?m=text" | head -n1)"
+          case "$GO_VERSION" in go1.*) ;; *) echo "unexpected Go version: $GO_VERSION" >&2; exit 1;; esac
+          case "${GOARCH:-$(uname -m)}" in
+            x86_64|amd64|x64) GO_ARCHIVE_TAIL="amd64" ;;
+            aarch64|arm64) GO_ARCHIVE_TAIL="arm64" ;;
+            *) echo "unsupported Go host architecture" >&2; exit 1 ;;
+          esac
+          curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCHIVE_TAIL}.tar.gz" -o /tmp/go.tgz
+          sudo rm -rf /usr/local/go /opt/hostedtoolcache/go*
+          sudo tar -C /usr/local -xzf /tmp/go.tgz
+          hash -r
+          go version
+      - name: Inspect macOS toolchain
+        if: runner.os == 'macOS'
+        run: |
+          {
+            sw_vers
+            xcode-select -p
+            xcodebuild -version
+            xcrun --sdk macosx --show-sdk-version
+            xcrun --sdk macosx --show-sdk-path
+          } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/xcode.log"
+
+      - name: Disable Spotlight indexing
+        if: runner.os == 'macOS'
+        run: sudo mdutil -a -i off
+
+      # Upstream macOS CI uses Homebrew for ninja/Go only; clang comes from
+      # Chromium's own downloaded LLVM resources per target architecture.
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        run: brew install ninja go coreutils gpatch zstd
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      # The pinned download cache is deliberately outside the tree snapshot;
+      # re-warm it first so a resumed preparation does not redownload archives.
+      - name: Restore pinned source downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/chromix-build/download_cache
+          key: ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-${{ env.CHROMIUM_VERSION }}-${{ hashFiles('build/ungoogled-revisions.psd1', 'build/prepare-ungoogled.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
+      - name: Run stage 3
+        id: stage
+        run: |
+          set -euo pipefail
+          DEADLINE_EPOCH=$(( $(date +%s) + 300 * 60 ))
+          build/posix/ci-stage.sh \
+            --platform '${{ inputs.platform }}' --arch '${{ inputs.arch }}' \
+            --workdir "${RUNNER_TEMP}/chromix-build" \
+            --stage-index 3 --max-stages '${{ inputs.max_stages }}' --from-snapshot "${RUNNER_TEMP}/chromix-restore" \
+            --deadline-epoch "$DEADLINE_EPOCH" \
+            2>&1 | tee "${RUNNER_TEMP}/chromix-logs/stage-3.log"
+      - name: Ensure tree snapshot exists even when handoff failed to pack
+        if: always()
+        run: |
+          WORK="${RUNNER_TEMP}/chromix-build"
+          SNAP="$WORK/.snapshot-stage-3"
+          rm -rf "$SNAP"
+          mkdir -p "$SNAP"
+          [ -d "$WORK/src" ] || { echo "no work tree to snapshot"; exit 0; }
+          bash build/posix/ci-parts.sh "$WORK" "$SNAP" >/dev/null && echo "snapshot packed at $SNAP"
+
+      - name: Upload tree part 1
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s3-attempt-${{ github.run_attempt }}-part1
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-3/p1/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 2
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s3-attempt-${{ github.run_attempt }}-part2
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-3/p2/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 3
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s3-attempt-${{ github.run_attempt }}-part3
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-3/p3/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 4
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s3-attempt-${{ github.run_attempt }}-part4
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-3/p4/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload final bundle
+        if: steps.stage.outputs.finished == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}
+          path: |
+            ${{ runner.temp }}/chromix-build/dist/${{ inputs.artifact }}.zip
+            ${{ runner.temp }}/chromix-build/dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-logs-s3-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/chromix-logs/
+            ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
+          if-no-files-found: warn
+          retention-days: 14
+
+  posix-4:
+    name: ${{ inputs.platform }}-${{ inputs.arch }} stage 4 (resume compile)
+    needs: posix-3
+    if: >-
+      always() &&
+      needs.posix-3.result == 'success' &&
+      needs.posix-3.outputs.finished != 'true'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 355
+    outputs:
+      finished: ${{ steps.stage.outputs.finished }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record runner resources
+        run: |
+          mkdir -p "${RUNNER_TEMP}/chromix-logs"
+          { uname -a; df -h; } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/runner.log"
+
+      - name: Download tree from previous stage
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.artifact }}-tree-s3-attempt-*-part*
+          merge-multiple: true
+          path: ${{ runner.temp }}/chromix-restore
+
+      - name: Free Linux disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/local/.ghcup /usr/lib/jvm \
+            /usr/local/share/boost /usr/share/swift \
+            /usr/lib/dotnet /usr/lib/google-cloud-sdk
+          sudo docker system prune -af || true
+          df -h
+
+      # Upstream portablelinux pins a Debian Docker image whose packages match
+      # Chromium's install-build-deps and whose Go is new enough for Dawn's
+      # go.mod toolchain line (go 1.25.0). The preinstalled /usr/local/go is
+      # replaced by the pinned version below; arm64 runners download
+      # linux-arm64 and x64 runners download linux-amd64, matching upstream's
+      # host-architecture Go selection.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison clang clang-format cmake curl flex g++ git gperf \
+            libasound2-dev libatk1.0-dev libcups2-dev libdrm-dev libegl1-mesa-dev \
+            libevent-dev libflac-dev libgbm-dev libglib2.0-dev libgtk-3-dev \
+            libjpeg-dev libnss3-dev libopus-dev libpam0g-dev libpci-dev \
+            libpipewire-0.3-dev libpulse-dev libspeechd-dev libudev-dev \
+            libva-dev libvpx-dev libwebp-dev libx11-xcb-dev libxcb-dri3-dev \
+            libxshmfence-dev libxslt1-dev libxss-dev libxtst-dev mesa-common-dev \
+            ninja-build pkg-config python3-jinja2 python3-pyparsing \
+            python3-setuptools python3-six rsync uuid-dev xz-utils yasm zip unzip \
+            zstd patch file
+          GO_VERSION="$(curl -fsSL "https://go.dev/VERSION?m=text" | head -n1)"
+          case "$GO_VERSION" in go1.*) ;; *) echo "unexpected Go version: $GO_VERSION" >&2; exit 1;; esac
+          case "${GOARCH:-$(uname -m)}" in
+            x86_64|amd64|x64) GO_ARCHIVE_TAIL="amd64" ;;
+            aarch64|arm64) GO_ARCHIVE_TAIL="arm64" ;;
+            *) echo "unsupported Go host architecture" >&2; exit 1 ;;
+          esac
+          curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCHIVE_TAIL}.tar.gz" -o /tmp/go.tgz
+          sudo rm -rf /usr/local/go /opt/hostedtoolcache/go*
+          sudo tar -C /usr/local -xzf /tmp/go.tgz
+          hash -r
+          go version
+      - name: Inspect macOS toolchain
+        if: runner.os == 'macOS'
+        run: |
+          {
+            sw_vers
+            xcode-select -p
+            xcodebuild -version
+            xcrun --sdk macosx --show-sdk-version
+            xcrun --sdk macosx --show-sdk-path
+          } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/xcode.log"
+
+      - name: Disable Spotlight indexing
+        if: runner.os == 'macOS'
+        run: sudo mdutil -a -i off
+
+      # Upstream macOS CI uses Homebrew for ninja/Go only; clang comes from
+      # Chromium's own downloaded LLVM resources per target architecture.
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        run: brew install ninja go coreutils gpatch zstd
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      # The pinned download cache is deliberately outside the tree snapshot;
+      # re-warm it first so a resumed preparation does not redownload archives.
+      - name: Restore pinned source downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/chromix-build/download_cache
+          key: ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-${{ env.CHROMIUM_VERSION }}-${{ hashFiles('build/ungoogled-revisions.psd1', 'build/prepare-ungoogled.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
+      - name: Run stage 4
+        id: stage
+        run: |
+          set -euo pipefail
+          DEADLINE_EPOCH=$(( $(date +%s) + 300 * 60 ))
+          build/posix/ci-stage.sh \
+            --platform '${{ inputs.platform }}' --arch '${{ inputs.arch }}' \
+            --workdir "${RUNNER_TEMP}/chromix-build" \
+            --stage-index 4 --max-stages '${{ inputs.max_stages }}' --from-snapshot "${RUNNER_TEMP}/chromix-restore" \
+            --deadline-epoch "$DEADLINE_EPOCH" \
+            2>&1 | tee "${RUNNER_TEMP}/chromix-logs/stage-4.log"
+      - name: Ensure tree snapshot exists even when handoff failed to pack
+        if: always()
+        run: |
+          WORK="${RUNNER_TEMP}/chromix-build"
+          SNAP="$WORK/.snapshot-stage-4"
+          rm -rf "$SNAP"
+          mkdir -p "$SNAP"
+          [ -d "$WORK/src" ] || { echo "no work tree to snapshot"; exit 0; }
+          bash build/posix/ci-parts.sh "$WORK" "$SNAP" >/dev/null && echo "snapshot packed at $SNAP"
+
+      - name: Upload tree part 1
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s4-attempt-${{ github.run_attempt }}-part1
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-4/p1/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 2
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s4-attempt-${{ github.run_attempt }}-part2
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-4/p2/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 3
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s4-attempt-${{ github.run_attempt }}-part3
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-4/p3/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 4
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s4-attempt-${{ github.run_attempt }}-part4
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-4/p4/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload final bundle
+        if: steps.stage.outputs.finished == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}
+          path: |
+            ${{ runner.temp }}/chromix-build/dist/${{ inputs.artifact }}.zip
+            ${{ runner.temp }}/chromix-build/dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-logs-s4-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/chromix-logs/
+            ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
+          if-no-files-found: warn
+          retention-days: 14
+
+  posix-5:
+    name: ${{ inputs.platform }}-${{ inputs.arch }} stage 5 (resume compile)
+    needs: posix-4
+    if: >-
+      always() &&
+      needs.posix-4.result == 'success' &&
+      needs.posix-4.outputs.finished != 'true'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 355
+    outputs:
+      finished: ${{ steps.stage.outputs.finished }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record runner resources
+        run: |
+          mkdir -p "${RUNNER_TEMP}/chromix-logs"
+          { uname -a; df -h; } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/runner.log"
+
+      - name: Download tree from previous stage
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.artifact }}-tree-s4-attempt-*-part*
+          merge-multiple: true
+          path: ${{ runner.temp }}/chromix-restore
+
+      - name: Free Linux disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/local/.ghcup /usr/lib/jvm \
+            /usr/local/share/boost /usr/share/swift \
+            /usr/lib/dotnet /usr/lib/google-cloud-sdk
+          sudo docker system prune -af || true
+          df -h
+
+      # Upstream portablelinux pins a Debian Docker image whose packages match
+      # Chromium's install-build-deps and whose Go is new enough for Dawn's
+      # go.mod toolchain line (go 1.25.0). The preinstalled /usr/local/go is
+      # replaced by the pinned version below; arm64 runners download
+      # linux-arm64 and x64 runners download linux-amd64, matching upstream's
+      # host-architecture Go selection.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison clang clang-format cmake curl flex g++ git gperf \
+            libasound2-dev libatk1.0-dev libcups2-dev libdrm-dev libegl1-mesa-dev \
+            libevent-dev libflac-dev libgbm-dev libglib2.0-dev libgtk-3-dev \
+            libjpeg-dev libnss3-dev libopus-dev libpam0g-dev libpci-dev \
+            libpipewire-0.3-dev libpulse-dev libspeechd-dev libudev-dev \
+            libva-dev libvpx-dev libwebp-dev libx11-xcb-dev libxcb-dri3-dev \
+            libxshmfence-dev libxslt1-dev libxss-dev libxtst-dev mesa-common-dev \
+            ninja-build pkg-config python3-jinja2 python3-pyparsing \
+            python3-setuptools python3-six rsync uuid-dev xz-utils yasm zip unzip \
+            zstd patch file
+          GO_VERSION="$(curl -fsSL "https://go.dev/VERSION?m=text" | head -n1)"
+          case "$GO_VERSION" in go1.*) ;; *) echo "unexpected Go version: $GO_VERSION" >&2; exit 1;; esac
+          case "${GOARCH:-$(uname -m)}" in
+            x86_64|amd64|x64) GO_ARCHIVE_TAIL="amd64" ;;
+            aarch64|arm64) GO_ARCHIVE_TAIL="arm64" ;;
+            *) echo "unsupported Go host architecture" >&2; exit 1 ;;
+          esac
+          curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCHIVE_TAIL}.tar.gz" -o /tmp/go.tgz
+          sudo rm -rf /usr/local/go /opt/hostedtoolcache/go*
+          sudo tar -C /usr/local -xzf /tmp/go.tgz
+          hash -r
+          go version
+      - name: Inspect macOS toolchain
+        if: runner.os == 'macOS'
+        run: |
+          {
+            sw_vers
+            xcode-select -p
+            xcodebuild -version
+            xcrun --sdk macosx --show-sdk-version
+            xcrun --sdk macosx --show-sdk-path
+          } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/xcode.log"
+
+      - name: Disable Spotlight indexing
+        if: runner.os == 'macOS'
+        run: sudo mdutil -a -i off
+
+      # Upstream macOS CI uses Homebrew for ninja/Go only; clang comes from
+      # Chromium's own downloaded LLVM resources per target architecture.
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        run: brew install ninja go coreutils gpatch zstd
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      # The pinned download cache is deliberately outside the tree snapshot;
+      # re-warm it first so a resumed preparation does not redownload archives.
+      - name: Restore pinned source downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/chromix-build/download_cache
+          key: ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-${{ env.CHROMIUM_VERSION }}-${{ hashFiles('build/ungoogled-revisions.psd1', 'build/prepare-ungoogled.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
+      - name: Run stage 5
+        id: stage
+        run: |
+          set -euo pipefail
+          DEADLINE_EPOCH=$(( $(date +%s) + 300 * 60 ))
+          build/posix/ci-stage.sh \
+            --platform '${{ inputs.platform }}' --arch '${{ inputs.arch }}' \
+            --workdir "${RUNNER_TEMP}/chromix-build" \
+            --stage-index 5 --max-stages '${{ inputs.max_stages }}' --from-snapshot "${RUNNER_TEMP}/chromix-restore" \
+            --deadline-epoch "$DEADLINE_EPOCH" \
+            2>&1 | tee "${RUNNER_TEMP}/chromix-logs/stage-5.log"
+      - name: Ensure tree snapshot exists even when handoff failed to pack
+        if: always()
+        run: |
+          WORK="${RUNNER_TEMP}/chromix-build"
+          SNAP="$WORK/.snapshot-stage-5"
+          rm -rf "$SNAP"
+          mkdir -p "$SNAP"
+          [ -d "$WORK/src" ] || { echo "no work tree to snapshot"; exit 0; }
+          bash build/posix/ci-parts.sh "$WORK" "$SNAP" >/dev/null && echo "snapshot packed at $SNAP"
+
+      - name: Upload tree part 1
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s5-attempt-${{ github.run_attempt }}-part1
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-5/p1/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 2
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s5-attempt-${{ github.run_attempt }}-part2
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-5/p2/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 3
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s5-attempt-${{ github.run_attempt }}-part3
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-5/p3/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 4
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s5-attempt-${{ github.run_attempt }}-part4
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-5/p4/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload final bundle
+        if: steps.stage.outputs.finished == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}
+          path: |
+            ${{ runner.temp }}/chromix-build/dist/${{ inputs.artifact }}.zip
+            ${{ runner.temp }}/chromix-build/dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-logs-s5-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/chromix-logs/
+            ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
+          if-no-files-found: warn
+          retention-days: 14
+
+  posix-6:
+    name: ${{ inputs.platform }}-${{ inputs.arch }} stage 6 (resume compile)
+    needs: posix-5
+    if: >-
+      always() &&
+      needs.posix-5.result == 'success' &&
+      needs.posix-5.outputs.finished != 'true'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 355
+    outputs:
+      finished: ${{ steps.stage.outputs.finished }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record runner resources
+        run: |
+          mkdir -p "${RUNNER_TEMP}/chromix-logs"
+          { uname -a; df -h; } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/runner.log"
+
+      - name: Download tree from previous stage
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.artifact }}-tree-s5-attempt-*-part*
+          merge-multiple: true
+          path: ${{ runner.temp }}/chromix-restore
+
+      - name: Free Linux disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/local/.ghcup /usr/lib/jvm \
+            /usr/local/share/boost /usr/share/swift \
+            /usr/lib/dotnet /usr/lib/google-cloud-sdk
+          sudo docker system prune -af || true
+          df -h
+
+      # Upstream portablelinux pins a Debian Docker image whose packages match
+      # Chromium's install-build-deps and whose Go is new enough for Dawn's
+      # go.mod toolchain line (go 1.25.0). The preinstalled /usr/local/go is
+      # replaced by the pinned version below; arm64 runners download
+      # linux-arm64 and x64 runners download linux-amd64, matching upstream's
+      # host-architecture Go selection.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison clang clang-format cmake curl flex g++ git gperf \
+            libasound2-dev libatk1.0-dev libcups2-dev libdrm-dev libegl1-mesa-dev \
+            libevent-dev libflac-dev libgbm-dev libglib2.0-dev libgtk-3-dev \
+            libjpeg-dev libnss3-dev libopus-dev libpam0g-dev libpci-dev \
+            libpipewire-0.3-dev libpulse-dev libspeechd-dev libudev-dev \
+            libva-dev libvpx-dev libwebp-dev libx11-xcb-dev libxcb-dri3-dev \
+            libxshmfence-dev libxslt1-dev libxss-dev libxtst-dev mesa-common-dev \
+            ninja-build pkg-config python3-jinja2 python3-pyparsing \
+            python3-setuptools python3-six rsync uuid-dev xz-utils yasm zip unzip \
+            zstd patch file
+          GO_VERSION="$(curl -fsSL "https://go.dev/VERSION?m=text" | head -n1)"
+          case "$GO_VERSION" in go1.*) ;; *) echo "unexpected Go version: $GO_VERSION" >&2; exit 1;; esac
+          case "${GOARCH:-$(uname -m)}" in
+            x86_64|amd64|x64) GO_ARCHIVE_TAIL="amd64" ;;
+            aarch64|arm64) GO_ARCHIVE_TAIL="arm64" ;;
+            *) echo "unsupported Go host architecture" >&2; exit 1 ;;
+          esac
+          curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCHIVE_TAIL}.tar.gz" -o /tmp/go.tgz
+          sudo rm -rf /usr/local/go /opt/hostedtoolcache/go*
+          sudo tar -C /usr/local -xzf /tmp/go.tgz
+          hash -r
+          go version
+      - name: Inspect macOS toolchain
+        if: runner.os == 'macOS'
+        run: |
+          {
+            sw_vers
+            xcode-select -p
+            xcodebuild -version
+            xcrun --sdk macosx --show-sdk-version
+            xcrun --sdk macosx --show-sdk-path
+          } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/xcode.log"
+
+      - name: Disable Spotlight indexing
+        if: runner.os == 'macOS'
+        run: sudo mdutil -a -i off
+
+      # Upstream macOS CI uses Homebrew for ninja/Go only; clang comes from
+      # Chromium's own downloaded LLVM resources per target architecture.
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        run: brew install ninja go coreutils gpatch zstd
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      # The pinned download cache is deliberately outside the tree snapshot;
+      # re-warm it first so a resumed preparation does not redownload archives.
+      - name: Restore pinned source downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/chromix-build/download_cache
+          key: ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-${{ env.CHROMIUM_VERSION }}-${{ hashFiles('build/ungoogled-revisions.psd1', 'build/prepare-ungoogled.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
+      - name: Run stage 6
+        id: stage
+        run: |
+          set -euo pipefail
+          DEADLINE_EPOCH=$(( $(date +%s) + 300 * 60 ))
+          build/posix/ci-stage.sh \
+            --platform '${{ inputs.platform }}' --arch '${{ inputs.arch }}' \
+            --workdir "${RUNNER_TEMP}/chromix-build" \
+            --stage-index 6 --max-stages '${{ inputs.max_stages }}' --from-snapshot "${RUNNER_TEMP}/chromix-restore" \
+            --deadline-epoch "$DEADLINE_EPOCH" \
+            2>&1 | tee "${RUNNER_TEMP}/chromix-logs/stage-6.log"
+      - name: Ensure tree snapshot exists even when handoff failed to pack
+        if: always()
+        run: |
+          WORK="${RUNNER_TEMP}/chromix-build"
+          SNAP="$WORK/.snapshot-stage-6"
+          rm -rf "$SNAP"
+          mkdir -p "$SNAP"
+          [ -d "$WORK/src" ] || { echo "no work tree to snapshot"; exit 0; }
+          bash build/posix/ci-parts.sh "$WORK" "$SNAP" >/dev/null && echo "snapshot packed at $SNAP"
+
+      - name: Upload tree part 1
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s6-attempt-${{ github.run_attempt }}-part1
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-6/p1/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 2
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s6-attempt-${{ github.run_attempt }}-part2
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-6/p2/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 3
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s6-attempt-${{ github.run_attempt }}-part3
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-6/p3/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 4
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s6-attempt-${{ github.run_attempt }}-part4
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-6/p4/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload final bundle
+        if: steps.stage.outputs.finished == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}
+          path: |
+            ${{ runner.temp }}/chromix-build/dist/${{ inputs.artifact }}.zip
+            ${{ runner.temp }}/chromix-build/dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-logs-s6-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/chromix-logs/
+            ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
+          if-no-files-found: warn
+          retention-days: 14
+
+  posix-7:
+    name: ${{ inputs.platform }}-${{ inputs.arch }} stage 7 (resume compile)
+    needs: posix-6
+    if: >-
+      always() &&
+      needs.posix-6.result == 'success' &&
+      needs.posix-6.outputs.finished != 'true'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 355
+    outputs:
+      finished: ${{ steps.stage.outputs.finished }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record runner resources
+        run: |
+          mkdir -p "${RUNNER_TEMP}/chromix-logs"
+          { uname -a; df -h; } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/runner.log"
+
+      - name: Download tree from previous stage
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.artifact }}-tree-s6-attempt-*-part*
+          merge-multiple: true
+          path: ${{ runner.temp }}/chromix-restore
+
+      - name: Free Linux disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/local/.ghcup /usr/lib/jvm \
+            /usr/local/share/boost /usr/share/swift \
+            /usr/lib/dotnet /usr/lib/google-cloud-sdk
+          sudo docker system prune -af || true
+          df -h
+
+      # Upstream portablelinux pins a Debian Docker image whose packages match
+      # Chromium's install-build-deps and whose Go is new enough for Dawn's
+      # go.mod toolchain line (go 1.25.0). The preinstalled /usr/local/go is
+      # replaced by the pinned version below; arm64 runners download
+      # linux-arm64 and x64 runners download linux-amd64, matching upstream's
+      # host-architecture Go selection.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison clang clang-format cmake curl flex g++ git gperf \
+            libasound2-dev libatk1.0-dev libcups2-dev libdrm-dev libegl1-mesa-dev \
+            libevent-dev libflac-dev libgbm-dev libglib2.0-dev libgtk-3-dev \
+            libjpeg-dev libnss3-dev libopus-dev libpam0g-dev libpci-dev \
+            libpipewire-0.3-dev libpulse-dev libspeechd-dev libudev-dev \
+            libva-dev libvpx-dev libwebp-dev libx11-xcb-dev libxcb-dri3-dev \
+            libxshmfence-dev libxslt1-dev libxss-dev libxtst-dev mesa-common-dev \
+            ninja-build pkg-config python3-jinja2 python3-pyparsing \
+            python3-setuptools python3-six rsync uuid-dev xz-utils yasm zip unzip \
+            zstd patch file
+          GO_VERSION="$(curl -fsSL "https://go.dev/VERSION?m=text" | head -n1)"
+          case "$GO_VERSION" in go1.*) ;; *) echo "unexpected Go version: $GO_VERSION" >&2; exit 1;; esac
+          case "${GOARCH:-$(uname -m)}" in
+            x86_64|amd64|x64) GO_ARCHIVE_TAIL="amd64" ;;
+            aarch64|arm64) GO_ARCHIVE_TAIL="arm64" ;;
+            *) echo "unsupported Go host architecture" >&2; exit 1 ;;
+          esac
+          curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCHIVE_TAIL}.tar.gz" -o /tmp/go.tgz
+          sudo rm -rf /usr/local/go /opt/hostedtoolcache/go*
+          sudo tar -C /usr/local -xzf /tmp/go.tgz
+          hash -r
+          go version
+      - name: Inspect macOS toolchain
+        if: runner.os == 'macOS'
+        run: |
+          {
+            sw_vers
+            xcode-select -p
+            xcodebuild -version
+            xcrun --sdk macosx --show-sdk-version
+            xcrun --sdk macosx --show-sdk-path
+          } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/xcode.log"
+
+      - name: Disable Spotlight indexing
+        if: runner.os == 'macOS'
+        run: sudo mdutil -a -i off
+
+      # Upstream macOS CI uses Homebrew for ninja/Go only; clang comes from
+      # Chromium's own downloaded LLVM resources per target architecture.
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        run: brew install ninja go coreutils gpatch zstd
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      # The pinned download cache is deliberately outside the tree snapshot;
+      # re-warm it first so a resumed preparation does not redownload archives.
+      - name: Restore pinned source downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/chromix-build/download_cache
+          key: ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-${{ env.CHROMIUM_VERSION }}-${{ hashFiles('build/ungoogled-revisions.psd1', 'build/prepare-ungoogled.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
+      - name: Run stage 7
+        id: stage
+        run: |
+          set -euo pipefail
+          DEADLINE_EPOCH=$(( $(date +%s) + 300 * 60 ))
+          build/posix/ci-stage.sh \
+            --platform '${{ inputs.platform }}' --arch '${{ inputs.arch }}' \
+            --workdir "${RUNNER_TEMP}/chromix-build" \
+            --stage-index 7 --max-stages '${{ inputs.max_stages }}' --from-snapshot "${RUNNER_TEMP}/chromix-restore" \
+            --deadline-epoch "$DEADLINE_EPOCH" \
+            2>&1 | tee "${RUNNER_TEMP}/chromix-logs/stage-7.log"
+      - name: Ensure tree snapshot exists even when handoff failed to pack
+        if: always()
+        run: |
+          WORK="${RUNNER_TEMP}/chromix-build"
+          SNAP="$WORK/.snapshot-stage-7"
+          rm -rf "$SNAP"
+          mkdir -p "$SNAP"
+          [ -d "$WORK/src" ] || { echo "no work tree to snapshot"; exit 0; }
+          bash build/posix/ci-parts.sh "$WORK" "$SNAP" >/dev/null && echo "snapshot packed at $SNAP"
+
+      - name: Upload tree part 1
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s7-attempt-${{ github.run_attempt }}-part1
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-7/p1/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 2
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s7-attempt-${{ github.run_attempt }}-part2
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-7/p2/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 3
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s7-attempt-${{ github.run_attempt }}-part3
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-7/p3/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 4
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s7-attempt-${{ github.run_attempt }}-part4
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-7/p4/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload final bundle
+        if: steps.stage.outputs.finished == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}
+          path: |
+            ${{ runner.temp }}/chromix-build/dist/${{ inputs.artifact }}.zip
+            ${{ runner.temp }}/chromix-build/dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-logs-s7-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/chromix-logs/
+            ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
+          if-no-files-found: warn
+          retention-days: 14
+
+  posix-8:
+    name: ${{ inputs.platform }}-${{ inputs.arch }} stage 8 (resume compile)
+    needs: posix-7
+    if: >-
+      always() &&
+      needs.posix-7.result == 'success' &&
+      needs.posix-7.outputs.finished != 'true'
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 355
+    outputs:
+      finished: ${{ steps.stage.outputs.finished }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record runner resources
+        run: |
+          mkdir -p "${RUNNER_TEMP}/chromix-logs"
+          { uname -a; df -h; } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/runner.log"
+
+      - name: Download tree from previous stage
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.artifact }}-tree-s7-attempt-*-part*
+          merge-multiple: true
+          path: ${{ runner.temp }}/chromix-restore
+
+      - name: Free Linux disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/local/.ghcup /usr/lib/jvm \
+            /usr/local/share/boost /usr/share/swift \
+            /usr/lib/dotnet /usr/lib/google-cloud-sdk
+          sudo docker system prune -af || true
+          df -h
+
+      # Upstream portablelinux pins a Debian Docker image whose packages match
+      # Chromium's install-build-deps and whose Go is new enough for Dawn's
+      # go.mod toolchain line (go 1.25.0). The preinstalled /usr/local/go is
+      # replaced by the pinned version below; arm64 runners download
+      # linux-arm64 and x64 runners download linux-amd64, matching upstream's
+      # host-architecture Go selection.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison clang clang-format cmake curl flex g++ git gperf \
+            libasound2-dev libatk1.0-dev libcups2-dev libdrm-dev libegl1-mesa-dev \
+            libevent-dev libflac-dev libgbm-dev libglib2.0-dev libgtk-3-dev \
+            libjpeg-dev libnss3-dev libopus-dev libpam0g-dev libpci-dev \
+            libpipewire-0.3-dev libpulse-dev libspeechd-dev libudev-dev \
+            libva-dev libvpx-dev libwebp-dev libx11-xcb-dev libxcb-dri3-dev \
+            libxshmfence-dev libxslt1-dev libxss-dev libxtst-dev mesa-common-dev \
+            ninja-build pkg-config python3-jinja2 python3-pyparsing \
+            python3-setuptools python3-six rsync uuid-dev xz-utils yasm zip unzip \
+            zstd patch file
+          GO_VERSION="$(curl -fsSL "https://go.dev/VERSION?m=text" | head -n1)"
+          case "$GO_VERSION" in go1.*) ;; *) echo "unexpected Go version: $GO_VERSION" >&2; exit 1;; esac
+          case "${GOARCH:-$(uname -m)}" in
+            x86_64|amd64|x64) GO_ARCHIVE_TAIL="amd64" ;;
+            aarch64|arm64) GO_ARCHIVE_TAIL="arm64" ;;
+            *) echo "unsupported Go host architecture" >&2; exit 1 ;;
+          esac
+          curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCHIVE_TAIL}.tar.gz" -o /tmp/go.tgz
+          sudo rm -rf /usr/local/go /opt/hostedtoolcache/go*
+          sudo tar -C /usr/local -xzf /tmp/go.tgz
+          hash -r
+          go version
+      - name: Inspect macOS toolchain
+        if: runner.os == 'macOS'
+        run: |
+          {
+            sw_vers
+            xcode-select -p
+            xcodebuild -version
+            xcrun --sdk macosx --show-sdk-version
+            xcrun --sdk macosx --show-sdk-path
+          } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/xcode.log"
+
+      - name: Disable Spotlight indexing
+        if: runner.os == 'macOS'
+        run: sudo mdutil -a -i off
+
+      # Upstream macOS CI uses Homebrew for ninja/Go only; clang comes from
+      # Chromium's own downloaded LLVM resources per target architecture.
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        run: brew install ninja go coreutils gpatch zstd
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      # The pinned download cache is deliberately outside the tree snapshot;
+      # re-warm it first so a resumed preparation does not redownload archives.
+      - name: Restore pinned source downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/chromix-build/download_cache
+          key: ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-${{ env.CHROMIUM_VERSION }}-${{ hashFiles('build/ungoogled-revisions.psd1', 'build/prepare-ungoogled.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
+      - name: Run stage 8
+        id: stage
+        run: |
+          set -euo pipefail
+          DEADLINE_EPOCH=$(( $(date +%s) + 300 * 60 ))
+          build/posix/ci-stage.sh \
+            --platform '${{ inputs.platform }}' --arch '${{ inputs.arch }}' \
+            --workdir "${RUNNER_TEMP}/chromix-build" \
+            --stage-index 8 --max-stages '${{ inputs.max_stages }}' --from-snapshot "${RUNNER_TEMP}/chromix-restore" \
+            --deadline-epoch "$DEADLINE_EPOCH" \
+            2>&1 | tee "${RUNNER_TEMP}/chromix-logs/stage-8.log"
+      - name: Ensure tree snapshot exists even when handoff failed to pack
+        if: always()
+        run: |
+          WORK="${RUNNER_TEMP}/chromix-build"
+          SNAP="$WORK/.snapshot-stage-8"
+          rm -rf "$SNAP"
+          mkdir -p "$SNAP"
+          [ -d "$WORK/src" ] || { echo "no work tree to snapshot"; exit 0; }
+          bash build/posix/ci-parts.sh "$WORK" "$SNAP" >/dev/null && echo "snapshot packed at $SNAP"
+
+      - name: Upload tree part 1
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s8-attempt-${{ github.run_attempt }}-part1
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-8/p1/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 2
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s8-attempt-${{ github.run_attempt }}-part2
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-8/p2/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 3
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s8-attempt-${{ github.run_attempt }}-part3
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-8/p3/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload tree part 4
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-tree-s8-attempt-${{ github.run_attempt }}-part4
+          path: ${{ runner.temp }}/chromix-build/.snapshot-stage-8/p4/
+          if-no-files-found: warn
+          retention-days: 3
+          compression-level: 0
+      - name: Upload final bundle
+        if: steps.stage.outputs.finished == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}
+          path: |
+            ${{ runner.temp }}/chromix-build/dist/${{ inputs.artifact }}.zip
+            ${{ runner.temp }}/chromix-build/dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-logs-s8-attempt-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/chromix-logs/
+            ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
+          if-no-files-found: warn
+          retention-days: 14

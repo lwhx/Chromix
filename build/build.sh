@@ -7,10 +7,14 @@ HOST_ARCH="$(uname -m)"
 case "$HOST_ARCH" in x86_64) HOST_ARCH=x64 ;; aarch64) HOST_ARCH=arm64 ;; esac
 ARCH="${2:-$HOST_ARCH}"
 case "$ARCH" in
-  x64) SYSROOT_ARCH=amd64; GO_ARCH=amd64 ;;
-  arm64) SYSROOT_ARCH=arm64; GO_ARCH=arm64 ;;
+  x64) SYSROOT_ARCH=amd64 ;;
+  arm64) SYSROOT_ARCH=arm64 ;;
   *) echo "unsupported Linux architecture: $ARCH" >&2; exit 2 ;;
 esac
+# Host tools (Node/Go used by generators) must run on the actual host; the
+# target architecture only selects sysroots and output binaries. Upstream
+# portablelinux keeps linux-amd64 Go on x64 hosts regardless of ARCH.
+GO_ARCH="$HOST_ARCH"
 if [ "$(uname -s)" != Linux ] || [ "$HOST_ARCH" != "$ARCH" ]; then
   echo "a native Linux $ARCH host is required" >&2; exit 2
 fi
@@ -33,15 +37,20 @@ if ! node --input-type=module -e 'process.exit(typeof import.meta.main === "bool
   echo "Node.js 22.18+ or 24.2+ is required for DevTools generation" >&2
   exit 1
 fi
-# Refresh host-tool links when PATH changes between builds.
-for node_arch in x64 "$ARCH"; do
+# Refresh host-tool links when PATH changes between builds. Host tools
+# (Node/Go consumed by generators) follow the host architecture, mirroring
+# upstream portablelinux's setup_toolchain; target_cpu selects binaries only.
+for node_arch in x64 "$HOST_ARCH"; do
   mkdir -p "third_party/node/linux/node-linux-$node_arch/bin"
   ln -sfn "$(command -v node)" "third_party/node/linux/node-linux-$node_arch/bin/node"
 done
-mkdir -p third_party/gperf/cipd/bin "third_party/dawn/tools/golang/linux-$GO_ARCH/bin" buildtools/linux64-format
+mkdir -p third_party/gperf/cipd/bin buildtools/linux64-format
 ln -sfn "$(command -v gperf)" third_party/gperf/cipd/bin/gperf
-ln -sfn "$(command -v go)" "third_party/dawn/tools/golang/linux-$GO_ARCH/bin/go"
 ln -sfn "$(command -v clang-format)" buildtools/linux64-format/clang-format
+# Dawn resolves Go from its cipd-style host dir; linux-amd64 on x64 hosts and
+# linux-arm64 on arm64 hosts regardless of the target architecture.
+mkdir -p "third_party/dawn/tools/golang/linux-$GO_ARCH/bin"
+ln -sfn "$(command -v go)" "third_party/dawn/tools/golang/linux-$GO_ARCH/bin/go"
 if [ ! -f "$SRC/.chromix-toolchain-ready" ]; then
   if [ -f "$SRC/.chromix-domain-substituted" ]; then
     echo "toolchain is incomplete in a domain-substituted source tree; use a clean work directory" >&2; exit 1

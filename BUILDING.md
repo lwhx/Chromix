@@ -98,9 +98,10 @@ private Apple toolchain nor changes SDK pins/GN requirements to hide a mismatch.
 
 ## GitHub Actions cross-platform build
 
-`.github/workflows/build-cross-platform.yml` runs five native targets. Linux and
-macOS remain parallel matrix jobs; Windows is called as a reusable job from this
-same workflow, so one successful run owns all five ZIP artifacts.
+`.github/workflows/build-cross-platform.yml` calls five reusable staged
+workflows, one per native target, so one successful run owns all five ZIP
+artifacts: `build-posix-github.yml` for the four POSIX targets and
+`build-win-x64-github.yml` for Windows.
 
 | Runner | Target | Archive |
 |---|---|---|
@@ -116,42 +117,82 @@ Ninja can continue incrementally. Manual dispatch of
 `.github/workflows/build-win-x64-github.yml` remains available for explicit
 Windows-only retries or cross-run resume; the normal release path uses the
 Windows job nested in `build-cross-platform`.
-Each POSIX job caches only the pinned source and resource downloads at
+
+The POSIX reusable workflow follows the upstream ungoogled-chromium CI model:
+portablelinux's `prep` + `build_part_01..10` chain and macOS'
+`retrieve-resources` + `build_job_01..20` chain. Each POSIX target runs
+`posix-1..posix-8`; every stage is a fresh native runner with a self-imposed
+~300-minute deadline (`timeout -k 7m -s SIGTERM`) that leaves ~45 minutes for
+snapshotting inside GitHub's 355/360-minute limits:
+
+1. restore the previous stage's tree snapshot (none at stage 1);
+2. run `build/posix/ci-stage.sh --platform --arch --stage-index ...`;
+3. prepare the pinned ungoogled source (or resume it) under the deadline;
+4. continue Ninja through `build/build.sh` / `build/macos/build.sh`;
+5. on deadline exit 124, pack `${workdir}` with `build/posix/ci-parts.sh`
+   into multi-volume `tree.tar.zst.*` files via `tar | zstd`, preserving
+   mtimes, modes, and symlinks so incremental Ninja state survives;
+6. upload up to four volume artifacts; the next stage downloads them with
+   `actions/download-artifact@v4` (`merge-multiple: true`, sorted part order)
+   and resumes.
+
+Compile failures fail the job immediately; only the timeout hands off.
+`tree.tar.zst*` archives over eight volumes (eight ~9 GB slices) abort the
+chain rather than upload a broken handoff, mirroring the Windows multi-volume
+guard; between five and eight volumes the chain continues with an explicit
+warning instead of aborting, because re-packing hundreds of gigabytes buys
+nothing once the per-artifact upload cap is the real constraint. Stage jobs declare
+`if: always() && needs.posix-N.result == 'success' && needs.posix-N.outputs.finished != 'true'`,
+so an early finish skips later stages while hard failures stop the platform.
+
+Each POSIX stage also caches only the pinned source and resource downloads at
 `${{ runner.temp }}/chromix-build/download_cache`. The cache key includes the
 runner OS, platform, architecture, Chromium version, revisions, and preparation
-script. Mutable Chromium `src/` and `out/` trees are intentionally not placed in
-`actions/cache`: their size, runner/toolchain coupling, and file metadata make a
-blind restore unreliable. A POSIX retry therefore reuses downloads but prepares
-and compiles on one native runner from a clean mutable tree.
+script. The mutable Chromium `src/` and `out/` trees are intentionally not
+placed in `actions/cache`: their size, runner/toolchain coupling, and file
+metadata make a blind restore unreliable. A POSIX retry instead restores the
+explicit tar/zstd stage snapshots — never a cache guess.
 
-The POSIX workflow verifies `SHA256SUMS`, extracts the ZIP into a fresh directory,
-and runs the extracted launcher with `--version` and a bounded headless
-`--dump-dom` check against a local data URL. It checks the pinned browser version
-and rendered marker before uploading the browser artifact. It does not launch
-from the build output, contact a test website, disable the sandbox, or notarize
-macOS bundles. Sandbox/user-namespace policy, missing shared libraries, or macOS
-launch restrictions can fail the check; such failures are not silently skipped.
-This small check does not validate GPU operation, GUI behavior, Playwright
-integration, Gatekeeper approval, or every supported OS version.
+Host toolchains follow the host architecture, not the target: Node resolves
+through `third_party/node/linux/node-linux-$HOST_ARCH/bin/node` with an extra
+x64 link for hardcoded generator paths, Go is linked as
+`third_party/dawn/tools/golang/linux-amd64/bin/go` on x64 hosts and
+`linux-arm64` on arm64 hosts (Dawn's DEPS pins exactly these cipd directories),
+matching upstream portablelinux's `setup_toolchain`. Only GN args, sysroots,
+and output binaries select the target architecture. Linux stages install a
+current Go explicitly because Dawn's `go.mod` requires go 1.25.0 toolchain
+support, matching the pinned Docker image upstream builds with; arm64
+runners download linux-arm64 and x64 runners download linux-amd64 from
+go.dev. That single dependency drift was enough to fail prior one-shot POSIX
+builds when Ubuntu's apt Go predated the new module syntax.
+
+The final POSIX stage verifies `SHA256SUMS`, extracts the ZIP into a fresh
+directory, and runs the extracted launcher with `--version` and a bounded
+headless `--dump-dom` check against a local data URL. It checks the pinned
+browser version and rendered marker before uploading the browser artifact. It
+does not launch from the build output, contact a test website, disable the
+sandbox, or notarize macOS bundles. Sandbox/user-namespace policy, missing
+shared libraries, or macOS launch restrictions can fail the check; such
+failures are not silently skipped. This small check does not validate GPU
+operation, GUI behavior, Playwright integration, Gatekeeper approval, or
+every supported OS version.
 
 Preparation, build, packaging, checksum, and smoke output are captured in
-`chromix-*-logs` artifacts alongside generated `args.gn` when present. Diagnostics
-upload uses `always()` so ordinary failed steps still upload logs. Hard job
-termination, runner loss, or a full disk can prevent even that upload. The
-90-minute preparation and 210-minute compilation limits leave some room inside
-the 355-minute job limit for packaging and diagnostics, but are not promises
-that a Chromium build fits.
+per-stage log artifacts alongside generated `args.gn` when present.
+Diagnostics upload uses `always()` so ordinary failed steps still upload logs,
+and each failed stage still packs and uploads its tree so the next run can
+resume from the last good handoff. Hard job termination, runner loss, or a
+full disk can prevent even that upload.
 
 **CI cost and capacity:** filtered pushes to `main` and manual dispatches start
-four POSIX jobs plus the Windows 12-stage chain. POSIX jobs reuse only their
-pinned download cache; they do not transfer large object trees between jobs.
-Windows uses bounded multi-volume snapshots because its Chromium tree already
-has a tested staged-resume implementation. A full run can still consume up to
-1,420 POSIX runner-minutes plus the Windows stage budgets before billing
-multipliers/quota rules; macOS is typically more expensive where usage is billed.
-`cancel-in-progress: false` does not cancel an active run when newer work
-arrives. Hosted disk/RAM may be insufficient even after Linux cleanup, especially
-for the arm64 LLVM/Rust bootstrap, link steps, and duplicate
+four POSIX chains plus the Windows 12-stage chain. Each POSIX stage now spans a
+full 355-minute budget rather than one shot, so retry capacity comes from
+resumable snapshots instead of repeated full rebuilds. A full run can consume
+far more runner-minutes than the earlier one-shot layout before billing
+multipliers/quota rules; macOS is typically more expensive where usage is
+billed. `cancel-in-progress: false` does not cancel an active run when newer
+work arrives. Hosted disk/RAM may be insufficient even after Linux cleanup,
+especially for the arm64 LLVM/Rust bootstrap, link steps, and duplicate
 packaging/extraction trees. Do not treat cleanup or a 100 GB estimate as proof
 of capacity.
 
