@@ -98,8 +98,11 @@ LINUX_CLEAN = """      - name: Free Linux disk space
           curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCHIVE_TAIL}.tar.gz" -o /tmp/go.tgz
           sudo rm -rf /usr/local/go /opt/hostedtoolcache/go*
           sudo tar -C /usr/local -xzf /tmp/go.tgz
-          hash -r
-          go version
+          # arm64 runner images ship no Go on PATH, and a plain `go` here would
+          # still miss after the rm above; publish the bin dir to later steps
+          # through GITHUB_PATH and verify via the absolute path.
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          /usr/local/go/bin/go version
 """
 
 MAC_STEPS = """      - name: Inspect macOS toolchain
@@ -168,7 +171,7 @@ def run_step(stage: int) -> str:
           build/posix/ci-stage.sh \\
             --platform '${{ inputs.platform }}' --arch '${{ inputs.arch }}' \\
             --workdir "${RUNNER_TEMP}/chromix-build" \\
-            --stage-index __STAGE__ --max-stages '${{ inputs.max_stages }}' __RESTORE_ARGS__--deadline-epoch "$DEADLINE_EPOCH" \\
+            --stage-index __STAGE__ --max-stages '${{ inputs['max-stages'] }}' __RESTORE_ARGS__--deadline-epoch "$DEADLINE_EPOCH" \\
             2>&1 | tee "${RUNNER_TEMP}/chromix-logs/stage-__STAGE__.log"
 """
     ).replace("__STAGE__", str(stage)).replace("__RESTORE_ARGS__", restore_args)

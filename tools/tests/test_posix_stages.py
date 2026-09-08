@@ -208,7 +208,7 @@ class GenPosixWorkflowTest(unittest.TestCase):
         self.assertNotIn("${ runner.", text)
         self.assertNotIn("${ steps.", text)
         for token in ("${{ inputs.platform }}", "${{ inputs.arch }}",
-                      "${{ inputs.max_stages }}", "${{ github.run_attempt }}",
+                      "${{ inputs['max-stages'] }}", "${{ github.run_attempt }}",
                       "${{ steps.stage.outputs.finished }}",
                       "${{ inputs.artifact }}"):
             self.assertIn(token, text)
@@ -243,7 +243,20 @@ class GenPosixWorkflowTest(unittest.TestCase):
         stage2 = next(s for s in jobs["posix-2"]["steps"]
                       if s.get("name") == "Run stage 2")["run"]
         self.assertNotIn("--from-snapshot", stage1)
+        # A dotted inputs.max_stages rendered as '' on the first real run:
+        # expression property access is literal, so dashed input keys need
+        # bracket syntax. Lock the rendered argument shape per stage.
+        self.assertIn(
+            "--stage-index 1 --max-stages '${{ inputs['max-stages'] }}' "
+            '--deadline-epoch "$DEADLINE_EPOCH"', stage1)
         self.assertIn("--from-snapshot \"${RUNNER_TEMP}/chromix-restore\"", stage2)
+        deps = next(s for s in jobs["posix-1"]["steps"]
+                    if s.get("name") == "Install Linux build dependencies")
+        # arm64 runner images carry no Go on PATH: the pinned toolchain must
+        # publish /usr/local/go/bin to later steps and verify via the
+        # absolute path, not a bare `go` (first real run died with exit 127).
+        self.assertIn('echo "/usr/local/go/bin" >> "$GITHUB_PATH"', deps["run"])
+        self.assertIn("/usr/local/go/bin/go version", deps["run"])
         last = next(s for s in jobs["posix-8"]["steps"]
                     if s.get("name") == "Run stage 8")["run"]
         self.assertIn("--stage-index 8", last)
@@ -267,6 +280,41 @@ class GenPosixWorkflowTest(unittest.TestCase):
         self.assertNotIn("runs-on: ubuntu-22.04", source)
         self.assertNotIn("runs-on: macos-15", source)
         self.assertIn("secrets: inherit", source)
+
+
+class WorkflowInputIntegrityTest(unittest.TestCase):
+    """Every inputs reference must hit a declared key of its own workflow.
+
+    GitHub Actions resolves `inputs.foo` with literal property access: for a
+    dashed input like max-stages only `${{ inputs['max-stages'] }}` works,
+    while `${{ inputs.max_stages }}` silently renders empty. The first real
+    POSIX run died on exactly that (`--max-stages ''`). This audit across all
+    workflows catches the whole class, including future renames.
+    """
+
+    WORKFLOWS = REPO / ".github" / "workflows"
+
+    def test_input_references_match_declared_input_keys(self):
+        import re
+        import yaml
+        dotted = re.compile(r"\$\{\{\s*inputs\.([A-Za-z0-9_]+)")
+        bracketed = re.compile(r"\$\{\{\s*inputs\['([^']+)'")
+        files = sorted(self.WORKFLOWS.glob("*.yml"))
+        self.assertGreaterEqual(len(files), 5)
+        for path in files:
+            text = path.read_text(encoding="utf-8")
+            data = yaml.safe_load(text)
+            triggers = data.get(True) or data.get("on") or {}
+            keys = set()
+            for body in triggers.values():
+                if isinstance(body, dict):
+                    keys |= set((body.get("inputs") or {}).keys())
+            refs = {m.group(1) for m in dotted.finditer(text)}
+            refs |= {m.group(1) for m in bracketed.finditer(text)}
+            missing = refs - keys if keys else set()
+            # Workflows without declared inputs must not reference any.
+            self.assertEqual(missing, set(),
+                             f"{path.name}: undeclared input refs {missing}")
 
 
 if __name__ == "__main__":

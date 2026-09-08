@@ -97,8 +97,11 @@ jobs:
           curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCHIVE_TAIL}.tar.gz" -o /tmp/go.tgz
           sudo rm -rf /usr/local/go /opt/hostedtoolcache/go*
           sudo tar -C /usr/local -xzf /tmp/go.tgz
-          hash -r
-          go version
+          # arm64 runner images ship no Go on PATH, and a plain `go` here would
+          # still miss after the rm above; publish the bin dir to later steps
+          # through GITHUB_PATH and verify via the absolute path.
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          /usr/local/go/bin/go version
       - name: Inspect macOS toolchain
         if: runner.os == 'macOS'
         run: |
@@ -145,7 +148,7 @@ jobs:
           build/posix/ci-stage.sh \
             --platform '${{ inputs.platform }}' --arch '${{ inputs.arch }}' \
             --workdir "${RUNNER_TEMP}/chromix-build" \
-            --stage-index 1 --max-stages '${{ inputs.max_stages }}' --deadline-epoch "$DEADLINE_EPOCH" \
+            --stage-index 1 --max-stages '${{ inputs['max-stages'] }}' --deadline-epoch "$DEADLINE_EPOCH" \
             2>&1 | tee "${RUNNER_TEMP}/chromix-logs/stage-1.log"
       - name: Ensure tree snapshot exists even when handoff failed to pack
         if: always()
@@ -284,8 +287,11 @@ jobs:
           curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCHIVE_TAIL}.tar.gz" -o /tmp/go.tgz
           sudo rm -rf /usr/local/go /opt/hostedtoolcache/go*
           sudo tar -C /usr/local -xzf /tmp/go.tgz
-          hash -r
-          go version
+          # arm64 runner images ship no Go on PATH, and a plain `go` here would
+          # still miss after the rm above; publish the bin dir to later steps
+          # through GITHUB_PATH and verify via the absolute path.
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          /usr/local/go/bin/go version
       - name: Inspect macOS toolchain
         if: runner.os == 'macOS'
         run: |
@@ -332,7 +338,7 @@ jobs:
           build/posix/ci-stage.sh \
             --platform '${{ inputs.platform }}' --arch '${{ inputs.arch }}' \
             --workdir "${RUNNER_TEMP}/chromix-build" \
-            --stage-index 2 --max-stages '${{ inputs.max_stages }}' --from-snapshot "${RUNNER_TEMP}/chromix-restore" \
+            --stage-index 2 --max-stages '${{ inputs['max-stages'] }}' --from-snapshot "${RUNNER_TEMP}/chromix-restore" \
             --deadline-epoch "$DEADLINE_EPOCH" \
             2>&1 | tee "${RUNNER_TEMP}/chromix-logs/stage-2.log"
       - name: Ensure tree snapshot exists even when handoff failed to pack
@@ -472,8 +478,11 @@ jobs:
           curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCHIVE_TAIL}.tar.gz" -o /tmp/go.tgz
           sudo rm -rf /usr/local/go /opt/hostedtoolcache/go*
           sudo tar -C /usr/local -xzf /tmp/go.tgz
-          hash -r
-          go version
+          # arm64 runner images ship no Go on PATH, and a plain `go` here would
+          # still miss after the rm above; publish the bin dir to later steps
+          # through GITHUB_PATH and verify via the absolute path.
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          /usr/local/go/bin/go version
       - name: Inspect macOS toolchain
         if: runner.os == 'macOS'
         run: |
@@ -520,7 +529,7 @@ jobs:
           build/posix/ci-stage.sh \
             --platform '${{ inputs.platform }}' --arch '${{ inputs.arch }}' \
             --workdir "${RUNNER_TEMP}/chromix-build" \
-            --stage-index 3 --max-stages '${{ inputs.max_stages }}' --from-snapshot "${RUNNER_TEMP}/chromix-restore" \
+            --stage-index 3 --max-stages '${{ inputs['max-stages'] }}' --from-snapshot "${RUNNER_TEMP}/chromix-restore" \
             --deadline-epoch "$DEADLINE_EPOCH" \
             2>&1 | tee "${RUNNER_TEMP}/chromix-logs/stage-3.log"
       - name: Ensure tree snapshot exists even when handoff failed to pack
@@ -660,8 +669,11 @@ jobs:
           curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCHIVE_TAIL}.tar.gz" -o /tmp/go.tgz
           sudo rm -rf /usr/local/go /opt/hostedtoolcache/go*
           sudo tar -C /usr/local -xzf /tmp/go.tgz
-          hash -r
-          go version
+          # arm64 runner images ship no Go on PATH, and a plain `go` here would
+          # still miss after the rm above; publish the bin dir to later steps
+          # through GITHUB_PATH and verify via the absolute path.
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          /usr/local/go/bin/go version
       - name: Inspect macOS toolchain
         if: runner.os == 'macOS'
         run: |
@@ -708,7 +720,7 @@ jobs:
           build/posix/ci-stage.sh \
             --platform '${{ inputs.platform }}' --arch '${{ inputs.arch }}' \
             --workdir "${RUNNER_TEMP}/chromix-build" \
-            --stage-index 4 --max-stages '${{ inputs.max_stages }}' --from-snapshot "${RUNNER_TEMP}/chromix-restore" \
+            --stage-index 4 --max-stages '${{ inputs['max-stages'] }}' --from-snapshot "${RUNNER_TEMP}/chromix-restore" \
             --deadline-epoch "$DEADLINE_EPOCH" \
             2>&1 | tee "${RUNNER_TEMP}/chromix-logs/stage-4.log"
       - name: Ensure tree snapshot exists even when handoff failed to pack
@@ -848,8 +860,11 @@ jobs:
           curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCHIVE_TAIL}.tar.gz" -o /tmp/go.tgz
           sudo rm -rf /usr/local/go /opt/hostedtoolcache/go*
           sudo tar -C /usr/local -xzf /tmp/go.tgz
-          hash -r
-          go version
+          # arm64 runner images ship no Go on PATH, and a plain `go` here would
+          # still miss after the rm above; publish the bin dir to later steps
+          # through GITHUB_PATH and verify via the absolute path.
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          /usr/local/go/bin/go version
       - name: Inspect macOS toolchain
         if: runner.os == 'macOS'
         run: |
@@ -896,7 +911,7 @@ jobs:
           build/posix/ci-stage.sh \
             --platform '${{ inputs.platform }}' --arch '${{ inputs.arch }}' \
             --workdir "${RUNNER_TEMP}/chromix-build" \
-            --stage-index 5 --max-stages '${{ inputs.max_stages }}' --from-snapshot "${RUNNER_TEMP}/chromix-restore" \
+            --stage-index 5 --max-stages '${{ inputs['max-stages'] }}' --from-snapshot "${RUNNER_TEMP}/chromix-restore" \
             --deadline-epoch "$DEADLINE_EPOCH" \
             2>&1 | tee "${RUNNER_TEMP}/chromix-logs/stage-5.log"
       - name: Ensure tree snapshot exists even when handoff failed to pack
@@ -1036,8 +1051,11 @@ jobs:
           curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCHIVE_TAIL}.tar.gz" -o /tmp/go.tgz
           sudo rm -rf /usr/local/go /opt/hostedtoolcache/go*
           sudo tar -C /usr/local -xzf /tmp/go.tgz
-          hash -r
-          go version
+          # arm64 runner images ship no Go on PATH, and a plain `go` here would
+          # still miss after the rm above; publish the bin dir to later steps
+          # through GITHUB_PATH and verify via the absolute path.
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          /usr/local/go/bin/go version
       - name: Inspect macOS toolchain
         if: runner.os == 'macOS'
         run: |
@@ -1084,7 +1102,7 @@ jobs:
           build/posix/ci-stage.sh \
             --platform '${{ inputs.platform }}' --arch '${{ inputs.arch }}' \
             --workdir "${RUNNER_TEMP}/chromix-build" \
-            --stage-index 6 --max-stages '${{ inputs.max_stages }}' --from-snapshot "${RUNNER_TEMP}/chromix-restore" \
+            --stage-index 6 --max-stages '${{ inputs['max-stages'] }}' --from-snapshot "${RUNNER_TEMP}/chromix-restore" \
             --deadline-epoch "$DEADLINE_EPOCH" \
             2>&1 | tee "${RUNNER_TEMP}/chromix-logs/stage-6.log"
       - name: Ensure tree snapshot exists even when handoff failed to pack
@@ -1224,8 +1242,11 @@ jobs:
           curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCHIVE_TAIL}.tar.gz" -o /tmp/go.tgz
           sudo rm -rf /usr/local/go /opt/hostedtoolcache/go*
           sudo tar -C /usr/local -xzf /tmp/go.tgz
-          hash -r
-          go version
+          # arm64 runner images ship no Go on PATH, and a plain `go` here would
+          # still miss after the rm above; publish the bin dir to later steps
+          # through GITHUB_PATH and verify via the absolute path.
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          /usr/local/go/bin/go version
       - name: Inspect macOS toolchain
         if: runner.os == 'macOS'
         run: |
@@ -1272,7 +1293,7 @@ jobs:
           build/posix/ci-stage.sh \
             --platform '${{ inputs.platform }}' --arch '${{ inputs.arch }}' \
             --workdir "${RUNNER_TEMP}/chromix-build" \
-            --stage-index 7 --max-stages '${{ inputs.max_stages }}' --from-snapshot "${RUNNER_TEMP}/chromix-restore" \
+            --stage-index 7 --max-stages '${{ inputs['max-stages'] }}' --from-snapshot "${RUNNER_TEMP}/chromix-restore" \
             --deadline-epoch "$DEADLINE_EPOCH" \
             2>&1 | tee "${RUNNER_TEMP}/chromix-logs/stage-7.log"
       - name: Ensure tree snapshot exists even when handoff failed to pack
@@ -1412,8 +1433,11 @@ jobs:
           curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCHIVE_TAIL}.tar.gz" -o /tmp/go.tgz
           sudo rm -rf /usr/local/go /opt/hostedtoolcache/go*
           sudo tar -C /usr/local -xzf /tmp/go.tgz
-          hash -r
-          go version
+          # arm64 runner images ship no Go on PATH, and a plain `go` here would
+          # still miss after the rm above; publish the bin dir to later steps
+          # through GITHUB_PATH and verify via the absolute path.
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          /usr/local/go/bin/go version
       - name: Inspect macOS toolchain
         if: runner.os == 'macOS'
         run: |
@@ -1460,7 +1484,7 @@ jobs:
           build/posix/ci-stage.sh \
             --platform '${{ inputs.platform }}' --arch '${{ inputs.arch }}' \
             --workdir "${RUNNER_TEMP}/chromix-build" \
-            --stage-index 8 --max-stages '${{ inputs.max_stages }}' --from-snapshot "${RUNNER_TEMP}/chromix-restore" \
+            --stage-index 8 --max-stages '${{ inputs['max-stages'] }}' --from-snapshot "${RUNNER_TEMP}/chromix-restore" \
             --deadline-epoch "$DEADLINE_EPOCH" \
             2>&1 | tee "${RUNNER_TEMP}/chromix-logs/stage-8.log"
       - name: Ensure tree snapshot exists even when handoff failed to pack
