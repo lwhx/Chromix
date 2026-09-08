@@ -155,10 +155,15 @@ class RestoreUpstreamCacheTest(unittest.TestCase):
     def test_all_five_manifest_targets_restore(self):
         for platform, arch in (("linux", "x64"), ("linux", "arm64"),
                                ("macos", "x64"), ("macos", "arm64"), ("windows", "x64")):
-            with self.subTest(platform=platform, arch=arch):
-                self.make_cache(platform, arch)
-                self.work = Path(self.tmp.name) / f"work-{platform}-{arch}"
-                self.assertEqual(self.invoke()["status"], "hit")
+            for version in (5, 6, 7):
+                with self.subTest(platform=platform, arch=arch, version=version):
+                    self.make_cache(platform, arch)
+                    self.work = Path(self.tmp.name) / f"work-{platform}-{arch}-v{version}"
+                    header = f"# ninja log v{version}\n".encode()
+                    self.write(self.donor / "out/Default/.ninja_log", header)
+                    self.assertEqual(self.invoke()["status"], "hit")
+                    self.assertEqual((self.work / "src/out/Default/.ninja_log").read_bytes(), header)
+                    self.assertEqual(self.invoke("verify", cache=False)["status"], "verified")
 
     def test_fetch_then_restore_all_five_targets_with_archive_relative_omissions(self):
         linux_links = ["buildtools/linux64-format/clang-format",
@@ -493,6 +498,78 @@ class RestoreUpstreamCacheTest(unittest.TestCase):
             self.write(self.donor / "out/Default" / relative, "broken metadata")
             self.assertEqual(self.invoke()["status"], "miss")
 
+    def test_ninja_state_diagnostics_survive_restore_and_owned_miss_cleanup(self):
+        for header, expected in ((b"# ninja log v5\n", "hit"),
+                                 (b"# ninja log v99\n", "miss"),
+                                 (b"\xff\x00broken\n", "miss"),
+                                 (b"x" * 4096, "miss")):
+            with self.subTest(header=header[:32]):
+                self.make_cache()
+                self.work = Path(self.tmp.name) / f"ninja-diagnostic-{len(header)}"
+                self.write(self.donor / "out/Default/.ninja_log", header)
+                entry = self.invoke()
+                self.assertEqual(entry["status"], expected, entry)
+                state = entry["ninja_state"]
+                self.assertEqual(state[".ninja_log"], {
+                    "path": "out/Default/.ninja_log", "size_bytes": len(header),
+                    "header_hex": header[:128].hex(), "header_truncated": len(header) > 128})
+                self.assertEqual(state[".ninja_deps"]["header_hex"],
+                                 b"# ninjadeps\n\x04\x00\x00\x00".hex())
+                self.assertEqual(json.loads((self.work / restore.REPORT).read_text())["ninja_state"], state)
+                if expected == "hit":
+                    self.assertEqual(entry["receipt"]["ninja_state"], state)
+                else:
+                    self.assertEqual(entry["cleanup"]["status"], "removed")
+                    self.assertFalse((self.cache / "tree").exists())
+                    self.assertFalse((self.work / "src").exists())
+
+    def test_ninja_state_diagnostics_record_linked_metadata_without_reading_it(self):
+        path = self.donor / "out/Default/.ninja_log"
+        path.unlink()
+        path.symlink_to(self.donor / "chrome/source.cc")
+        original_open = Path.open
+
+        def checked_open(candidate, *args, **kwargs):
+            if candidate == path or candidate == self.donor / "chrome/source.cc":
+                raise AssertionError("unsafe read")
+            return original_open(candidate, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", checked_open):
+            state = restore.ninja_state_diagnostics(self.donor)
+        self.assertIn("error", state[".ninja_log"])
+        self.assertNotIn("header_hex", state[".ninja_log"])
+
+    def test_ninja_evidence_survives_earlier_source_validation_failures(self):
+        header = b"# ninja log v99\n"
+        for failure in ("arch", "missing_deps", "linked_deps", "linked_log"):
+            with self.subTest(failure=failure):
+                self.make_cache()
+                self.write(self.donor / "out/Default/.ninja_log", header)
+                metadata = self.donor / "out/Default/.ninja_deps"
+                if failure == "arch":
+                    self.write(self.donor / "out/Default/args.gn", 'target_cpu="arm64"\n')
+                elif failure == "linked_log":
+                    metadata = self.donor / "out/Default/.ninja_log"
+                    metadata.unlink()
+                    metadata.symlink_to(self.donor / "chrome/source.cc")
+                else:
+                    metadata.unlink()
+                    if failure == "linked_deps":
+                        metadata.symlink_to(self.donor / "chrome/source.cc")
+                entry = self.invoke()
+                self.assertEqual(entry["status"], "miss", entry)
+                self.assertEqual(entry["cleanup"]["status"], "removed", entry)
+                self.assertFalse((self.cache / "tree").exists())
+                state = entry["ninja_state"]
+                if failure == "linked_log":
+                    self.assertIn("error", state[".ninja_log"])
+                    self.assertNotIn("header_hex", state[".ninja_log"])
+                else:
+                    self.assertEqual(state[".ninja_log"]["header_hex"], header.hex())
+                if failure in ("missing_deps", "linked_deps"):
+                    self.assertIn("error", state[".ninja_deps"])
+                    self.assertNotIn("header_hex", state[".ninja_deps"])
+
     def test_known_host_links_are_recorded_without_recreating_them(self):
         paths = ["build/src/" + name for name in sorted(restore.HOST_LINKS)]
         self.result.update(skipped_external_symlinks=len(paths), external_symlink_paths=paths)
@@ -816,7 +893,7 @@ class NinjaTimestampTest(unittest.TestCase):
         os.utime(self.output, ns=(self.floor, self.floor))
         self.metadata()
 
-    def metadata(self, output="obj/a.o", dependency="../../a.cc", logged=None):
+    def metadata(self, output="obj/a.o", dependency="../../a.cc", logged=None, version=5):
         raw = bytearray(b"# ninjadeps\n\x04\x00\x00\x00")
         for index, name in enumerate((output, dependency)):
             name = name.encode()
@@ -826,7 +903,7 @@ class NinjaTimestampTest(unittest.TestCase):
         raw += struct.pack("<I", 0x80000000 | len(record)) + record
         (self.out / ".ninja_deps").write_bytes(raw)
         (self.out / ".ninja_log").write_text(
-            f"# ninja log v5\n0\t1\t{logged or self.recorded}\t{output}\t123456789abcdef0\n")
+            f"# ninja log v{version}\n0\t1\t{logged or self.recorded}\t{output}\t123456789abcdef0\n")
 
     def test_exact_floor_only_and_hash_deps_input_unchanged(self):
         before = [(p, p.read_bytes(), p.stat().st_mtime_ns)
@@ -841,6 +918,25 @@ class NinjaTimestampTest(unittest.TestCase):
             os.utime(self.output, ns=(mtime, mtime))
             self.assertEqual(restore.restore_ninja_output_mtimes(self.src)["outputs_restored"], 0)
             self.assertEqual(self.output.stat().st_mtime_ns, mtime)
+
+    def test_v6_v7_command_start_timestamps_keep_logs_and_only_repair_proven_outputs(self):
+        for version in (6, 7):
+            logged = self.recorded - 2 * 10**9
+            cutoff = logged // 10**9 * 10**9
+            for input_mtime, repaired in ((cutoff - 1, 1), (cutoff, 0), (self.floor - 1, 0)):
+                with self.subTest(version=version, input_mtime=input_mtime):
+                    self.metadata(logged=logged, version=version)
+                    os.utime(self.input, ns=(input_mtime, input_mtime))
+                    os.utime(self.output, ns=(self.floor, self.floor))
+                    before = [(p, p.read_bytes(), p.stat().st_mtime_ns)
+                              for p in (self.input, self.out / ".ninja_log", self.out / ".ninja_deps")]
+                    result = restore.restore_ninja_output_mtimes(self.src)
+                    self.assertEqual(result["outputs_restored"], repaired, result)
+                    self.assertEqual(self.output.stat().st_mtime_ns,
+                                     self.recorded if repaired else self.floor)
+                    for path, content, mtime in before:
+                        self.assertEqual(path.read_bytes(), content)
+                        self.assertEqual(path.stat().st_mtime_ns, mtime)
 
     def test_newer_or_same_second_inputs_cannot_be_hidden(self):
         for mtime in (self.floor, self.floor + 1, self.recorded + 1):

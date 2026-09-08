@@ -110,6 +110,7 @@ jobs:
           path: |
             C:\u\result.json
             C:\c\chromix\upstream-cache-restore.json
+            C:\c\chromix\upstream-cache-ninja.json
             C:\c\chromix\src\.chromix-upstream-restored.json
           if-no-files-found: ignore
           retention-days: 3
@@ -146,6 +147,7 @@ jobs:
           path: |
             C:\u\result.json
             C:\c\chromix\upstream-cache-restore.json
+            C:\c\chromix\upstream-cache-ninja.json
             C:\c\chromix\upstream-cache-preparation.json
             C:\c\chromix\src\.chromix-upstream-restored.json
             C:\c\chromix\src\.chromix-restored-patches.json

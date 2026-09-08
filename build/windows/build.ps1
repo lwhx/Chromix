@@ -35,25 +35,61 @@ $env:DEPOT_TOOLS_METRICS = "0"
 $env:DEPOT_TOOLS_COLLECT_METRICS = "0"
 
 $env:PATH = "$(Join-Path $Src 'third_party\ninja');$(Join-Path $Src 'third_party\node\win');$env:PATH"
+$Ninja = Join-Path $Src "third_party\ninja\ninja.exe"
+if (Test-Path (Join-Path $Src ".chromix-upstream-restored.json")) {
+  $Out = Join-Path $Src "out\Default"
+  $Ninja = & python (Join-Path $Repo "tools\restore_ninja.py") --workdir $WorkDir --platform windows --arch x64
+  if ($LASTEXITCODE -ne 0 -or -not $Ninja) { throw "restored Ninja compatibility check failed" }
+  $env:NINJA = $Ninja
+}
 $mergedArgs = Join-Path $Out "args.gn"
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
-python (Join-Path $Repo "tools\merge_gn_args.py") $mergedArgs `
-  (Join-Path $UngoogledTooling "flags.gn") `
-  (Join-Path $WindowsTooling "flags.windows.gn") `
+$mergeArgs = @((Join-Path $Repo "tools\merge_gn_args.py"), $mergedArgs)
+if (Test-Path (Join-Path $Src ".chromix-upstream-restored.json")) { $mergeArgs += $mergedArgs }
+$mergeArgs += @(
+  (Join-Path $UngoogledTooling "flags.gn"),
+  (Join-Path $WindowsTooling "flags.windows.gn"),
   (Join-Path $Repo "build\args.windows.gn")
+)
+python @mergeArgs
 if ($LASTEXITCODE -ne 0) { throw "GN argument merge failed" }
 
 Push-Location $Src
 try {
+  if (-not (Test-Path "third_party\rust-toolchain\bin\bindgen.exe")) {
+    if (Test-Path (Join-Path $Src ".chromix-upstream-restored.json")) {
+      # Only restore known tool-download endpoints, never browser source domains.
+      $normalizeToolUrls = @'
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / 'tools'))
+from upstream_script_identity import ENDPOINTS, RESTORED
+src = Path(sys.argv[2])
+for relative, keys in RESTORED.items():
+    path = src / relative
+    original = path.read_bytes()
+    normalized = original
+    for key in keys:
+        before, after = ENDPOINTS[key]
+        normalized = normalized.replace(before.encode('ascii'), after.encode('ascii'))
+    if normalized != original:
+        path.write_bytes(normalized)
+'@
+      python -c $normalizeToolUrls $Repo $Src
+      if ($LASTEXITCODE -ne 0) { throw "restored tool download endpoint normalization failed" }
+    }
+    python tools\rust\build_bindgen.py --skip-test
+    if ($LASTEXITCODE -ne 0) { throw "bindgen build failed" }
+  }
+  if (Test-Path (Join-Path $Src ".chromix-upstream-restored.json")) {
+    python (Join-Path $Repo "tools\prepare_restored_build.py") --phase finish `
+      --platform windows --arch x64 --workdir $WorkDir
+    if ($LASTEXITCODE -ne 0) { throw "restored build preparation failed (exit $LASTEXITCODE)" }
+  }
   $gn = Join-Path $Out "gn.exe"
   if (-not (Test-Path $gn)) {
     python tools\gn\bootstrap\bootstrap.py -o $gn --skip-generate-buildfiles
     if ($LASTEXITCODE -ne 0) { throw "GN bootstrap failed" }
-  }
-
-  if (-not (Test-Path "third_party\rust-toolchain\bin\bindgen.exe")) {
-    python tools\rust\build_bindgen.py --skip-test
-    if ($LASTEXITCODE -ne 0) { throw "bindgen build failed" }
   }
 
   if ($ApplyDomainSubstitution) {
@@ -71,7 +107,7 @@ try {
   & $gn gen $Out --fail-on-unused-args
   if ($LASTEXITCODE -ne 0) { throw "gn gen failed" }
 
-  & "third_party\ninja\ninja.exe" -C $Out -j $Jobs chrome
+  & $Ninja -C $Out -j $Jobs chrome
   if ($LASTEXITCODE -ne 0) { throw "ninja failed" }
 } finally {
   Pop-Location

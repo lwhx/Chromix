@@ -214,6 +214,27 @@ def donor_counts(src: Path) -> dict:
     return counts
 
 
+def ninja_state_diagnostics(src: Path) -> dict:
+    """Keep available bounded evidence without following unsafe metadata paths."""
+    state = {}
+    for name, limit in ((".ninja_log", 128), (".ninja_deps", 16)):
+        relative = Path("out/Default") / name
+        evidence = {"path": relative.as_posix()}
+        try:
+            path = safe_path(src, relative)
+            info = path.stat()
+            if not stat.S_ISREG(info.st_mode):
+                raise Miss("Ninja metadata is not a regular file")
+            with path.open("rb") as stream:
+                header = stream.readline(limit + 1) if name == ".ninja_log" else stream.read(limit)
+            evidence.update(size_bytes=info.st_size, header_hex=header[:limit].hex(),
+                            header_truncated=len(header) > limit)
+        except (OSError, ValueError, RuntimeError) as error:
+            evidence["error"] = str(error)[:256]
+        state[name] = evidence
+    return state
+
+
 def ninja_mtime_plan(src: Path) -> dict:
     """Plan only exact whole-second output repairs; never adjust input mtimes."""
     out = safe_path(src, Path("out/Default"))
@@ -461,6 +482,7 @@ def restore(workdir: Path, platform: str, arch: str, cache_dir: Path,
         if importer.read_json(result_path) != result:
             raise Miss("downloader receipt changed during restoration")
         cache_owned = True
+        entry["ninja_state"] = ninja_state_diagnostics(donor)
         try:
             original_args = source_args(donor, identity)
             omitted = missing_host_links(cache, donor, result, platform)
@@ -473,7 +495,8 @@ def restore(workdir: Path, platform: str, arch: str, cache_dir: Path,
         receipt = {"schema_version": 1, "owner": OWNER, "status": "restored",
                    "identity": identity, "manifest": manifest, "platform": platform, "arch": arch,
                    "extraction_scope": fetcher.SOURCE_SCOPE, "original_args": original_args,
-                   "counts": counts, "ninja_mtimes": plan, "external_symlink_paths": omitted,
+                   "counts": counts, "ninja_mtimes": plan, "ninja_state": entry["ninja_state"],
+                   "external_symlink_paths": omitted,
                    "archive_external_symlink_paths": result.get("external_symlink_paths", []),
                    "environment": {"compiler": "unverified", "sdk": "unverified",
                                    "external_inputs": "unverified", "cache_hit_proven": False}}

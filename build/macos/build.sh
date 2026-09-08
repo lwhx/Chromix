@@ -22,6 +22,7 @@ if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
   OUT="$SRC/out/Default"
 fi
 cd "$SRC"
+chromix_select_restored_ninja macos
 if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
   bash "$REPO/build/posix/prepare-restored-tools.sh" "$WORK" macos "$ARCH"
 fi
@@ -59,5 +60,5 @@ if [ ! -x "$OUT/gn" ]; then
 fi
 "$OUT/gn" gen "$OUT" --fail-on-unused-args
 chromix_report_upstream_plan chrome
-ninja -C "$OUT" -j "${CHROMIX_JOBS:-$(sysctl -n hw.ncpu)}" chrome
+"$CHROMIX_NINJA" -C "$OUT" -j "${CHROMIX_JOBS:-$(sysctl -n hw.ncpu)}" chrome
 printf '==> Done: %s\n' "$OUT/Chromium.app"

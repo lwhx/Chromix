@@ -110,6 +110,30 @@ LINUX_CLEAN = """      - name: Free Linux disk space
           # through GITHUB_PATH and verify via the absolute path.
           echo "/usr/local/go/bin" >> "$GITHUB_PATH"
           /usr/local/go/bin/go version
+
+      - name: Install restored-build Ninja v6
+        if: runner.os == 'Linux' && inputs.use_upstream_cache
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64)
+              NINJA_ARCHIVE=ninja-linux.zip
+              NINJA_SHA256=6f98805688d19672bd699fbbfa2c2cf0fc054ac3df1f0e6a47664d963d530255 ;;
+            aarch64)
+              NINJA_ARCHIVE=ninja-linux-aarch64.zip
+              NINJA_SHA256=5c25c6570b0155e95fce5918cb95f1ad9870df5768653afe128db822301a05a1 ;;
+            *) exit 1 ;;
+          esac
+          NINJA_DIR="$(mktemp -d "${RUNNER_TEMP}/chromix-ninja-v6.XXXXXX")"
+          curl --fail --location --retry 3 --max-time 120 --max-filesize 2097152 \\
+            "https://github.com/ninja-build/ninja/releases/download/v1.12.1/${NINJA_ARCHIVE}" \\
+            -o "${NINJA_DIR}/ninja.zip"
+          printf '%s  %s\\n' "$NINJA_SHA256" "${NINJA_DIR}/ninja.zip" | sha256sum --check --strict
+          unzip -q "${NINJA_DIR}/ninja.zip" ninja -d "$NINJA_DIR"
+          rm "${NINJA_DIR}/ninja.zip"
+          chmod +x "${NINJA_DIR}/ninja"
+          test "$("${NINJA_DIR}/ninja" --version)" = 1.12.1
+          printf '%s\\n' "$NINJA_DIR" >> "$GITHUB_PATH"
 """
 
 MAC_STEPS = """      - name: Select compatible Xcode
@@ -276,6 +300,7 @@ FINAL_UPLOADS = """      - name: Upload final bundle
             ${{ runner.temp }}/chromix-build/src/.chromix-restored-patches.json
             ${{ runner.temp }}/chromix-build/upstream-cache-restore.json
             ${{ runner.temp }}/chromix-build/upstream-cache-preparation.json
+            ${{ runner.temp }}/chromix-build/upstream-cache-ninja.json
             ${{ runner.temp }}/chromix-build/upstream-cache-import.json
             ${{ runner.temp }}/chromix-build/upstream-cache-plan.log
             ${{ runner.temp }}/chromix-build/upstream-object-cache.json

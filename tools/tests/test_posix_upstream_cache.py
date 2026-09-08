@@ -68,6 +68,15 @@ class PosixUpstreamCacheTest(unittest.TestCase):
                 target = repo / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(REPO / relative, target)
+            # Selection is explicit here; these shell fixtures do not contain native binaries or real logs.
+            (repo / "tools/restore_ninja.py").write_text(f'''import os, sys
+from pathlib import Path
+assert sys.argv[1:] == ['--workdir', {str(work)!r}, '--platform', {platform!r}, '--arch', {arch!r}]
+assert (Path({str(src)!r}) / '.chromix-upstream-restored.json').is_file()
+with open(os.environ['CALL_LOG'], 'a') as output:
+    output.write('ninja-guard\\n')
+print(os.environ['SELECTED_NINJA'])
+''')
             script(repo / "build/prepare-ungoogled.sh", 'printf "prepare\\n" >> "$CALL_LOG"\n')
             script(repo / "build/posix/prepare-restored-tools.sh",
                    'printf "tools\\n" >> "$CALL_LOG"\n' +
@@ -89,13 +98,17 @@ class PosixUpstreamCacheTest(unittest.TestCase):
             script(out / "chrome", 'printf "Chromium fixture\\n"\n')
             for name in ("node", "go", "gperf", "clang-format"):
                 script(binaries / name, "exit 0\n")
-            script(binaries / "ninja", 'printf "ninja\\n" >> "$CALL_LOG"\n')
+            selected_ninja = root / "selected tools/ninja"
+            script(binaries / "ninja", 'printf "unselected-ninja\\n" >> "$CALL_LOG"\nexit 97\n')
+            script(selected_ninja, 'test "$NINJA" = "$0" || exit 98\n'
+                   'printf "ninja\\n" >> "$CALL_LOG"\n')
             machine = "x86_64" if arch == "x64" else ("aarch64" if platform == "linux" else "arm64")
             system = "Linux" if platform == "linux" else "Darwin"
             script(binaries / "uname", f'case "$1" in -m) printf "{machine}\\n";; -s) printf "{system}\\n";; esac\n')
             script(binaries / "sysctl", 'printf "2\\n"\n')
             env = {**os.environ, "PATH": str(binaries) + os.pathsep + os.environ["PATH"],
-                   "CHROMIX_SKIP_DEPS": "1", "CHROMIX_JOBS": "2", "CALL_LOG": str(log)}
+                   "CHROMIX_SKIP_DEPS": "1", "CHROMIX_JOBS": "2", "CALL_LOG": str(log),
+                   "SELECTED_NINJA": str(selected_ninja)}
             env.pop("CHROMIX_UPSTREAM_CACHE_DIR", None)
             for _ in range(1 if fail_tools else 2):
                 result = subprocess.run([str(BASH32 if BASH32.exists() else shutil.which("bash")),
@@ -103,9 +116,10 @@ class PosixUpstreamCacheTest(unittest.TestCase):
                                         env=env, capture_output=True, text=True, timeout=15)
                 self.assertEqual(result.returncode, 19 if fail_tools else 0, result.stdout + result.stderr)
             if fail_tools:
-                self.assertEqual(log.read_text().splitlines(), ["prepare", "tools"])
+                self.assertEqual(log.read_text().splitlines(), ["prepare", "ninja-guard", "tools"])
             else:
-                self.assertEqual(log.read_text().splitlines(), ["prepare", "tools", "gn", "ninja", "ninja"] * 2)
+                self.assertEqual(log.read_text().splitlines(),
+                                 ["prepare", "ninja-guard", "tools", "gn", "ninja", "ninja"] * 2)
                 args = (out / "args.gn").read_text()
                 self.assertIn("upstream_extra = true", args)
                 self.assertIn("symbol_level = 0", args)

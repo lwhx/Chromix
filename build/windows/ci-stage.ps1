@@ -447,6 +447,12 @@ python @mergeArgs
 if ($LASTEXITCODE -ne 0) { throw "GN argument merge failed" }
 
 $env:PATH = "$(Join-Path $Src 'third_party\ninja');$(Join-Path $Src 'third_party\node\win');$env:PATH"
+$Ninja = Join-Path $Src "third_party\ninja\ninja.exe"
+if ($RestoredUpstream) {
+  $Ninja = & python (Join-Path $Repo "tools\restore_ninja.py") --workdir $WorkDir --platform windows --arch x64
+  if ($LASTEXITCODE -ne 0 -or -not $Ninja) { throw "restored Ninja compatibility check failed" }
+  $env:NINJA = $Ninja
+}
 Push-Location $Src
 try {
   if (-not (Test-Path "third_party\rust-toolchain\bin\bindgen.exe")) {
@@ -517,7 +523,7 @@ for relative, keys in RESTORED.items():
   if ($LASTEXITCODE -ne 0) { throw "gn gen failed" }
   if ($RestoredUpstream) {
     Write-Host "==> recording incremental Ninja plan for restored upstream source/out/Default"
-    & (Join-Path $Src "third_party\ninja\ninja.exe") -C $OutDir -n chrome `
+    & $Ninja -C $OutDir -n chrome `
       *> (Join-Path $WorkDir "upstream-cache-plan.log")
     if ($LASTEXITCODE -ne 0) { throw "restored upstream build-plan check failed" }
   }
@@ -529,7 +535,7 @@ if ($ValidateOnly) {
   Write-Host "==> validate-only: building V8 Torque generation target"
   $validationBudget = (Get-RemainingMin) - $PackReserveMin
   if ($validationBudget -lt 1) { throw "validate-only: insufficient V8 Torque budget" }
-  $validationRc = Invoke-Tracked -File (Join-Path $Src "third_party\ninja\ninja.exe") `
+  $validationRc = Invoke-Tracked -File $Ninja `
     -ArgList "-C `"$OutDir`" -j 1 -v gen/v8/torque-generated/bit-field-asserts.cc" `
     -Cwd $Src -TimeoutSec ($validationBudget * 60) -FullFailureOutput
   if ($validationRc -ne 0) { throw "V8 Torque validation failed (exit $validationRc)" }
@@ -543,7 +549,7 @@ if ($ninjaBudget -lt 20) {
   Save-Handoff -Mode Synced
   return
 }
-$rc = Invoke-Tracked -File (Join-Path $Src "third_party\ninja\ninja.exe") `
+$rc = Invoke-Tracked -File $Ninja `
   -ArgList "-C `"$OutDir`" -j 4 chrome" -Cwd $Src -TimeoutSec ($ninjaBudget * 60)
 
 if ($rc -eq 0) {

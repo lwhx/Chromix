@@ -37,7 +37,8 @@ if [ "${CHROMIX_SKIP_DEPS:-0}" != 1 ]; then
   "$SRC/build/install-build-deps.sh" --no-prompt
 fi
 cd "$SRC"
-for tool in node go gperf clang-format ninja; do
+chromix_select_restored_ninja linux
+for tool in node go gperf clang-format "$CHROMIX_NINJA"; do
   command -v "$tool" >/dev/null || { echo "required build tool is missing: $tool" >&2; exit 1; }
 done
 if ! node --input-type=module -e 'process.exit(typeof import.meta.main === "boolean" ? 0 : 1)'; then
@@ -116,5 +117,5 @@ if [ ! -x "$OUT/gn" ]; then
 fi
 "$OUT/gn" gen "$OUT" --fail-on-unused-args
 chromix_report_upstream_plan chrome chrome_crashpad_handler chrome_sandbox
-ninja -C "$OUT" -j "${CHROMIX_JOBS:-$(getconf _NPROCESSORS_ONLN)}" chrome chrome_crashpad_handler chrome_sandbox
+"$CHROMIX_NINJA" -C "$OUT" -j "${CHROMIX_JOBS:-$(getconf _NPROCESSORS_ONLN)}" chrome chrome_crashpad_handler chrome_sandbox
 "$OUT/chrome" --version

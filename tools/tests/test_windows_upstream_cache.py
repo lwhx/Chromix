@@ -124,10 +124,18 @@ class WindowsUpstreamCacheRegressionTest(unittest.TestCase):
         self.assertEqual(offsets, sorted(offsets))
         self.assertIn('$gn = Join-Path $OutDir "gn.exe"', self.stage)
         self.assertIn('if (-not (Test-Path $gn)) {', self.stage)
+        selected = self.stage.index('$Ninja = & python (Join-Path $Repo "tools\\restore_ninja.py")')
+        self.assertIn('--workdir $WorkDir --platform windows --arch x64', self.stage[selected:])
+        self.assertIn('if ($LASTEXITCODE -ne 0 -or -not $Ninja) { throw "restored Ninja compatibility check failed" }',
+                      self.stage)
+        self.assertIn('$env:NINJA = $Ninja', self.stage)
         generated = self.stage.index('& $gn gen $OutDir --fail-on-unused-args')
-        planned = self.stage.index('-C $OutDir -n chrome')
-        built = self.stage.index('$rc = Invoke-Tracked -File (Join-Path $Src "third_party\\ninja\\ninja.exe")')
+        planned = self.stage.index('& $Ninja -C $OutDir -n chrome')
+        built = self.stage.index('$rc = Invoke-Tracked -File $Ninja')
         packaged = self.stage.index('& "$PSScriptRoot\\package-win.ps1" -Out $OutDir')
+        self.assertLess(selected, self.stage.index('python tools\\rust\\build_bindgen.py'))
+        self.assertLess(selected, generated)
+        self.assertIn('$validationRc = Invoke-Tracked -File $Ninja', self.stage)
         self.assertLess(generated, planned)
         self.assertLess(planned, built)
         self.assertLess(built, packaged)
@@ -299,9 +307,11 @@ ConvertTo-Json -Compress -InputObject @($rows)
 $ValidateOnly = $true
 $Src = "/fixture/src"
 $OutDir = "/fixture/src/out/Default"
+$Ninja = "/fixture/selected tools/ninja.exe"
 function Get-RemainingMin { return $left }
 function Invoke-Tracked {
   param($File, $ArgList, $Cwd, $TimeoutSec, [switch]$FullFailureOutput)
+  if ($File -ne $Ninja) { throw "validation did not use selected Ninja" }
   Write-Host "timeout:$TimeoutSec"
   return $rc
 }
@@ -672,6 +682,28 @@ class WindowsRestoredBuildStageTest(WindowsRestoredPreparationFixture, unittest.
         super().setUp()
         self.put(self.repo / "tools/merge_gn_args.py", (REPO / "tools/merge_gn_args.py").read_text())
         self.put(self.repo / "tools/upstream_script_identity.py", (REPO / "tools/upstream_script_identity.py").read_text())
+        self.ninja = self.src / "third_party/ninja/ninja.exe"
+        self.ninja.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(self.src / "third_party/rust-toolchain/bin/cargo.exe", self.ninja)
+        # Native host identity and PE execution are mocked; selection and log/header checks are real.
+        self.put(self.repo / "tools/restore_ninja.py", f'''import os, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, {str(REPO)!r})
+from tools import restore_ninja as helper
+work = Path(os.environ['MOCK_WORK'])
+ninja = work / 'src/third_party/ninja/ninja.exe'
+assert sys.argv[1:] == ['--workdir', str(work), '--platform', 'windows', '--arch', 'x64']
+run = subprocess.run
+def probe(command, **kwargs):
+    assert command == [str(ninja), '--version'], command
+    assert kwargs['cwd'] == work, kwargs
+    return run([sys.executable, '-c', 'print("1.11.1")'], **kwargs)
+helper.host_identity = lambda: ('windows', 'x64')
+helper.subprocess.run = probe
+with open(os.environ['MOCK_CALLS'], 'a') as output:
+    output.write('ninja-guard\\n')
+raise SystemExit(helper.main())
+''')
         self.put(self.work / "tooling/ungoogled-chromium/flags.gn",
                  'common_override = "core"\nwindows_override = "core"\nis_debug = true\n')
         self.put(self.work / "tooling/ungoogled-chromium-windows/flags.windows.gn",
@@ -717,8 +749,9 @@ gn.write_bytes(header)
         # PE execution is stubbed on Linux; PowerShell control flow and Python helpers are real.
         body = body.replace('& $gn gen $OutDir --fail-on-unused-args',
                             'Invoke-FixtureGn gen $OutDir --fail-on-unused-args')
-        body = body.replace('& (Join-Path $Src "third_party\\ninja\\ninja.exe") -C $OutDir -n chrome',
-                            'Invoke-FixtureNinja -C $OutDir -n chrome')
+        plan = '& $Ninja -C $OutDir -n chrome'
+        self.assertEqual(body.count(plan), 1)
+        body = body.replace(plan, 'Invoke-FixtureNinja $Ninja -C $OutDir -n chrome')
         self.put(self.wrapper, self.wrapper.read_text().split('& $env:MOCK_SCRIPT', 1)[0] + r'''
 $Repo = $env:MOCK_REPO
 $WorkDir = $env:MOCK_WORK
@@ -742,6 +775,7 @@ function python {
   $arguments = @($args)
   $arguments[0] = $arguments[0].Replace('\', '/')
   & $env:MOCK_PYTHON @arguments
+  $global:LASTEXITCODE = $LASTEXITCODE
 }
 function Invoke-FixtureGn {
   if (-not (Test-Path $gn)) { throw "GN is missing" }
@@ -751,6 +785,11 @@ function Invoke-FixtureGn {
   $global:LASTEXITCODE = 0
 }
 function Invoke-FixtureNinja {
+  $selection = Get-Content (Join-Path $WorkDir "upstream-cache-ninja.json") -Raw | ConvertFrom-Json
+  if ($selection.status -ne "selected" -or $args[0] -cne $selection.selected.path -or
+      $env:NINJA -cne $selection.selected.path) { throw "plan did not use selected Ninja" }
+  if ($args.Count -ne 5 -or $args[1] -ne "-C" -or $args[2] -ne $OutDir -or
+      $args[3] -ne "-n" -or $args[4] -ne "chrome") { throw "unexpected Ninja plan arguments" }
   Add-Content -LiteralPath $env:MOCK_CALLS -Value "ninja-plan"
   $global:LASTEXITCODE = 0
 }
@@ -766,7 +805,7 @@ function Invoke-FixtureNinja {
     def test_missing_bindgen_then_finish_invalidates_before_gn_and_resume_reinspects(self):
         first = self.run_prep()
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        self.assertEqual(self.phases(), ["verify", "verify", "inspect", "normalize", "bindgen", "finish",
+        self.assertEqual(self.phases(), ["verify", "verify", "inspect", "ninja-guard", "normalize", "bindgen", "finish",
                                          "gn-bootstrap", "gn-gen", "ninja-plan"])
         report = self.report()
         self.assertEqual((report["platform"], report["arch"], report["phase"]), ("windows", "x64", "finish"))
@@ -793,7 +832,7 @@ function Invoke-FixtureNinja {
         self.env["MOCK_STAGE"] = "2"
         resumed = self.run_prep()
         self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
-        self.assertEqual(self.phases(), ["verify", "verify", "inspect", "finish", "gn-gen", "ninja-plan"])
+        self.assertEqual(self.phases(), ["verify", "verify", "inspect", "ninja-guard", "finish", "gn-gen", "ninja-plan"])
         self.assertEqual(self.report()["counters"]["toolchain_invalidated_outputs"], 0)
         self.assertEqual(times, {name: (self.out / name).stat().st_mtime_ns for name in times})
         self.assertEqual((self.out / "args.gn").read_text(), args)
@@ -806,7 +845,7 @@ function Invoke-FixtureNinja {
         before = (self.out / "obj/retained.obj").stat().st_mtime_ns
         first = self.run_prep()
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        self.assertEqual(self.phases(), ["verify", "verify", "inspect", "finish", "gn-gen", "ninja-plan"])
+        self.assertEqual(self.phases(), ["verify", "verify", "inspect", "ninja-guard", "finish", "gn-gen", "ninja-plan"])
         self.assertEqual((self.out / "obj/retained.obj").stat().st_mtime_ns, before)
         self.assertFalse((self.out / "obj/sdk.obj").exists())
         self.assertEqual(self.report()["dependencies"]["external_dependency_outputs"], 1)
@@ -830,8 +869,10 @@ function Invoke-FixtureNinja {
                 self.calls.unlink(missing_ok=True)
                 result = self.run_prep()
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("inspect", self.phases())
-                self.assertIn("bindgen", self.phases())
+                expected = ["verify", "verify", "inspect", "ninja-guard", "normalize", "bindgen"]
+                if failed_tool != "builder":
+                    expected.append("finish")
+                self.assertEqual(self.phases(), expected)
                 self.assertNotIn("gn-bootstrap", self.phases())
                 self.assertNotIn("gn-gen", self.phases())
                 self.assertNotIn("ninja-plan", self.phases())

@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from tools import restore_upstream_cache as restore
 from tools import upstream_object_cache as cache
 
 
@@ -30,6 +31,89 @@ class NinjaMetadataTest(unittest.TestCase):
             path.write_text("# ninja log v5\n0\t2\t10\tgen/generated.h\t7fbda484803aeec8\n")
             self.assertEqual(cache.ninja_log(path)["gen/generated.h"],
                              (10, 0x7FBDA484803AEEC8, 5))
+
+    def test_supported_log_formats_preserve_nanoseconds_and_opaque_hashes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / ".ninja_log"
+            for version in (5, 6, 7):
+                for newline in ("\n", "\r\n"):
+                    with self.subTest(version=version, newline=newline):
+                        path.write_bytes(f"# ninja log v{version}{newline}".encode())
+                        self.assertEqual(cache.ninja_log(path), {})
+                        lines = [f"# ninja log v{version}",
+                                 "0\t2\t1788888888123456789\tobj/with space.o\t0123456789abcdef",
+                                 "2\t2\t1788888888987654321\tobj/b.o\tffffffffffffffff",
+                                 "0\t0\t1\tgen/zero\t0"]
+                        content = (newline.join(lines) + newline).encode()
+                        path.write_bytes(content)
+                        before = cache.stamp(path)
+                        self.assertEqual(cache.ninja_log(path), {
+                            "obj/with space.o": (1788888888123456789, 0x0123456789ABCDEF, version),
+                            "obj/b.o": (1788888888987654321, 0xFFFFFFFFFFFFFFFF, version),
+                            "gen/zero": (1, 0, version),
+                        })
+                        self.assertEqual(path.read_bytes(), content)
+                        self.assertEqual(cache.stamp(path), before)
+
+    def test_duplicate_log_outputs_use_last_record_not_largest_timestamp(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / ".ninja_log"
+            for version in (5, 6, 7):
+                with self.subTest(version=version):
+                    path.write_text(f"# ninja log v{version}\n"
+                                    "10\t20\t200\tobj/a.o\t1111\n"
+                                    "20\t30\t300\tobj/b.o\t2222\n"
+                                    "0\t1\t100\tobj/a.o\t3333\n")
+                    self.assertEqual(cache.ninja_log(path), {
+                        "obj/a.o": (100, 0x3333, version),
+                        "obj/b.o": (300, 0x2222, version),
+                    })
+
+    def test_unknown_or_malformed_log_headers_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / ".ninja_log"
+            for header in ("", "junk\n", "# ninja log v4\n", "# ninja log v8\n",
+                           "# ninja log v99\n", "# ninja log v7", "# ninja log v07\n",
+                           "# ninja log v7 extra\n", " # ninja log v7\n"):
+                with self.subTest(header=header):
+                    path.write_text(header)
+                    with self.assertRaisesRegex(cache.Miss, "unsupported Ninja log") as error:
+                        cache.ninja_log(path)
+                    self.assertIn(repr(header.rstrip()), str(error.exception))
+
+    def test_unsupported_header_error_is_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / ".ninja_log"
+            path.write_text("x" * 4096 + "\n")
+            with self.assertRaises(cache.Miss) as error:
+                cache.ninja_log(path)
+            self.assertIn("[truncated]", str(error.exception))
+            self.assertLess(len(str(error.exception)), 256)
+
+    def test_malformed_log_records_are_rejected(self):
+        records = ["\n", "0\t1\t10\tobj/a.o\n", "0\t1\t10\tobj/a.o\t123\textra\n",
+                   "0\t1\t10\tobj/a.o\t123", "# ninja log v7\n"]
+        for index, values in (
+            (0, ("-1", "start", "1_0", " 0", "+0")),
+            (1, ("-1", "end", "", "1.5")),
+            (2, ("-1", "0", "mtime", "1_000", str(1 << 63))),
+            (3, ("", "obj/a\x00.o")),
+            (4, ("", "xyz", "-1", "+1", "0x123", "1_2", " 123", "1" * 17)),
+        ):
+            for value in values:
+                fields = ["0", "1", "10", "obj/a.o", "123"]
+                fields[index] = value
+                records.append("\t".join(fields) + "\n")
+        records.append("2\t1\t10\tobj/a.o\t123\n")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / ".ninja_log"
+            for version in (5, 6, 7):
+                for record in records:
+                    with self.subTest(version=version, record=record):
+                        path.write_text(f"# ninja log v{version}\n"
+                                        "0\t1\t10\tobj/a.o\t123\n" + record)
+                        with self.assertRaisesRegex(cache.Miss, "Ninja log"):
+                            cache.ninja_log(path)
 
     def test_internal_directory_aliases_inventory_and_verification(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -65,25 +149,82 @@ class NinjaMetadataTest(unittest.TestCase):
     def test_object_time_floor_is_opt_in_and_metadata_is_exact(self):
         second = cache.NANOSECOND
         logged, dependency = 10 * second + 123, 11 * second + 456
-        with self.assertRaises(cache.Miss):
-            cache.object_times(11 * second, dependency, logged, 6, False)
-        record = cache.object_times(11 * second, dependency, logged, 6, True)
-        self.assertEqual(record["object_mtime"], 11 * second)
-        self.assertEqual(record["dependency_mtime"], dependency)
-        self.assertEqual(record["freshness_cutoff"], 10 * second)
-        self.assertTrue(cache.input_is_fresh(10 * second - 1, record))
-        self.assertFalse(cache.input_is_fresh(10 * second, record))
-        for actual in (10 * second, 11 * second + 1, dependency + 1):
-            with self.subTest(actual=actual), self.assertRaises(cache.Miss):
-                cache.object_times(actual, dependency, logged, 6, True)
+        for version in (6, 7):
+            with self.subTest(version=version):
+                with self.assertRaises(cache.Miss):
+                    cache.object_times(11 * second, dependency, logged, version, False)
+                record = cache.object_times(11 * second, dependency, logged, version, True)
+                self.assertEqual(record["object_mtime"], 11 * second)
+                self.assertEqual(record["dependency_mtime"], dependency)
+                self.assertEqual(record["log_mtime"], logged)
+                self.assertEqual(record["freshness_cutoff"], 10 * second)
+                self.assertTrue(cache.input_is_fresh(10 * second - 1, record))
+                self.assertFalse(cache.input_is_fresh(10 * second, record))
+                exact = cache.object_times(dependency, dependency, logged, version, False)
+                self.assertEqual(exact["freshness_cutoff"], logged)
+                self.assertTrue(cache.input_is_fresh(logged, exact))
+                self.assertFalse(cache.input_is_fresh(logged + 1, exact))
+                for actual in (10 * second, 11 * second + 1, dependency + 1):
+                    with self.subTest(actual=actual), self.assertRaises(cache.Miss):
+                        cache.object_times(actual, dependency, logged, version, True)
+                with self.assertRaises(cache.Miss):
+                    cache.object_times(11 * second, dependency, dependency + 1, version, True)
         with self.assertRaises(cache.Miss):
             cache.object_times(11 * second, dependency, dependency - 1, 5, True)
-        with self.assertRaises(cache.Miss):
-            cache.object_times(11 * second, dependency, dependency + 1, 6, True)
         v5 = cache.object_times(11 * second, dependency, dependency, 5, True)
         self.assertEqual(v5["freshness_cutoff"], 11 * second)
         exact = cache.object_times(dependency, dependency, dependency, 5, False)
         self.assertTrue(cache.input_is_fresh(dependency, exact))
+        for version in (4, 8):
+            with self.subTest(version=version), self.assertRaises(cache.Miss):
+                cache.object_times(dependency, dependency, dependency, version, False)
+
+    def test_v7_restore_repairs_only_output_mtime_and_preserves_ninja_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            src = Path(temporary) / "src"
+            out = src / "out/Default"
+            (out / "obj").mkdir(parents=True)
+            source, obj = src / "a.c", out / "obj/a.o"
+            source.write_text("int a;\n")
+            obj.write_bytes(b"object")
+            (out / "build.ninja").write_text("# preserved graph\n")
+            (out / "args.gn").write_text('target_cpu = "arm64"\n')
+            logged = 1788888888123456789
+            recorded = logged + cache.NANOSECOND
+            cutoff = logged // cache.NANOSECOND * cache.NANOSECOND
+            floor = recorded // cache.NANOSECOND * cache.NANOSECOND
+            os.utime(source, ns=(cutoff - cache.NANOSECOND, cutoff - cache.NANOSECOND))
+            os.utime(obj, ns=(floor, floor))
+            deps = bytearray(b"# ninjadeps\n\x04\x00\x00\x00")
+            for index, name in enumerate((b"obj/a.o", b"../../a.c")):
+                payload = name + b"\0" * (-len(name) % 4) + struct.pack("<I", ~index & 0xffffffff)
+                deps += struct.pack("<I", len(payload)) + payload
+            payload = struct.pack("<IQI", 0, recorded, 1)
+            deps += struct.pack("<I", 0x80000000 | len(payload)) + payload
+            (out / ".ninja_deps").write_bytes(deps)
+            (out / ".ninja_log").write_text(
+                f"# ninja log v7\n0\t2\t{logged}\tobj/a.o\t0123456789abcdef\n")
+            before = {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                      for path in (source, out / ".ninja_log", out / ".ninja_deps",
+                                   out / "build.ninja", out / "args.gn")}
+            with mock.patch.object(cache, "murmur_hash64a", side_effect=AssertionError("opaque hash")), \
+                    mock.patch.object(cache.subprocess, "run", side_effect=AssertionError("no commands")):
+                plan = restore.restore_ninja_output_mtimes(src)
+            self.assertEqual(plan["repairs"], [{"output": "obj/a.o", "from_ns": floor, "to_ns": recorded}])
+            self.assertEqual(obj.stat().st_mtime_ns, recorded)
+            self.assertEqual(obj.read_bytes(), b"object")
+            for path, expected in before.items():
+                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), expected)
+            self.assertEqual(restore.restore_ninja_output_mtimes(src)["outputs_restored"], 0)
+            for mtime in (cutoff, cutoff + cache.NANOSECOND):
+                with self.subTest(input_mtime=mtime):
+                    os.utime(obj, ns=(floor, floor))
+                    os.utime(source, ns=(mtime, mtime))
+                    plan = restore.restore_ninja_output_mtimes(src)
+                    self.assertEqual(plan["outputs_restored"], 0)
+                    self.assertIn("recorded input is newer or same-second ambiguous", plan["skipped"])
+                    self.assertEqual(obj.stat().st_mtime_ns, floor)
+                    self.assertEqual(source.stat().st_mtime_ns, mtime)
 
     def test_only_known_wrapper_is_stripped(self):
         argv = ["../../third_party/llvm-build/Release+Asserts/bin/clang", "-c", "../../a.c"]
@@ -268,6 +409,24 @@ class UpstreamObjectCacheTest(unittest.TestCase):
         record[-1] = "0"
         path.write_text(original + "\t".join(record) + "\n")
         self.assert_miss(self.prepare(), "stale Ninja command hash")
+        self.generate()
+        self.assertEqual(self.direct_compile(), 0)
+        self.assertEqual(self.receipt()["status"], "miss")
+
+    def test_v7_object_reuse_misses_without_murmur_validation(self):
+        path = self.old / ".ninja_log"
+        command = cache.compdb(self.old)[0]["command"]
+        mtime = cache.ninja_deps(self.old / ".ninja_deps")["obj/a.o"][0]
+        path.write_text(f"# ninja log v5\n0\t1\t{mtime}\tobj/a.o\t"
+                        f"{cache.murmur_hash64a(command.encode()):x}\n")
+        self.ready()
+        path.write_text("# ninja log v7\n" + path.read_text().split("\n", 1)[1])
+        content = path.read_bytes()
+        with mock.patch.object(cache, "murmur_hash64a", side_effect=AssertionError("v7 is not Murmur")):
+            self.assert_miss(self.prepare(), "unsupported Ninja command hash for object reuse: v7")
+        self.assertEqual(path.read_bytes(), content)
+        manifest = json.loads((self.work / cache.CACHE / "manifest.json").read_text())
+        self.assertEqual(manifest["status"], "miss")
         self.generate()
         self.assertEqual(self.direct_compile(), 0)
         self.assertEqual(self.receipt()["status"], "miss")

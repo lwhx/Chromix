@@ -232,7 +232,24 @@ links are omitted and recorded for recreation on the current runner. Source
 version, architecture, manifest identity, and required Ninja state are verified
 before an atomic installation; an existing source tree is never overwritten.
 Exact whole-second output timestamps are repaired from trusted Ninja records
-only when the recorded inputs prove they are unambiguous.
+only when the recorded inputs prove they are unambiguous. Restoration accepts
+Ninja log v5, v6, and v7 and leaves the original log bytes and command hashes
+unchanged. v6/v7 use command-start timestamps (or restat timestamps), rather
+than v5's output timestamp. v7 uses rapidhash; the optional legacy single-object
+importer still rejects v7 instead of checking it with the v5/v6 hash algorithm.
+Restore diagnostics retain available bounded log/dependency headers and file
+sizes before source validation; missing or unsafe metadata is recorded without
+following links, even when a rejected owned cache is removed. Unknown formats
+still stop restoration.
+
+Before any restored-output Ninja invocation, the build selects one native
+executable matching the log generation: Ninja 1.10/1.11 for v5, 1.12 for v6,
+and 1.13 for v7. Its path, version, architecture, and rejected candidates are
+recorded in `upstream-cache-ninja.json`. The same executable runs the plan and
+compile; an incompatible reader is never allowed to discard the old log.
+Linux Actions also install checksum-pinned Ninja 1.12.1 for x64/arm64 alongside
+the distro tool, since the upstream Debian tool can differ from Ubuntu's.
+Selection still follows the actual restored header, not the target platform.
 
 The restored source already contains the pinned ungoogled core patches,
 platform overlay, pruning, and domain substitution. Preparation verifies those

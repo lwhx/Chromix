@@ -49,9 +49,18 @@ PY
   fi
 }
 
+chromix_select_restored_ninja() {
+  CHROMIX_NINJA=ninja
+  if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
+    CHROMIX_NINJA="$(python3 "$REPO/tools/restore_ninja.py" \
+      --workdir "$WORK" --platform "$1" --arch "$ARCH")" || return 1
+    export NINJA="$CHROMIX_NINJA"
+  fi
+}
+
 chromix_report_upstream_plan() {
   if [ -n "${CHROMIX_UPSTREAM_CACHE_DIR:-}" ] || [ -f "$WORK/src/.chromix-upstream-restored.json" ]; then
     # A dry run records planned work; it cannot establish elapsed-time savings.
-    ninja -C "$OUT" -n "$@" > "$WORK/upstream-cache-plan.log" 2>&1
+    "${CHROMIX_NINJA:-ninja}" -C "$OUT" -n "$@" > "$WORK/upstream-cache-plan.log" 2>&1
   fi
 }

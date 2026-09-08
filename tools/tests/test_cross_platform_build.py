@@ -68,6 +68,29 @@ class CrossPlatformBuildRegressionTest(unittest.TestCase):
         self.assertIn("8-stage snapshot/resume", source)
         self.assertIn(".github/workflows/build-posix-github.yml", source)
 
+    def test_linux_restore_ninja_is_pinned_for_both_native_architectures(self):
+        import ast
+
+        module = ast.parse((REPO / "tools/gen_posix_workflow.py").read_text())
+        assignment = next(node for node in module.body if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name) and target.id == "LINUX_CLEAN"
+                                  for target in node.targets))
+        source = ast.literal_eval(assignment.value)
+        step = source.split("- name: Install restored-build Ninja v6", 1)[1]
+        self.assertIn("runner.os == 'Linux' && inputs.use_upstream_cache", step)
+        self.assertIn("releases/download/v1.12.1/", step)
+        self.assertIn("ninja-linux.zip", step)
+        self.assertIn("ninja-linux-aarch64.zip", step)
+        self.assertIn("6f98805688d19672bd699fbbfa2c2cf0fc054ac3df1f0e6a47664d963d530255", step)
+        self.assertIn("5c25c6570b0155e95fce5918cb95f1ad9870df5768653afe128db822301a05a1", step)
+        self.assertIn("--max-filesize 2097152", step)
+        self.assertIn('"${NINJA_DIR}/ninja" --version', step)
+        self.assertLess(step.index("sha256sum --check --strict"), step.index("unzip -q"))
+        self.assertLess(step.index("unzip -q"), step.index("--version"))
+        workflow = (REPO / ".github/workflows/build-posix-github.yml").read_text()
+        self.assertEqual(workflow.count("- name: Install restored-build Ninja v6"), 8)
+        self.assertEqual(workflow.count("chromix-build/upstream-cache-ninja.json"), 8)
+
     def test_build_arguments_cover_host_toolchain_compatibility(self):
         linux = (REPO / "build" / "build.sh").read_text(encoding="utf-8")
         macos = (REPO / "build" / "args.macos.gn").read_text(encoding="utf-8")

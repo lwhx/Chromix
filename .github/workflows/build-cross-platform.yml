@@ -18,6 +18,7 @@ on:
       - 'tools/upstream_script_identity.py'
       - 'tools/apply_restored_patches.py'
       - 'tools/prepare_restored_build.py'
+      - 'tools/restore_ninja.py'
       - 'tools/gen_posix_workflow.py'
       - 'tools/merge_gn_args.py'
       - '.github/workflows/build-cross-platform.yml'

@@ -20,7 +20,9 @@ Full LLVM/sysroot verification still runs per candidate at compile time. This
 conservative scan cost is accepted for the initial eligible C subset.
 Only the canonical compiler is executed, including for donor preprocessing.
 Ninja v5/v6 logs use the 64-bit 0xDECAFBADDECAFBAD command-hash seed;
-0xDECAFBAD is Ninja's unrelated 32-bit path-hash seed. Dependency logs require v4.
+0xDECAFBAD is Ninja's unrelated 32-bit path-hash seed. Ninja 1.13's v7 logs
+use rapidhash: metadata restoration supports v7, but optional object reuse still
+requires v5/v6 command hashes. Dependency logs require v4.
 Modules, PCH, profiles, response files, external inputs and unknown flags miss;
 canonical flags are never rewritten to increase eligibility.
 """
@@ -278,19 +280,26 @@ def murmur_hash64a(command: bytes, seed: int = 0xDECAFBADDECAFBAD) -> int:
 
 
 def ninja_log(path: Path) -> dict:
+    """Read v5/v6/v7 metadata, retaining opaque hashes and the last output record."""
     result = {}
     with path.open(encoding="utf-8") as stream:
-        header = stream.readline()
-        versions = {"# ninja log v5\n": 5, "# ninja log v6\n": 6}
+        header = stream.readline(129)
+        versions = {"# ninja log v5\n": 5, "# ninja log v6\n": 6, "# ninja log v7\n": 7}
         if header not in versions:
-            raise Miss("unsupported Ninja log (requires v5 or v6)")
+            suffix = " [truncated]" if len(header) > 128 else ""
+            raise Miss(f"unsupported Ninja log (requires v5, v6 or v7): {header[:128].rstrip()!r}{suffix}")
         for line in stream:
             fields = line.rstrip("\n").split("\t")
-            if len(fields) != 5:
+            if not line.endswith("\n") or len(fields) != 5:
                 raise Miss("malformed Ninja log")
             start, end, mtime, output, command_hash = fields
-            if int(start) < 0 or int(end) < int(start) or int(mtime) <= 0:
+            if (not all(re.fullmatch(r"[0-9]+", value) for value in (start, end, mtime))
+                    or int(end) < int(start) or not 0 < int(mtime) < 1 << 63):
                 raise Miss("invalid Ninja log timestamp")
+            if not output or "\x00" in output:
+                raise Miss("invalid Ninja log output")
+            if not re.fullmatch(r"[0-9a-fA-F]{1,16}", command_hash):
+                raise Miss("invalid Ninja log command hash")
             result[output] = (int(mtime), int(command_hash, 16), versions[header])
     return result
 
@@ -456,6 +465,9 @@ def dependency_name(value: str, cwd: Path, root: Path) -> str:
 
 def object_times(actual: int, dependency: int, logged: int, version: int,
                  allow_truncated_mtimes: bool) -> dict:
+    if version not in (5, 6, 7):
+        raise Miss("unsupported Ninja log timestamp version")
+    # v6/v7 use command-start time (or restat mtime); v5 uses output mtime.
     # Metadata retains nanoseconds even when a trusted GNU tar archive does not.
     if (actual != dependency and not (
             allow_truncated_mtimes and actual == dependency // NANOSECOND * NANOSECOND)
@@ -525,11 +537,13 @@ def prepare(src: Path, donor: Path, platform: str, arch: str, work: Path, *,
                     if output not in logs or output not in dependencies:
                         raise Miss("missing Ninja object record")
                     mtime, command_hash, log_version = logs[output]
+                    # v7 uses rapidhash, not the v5/v6 MurmurHash64A below.
+                    if log_version not in (5, 6):
+                        raise Miss(f"unsupported Ninja command hash for object reuse: v{log_version}")
                     dep_mtime, names = dependencies[output]
                     obj = relative_path(output, cwd, cwd, output=True)
                     if murmur_hash64a(command.encode()) != command_hash:
                         raise Miss("stale Ninja command hash")
-                    # v6 logs command-start time; v5 logs output mtime.
                     freshness = object_times(obj.stat().st_mtime_ns, dep_mtime, mtime,
                                              log_version, allow_truncated_mtimes)
                     if not names:
