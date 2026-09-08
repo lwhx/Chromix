@@ -18,6 +18,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import time
 from collections import Counter
 from pathlib import Path, PureWindowsPath
 
@@ -242,6 +243,20 @@ def ninja_mtime_plan(src: Path) -> dict:
     logs = objects.ninja_log(safe_path(out, Path(".ninja_log")))
     skipped = Counter()
     repairs = []
+    # Cache applies only to this read-only planning pass; revalidate before use.
+    input_stats = {}
+
+    def checked_input(value):
+        dependency = objects.relative_path(value, out, src)
+        safe_path(src, dependency.relative_to(src))
+        if not dependency.is_file():
+            raise Miss("recorded input is missing")
+        return dependency.stat()
+
+    def input_identity(info):
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
+
     for name, (recorded, inputs) in deps.items():
         try:
             if name in {"args.gn", "build.ninja", ".ninja_log", ".ninja_deps"}:
@@ -264,15 +279,20 @@ def ninja_mtime_plan(src: Path) -> dict:
             if not inputs:
                 raise Miss("output has no recorded inputs")
             for value in inputs:
-                dependency = objects.relative_path(value, out, src)
-                safe_path(src, dependency.relative_to(src))
-                if not dependency.is_file():
-                    raise Miss("recorded input is missing")
-                if not objects.input_is_fresh(dependency.stat().st_mtime_ns, freshness):
+                if value not in input_stats:
+                    input_stats[value] = checked_input(value)
+                if not objects.input_is_fresh(input_stats[value].st_mtime_ns, freshness):
                     raise Miss("recorded input is newer or same-second ambiguous")
             repairs.append({"output": name, "from_ns": info.st_mtime_ns, "to_ns": recorded})
         except (OSError, ValueError, RuntimeError) as error:
             skipped[str(error)] += 1
+    for value, original in input_stats.items():
+        try:
+            current = checked_input(value)
+        except (ValueError, RuntimeError) as error:
+            raise Miss(f"recorded input changed during timestamp planning: {value}: {error}") from error
+        if input_identity(current) != input_identity(original):
+            raise Miss(f"recorded input changed during timestamp planning: {value}")
     return {"outputs_restored": len(repairs), "repairs": repairs, "skipped": dict(skipped)}
 
 
@@ -289,6 +309,22 @@ def apply_mtime_plan(src: Path, plan: dict, journal: list) -> None:
             raise Miss("filesystem cannot preserve Ninja nanosecond timestamps")
 
 
+def raise_rollback_error(error: BaseException, rollback_error: BaseException, source: Path) -> None:
+    message = f"rollback failed; preserved owned source at {source}: {rollback_error}"
+    if not isinstance(error, Exception):
+        failure = error
+    elif not isinstance(rollback_error, Exception):
+        failure = rollback_error
+    else:
+        failure = LocalError(message)
+    failure.preserved_source = str(source)
+    if not isinstance(failure, Exception):
+        failure.add_note(message)
+    if failure is rollback_error:
+        raise failure
+    raise failure from rollback_error
+
+
 def restore_ninja_output_mtimes(src: Path) -> dict:
     """Repair a trusted extracted source tree; callers must validate its provenance."""
     src = Path(src).resolve()
@@ -296,9 +332,12 @@ def restore_ninja_output_mtimes(src: Path) -> dict:
     journal = []
     try:
         apply_mtime_plan(src, plan, journal)
-    except (OSError, ValueError):
-        for path, atime, mtime in reversed(journal):
-            os.utime(path, ns=(atime, mtime), follow_symlinks=False)
+    except BaseException as error:
+        try:
+            for path, atime, mtime in reversed(journal):
+                os.utime(path, ns=(atime, mtime), follow_symlinks=False)
+        except BaseException as rollback_error:
+            raise_rollback_error(error, rollback_error, src)
         raise
     return plan
 
@@ -365,33 +404,56 @@ def install(donor: Path, work: Path, receipt: dict) -> None:
     # Private staging contains any partial shutil.move fallback, never WORK/src.
     transaction = Path(tempfile.mkdtemp(prefix=".chromix-upstream-restore-", dir=work))
     staged = transaction / "src"
+    destination = work / "src"
     original = donor.stat()
-    moved = False
     journal = []
-    keep = False
+    keep = True
+
+    def original_directory(path):
+        if linked(path):
+            return False
+        try:
+            info = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return stat.S_ISDIR(info.st_mode) and (
+            info.st_dev, info.st_ino) == (original.st_dev, original.st_ino)
+
     try:
         shutil.move(str(donor), str(staged), copy_function=no_copy)
-        moved = True
         apply_mtime_plan(staged, receipt["ninja_mtimes"], journal)
         importer.write_json(staged / MARKER, receipt)
         os.utime(staged, ns=(original.st_atime_ns, original.st_mtime_ns))
-        destination = work / "src"
         if destination.exists() or linked(destination):
             raise LocalError("WORK/src appeared during restoration; it was not overwritten")
         os.rename(staged, destination)
-    except (OSError, ValueError, LocalError):
-        if moved:
-            try:
+        keep = False
+    except BaseException as error:
+        location = staged
+        try:
+            donor_retained = original_directory(donor)
+            if not donor_retained:
+                if not staged.exists() and not linked(staged):
+                    if not original_directory(destination):
+                        raise LocalError("moved source could not be located")
+                    location = destination
                 for path, atime, mtime in reversed(journal):
+                    path = location / path.relative_to(staged)
                     os.utime(path, ns=(atime, mtime), follow_symlinks=False)
-                (staged / MARKER).unlink(missing_ok=True)
-                os.utime(staged, ns=(original.st_atime_ns, original.st_mtime_ns))
+                (location / MARKER).unlink(missing_ok=True)
+                os.utime(location, ns=(original.st_atime_ns, original.st_mtime_ns))
                 if donor.exists() or linked(donor):
                     raise LocalError("original donor path is occupied")
-                os.rename(staged, donor)
-            except (OSError, ValueError, LocalError) as error:
-                keep = True
-                raise LocalError(f"rollback failed; preserved owned source at {staged}: {error}") from error
+                os.rename(location, donor)
+            keep = False
+        except BaseException as rollback_error:
+            # A signal may arrive after the rollback rename already succeeded.
+            try:
+                if original_directory(donor):
+                    location = donor
+            except OSError:
+                pass
+            raise_rollback_error(error, rollback_error, location)
         raise
     finally:
         if not keep:
@@ -450,14 +512,33 @@ def restore(workdir: Path, platform: str, arch: str, cache_dir: Path,
     if linked(src) or linked(work / REPORT):
         raise LocalError("source or diagnostic report is symlinked or junctioned")
     work.mkdir(parents=True, exist_ok=True)
+    started = phase_started = time.monotonic()
     entry = {"schema_version": 1, "platform": platform, "arch": arch, "status": "miss",
-             "reasons": [], "counts": {"files_moved": 0, "bytes_moved": 0, "symlinks_moved": 0}}
+             "reasons": [], "counts": {"files_moved": 0, "bytes_moved": 0, "symlinks_moved": 0},
+             "phase_durations_seconds": {},
+             "progress": {"files_counted": 0, "bytes_counted": 0, "symlinks_counted": 0,
+                          "outputs_planned": 0, "outputs_skipped": 0}}
+
+    def report_phase(phase):
+        nonlocal phase_started
+        now = time.monotonic()
+        previous = entry.get("phase")
+        if previous is not None:
+            durations = entry["phase_durations_seconds"]
+            durations[previous] = round(durations.get(previous, 0) + now - phase_started, 3)
+        phase_started = now
+        entry.update(phase=phase, duration_seconds=round(now - started, 3))
+        print(f"upstream cache restore: phase={phase}; duration_seconds={entry['duration_seconds']}; "
+              f"progress={json.dumps(entry['progress'], sort_keys=True)}", file=sys.stderr, flush=True)
+        write_report(work, entry)
+
     lock = cache / ".lock"
     locked = False
     cache_owned = False
     cleanup_reason = None
     validation_complete = False
     try:
+        report_phase("validate_cache")
         if src.exists():
             raise Miss("WORK/src already exists; it was not inspected, overwritten, or removed")
         if importer.resume_marker(work, src):
@@ -483,11 +564,19 @@ def restore(workdir: Path, platform: str, arch: str, cache_dir: Path,
             raise Miss("downloader receipt changed during restoration")
         cache_owned = True
         entry["ninja_state"] = ninja_state_diagnostics(donor)
+        report_phase("validate_source")
         try:
             original_args = source_args(donor, identity)
             omitted = missing_host_links(cache, donor, result, platform)
+            report_phase("donor_counts")
             counts = donor_counts(donor)
+            entry["progress"].update(files_counted=counts["files_moved"],
+                                     bytes_counted=counts["bytes_moved"],
+                                     symlinks_counted=counts["symlinks_moved"])
+            report_phase("ninja_mtime_plan")
             plan = ninja_mtime_plan(donor)
+            entry["progress"].update(outputs_planned=plan["outputs_restored"],
+                                     outputs_skipped=sum(plan["skipped"].values()))
         except (ValueError, RuntimeError, fetcher.CacheMiss) as error:
             cleanup_reason = str(error)
             raise
@@ -500,6 +589,7 @@ def restore(workdir: Path, platform: str, arch: str, cache_dir: Path,
                    "archive_external_symlink_paths": result.get("external_symlink_paths", []),
                    "environment": {"compiler": "unverified", "sdk": "unverified",
                                    "external_inputs": "unverified", "cache_hit_proven": False}}
+        report_phase("install")
         install(donor, work, receipt)
         entry.update(status="hit", reasons=["full pinned upstream source restored; preparation and environment checks still required"],
                      counts=counts, receipt=receipt, receipt_path=str(src / MARKER))
@@ -508,26 +598,47 @@ def restore(workdir: Path, platform: str, arch: str, cache_dir: Path,
             importer.write_json(result_path, result)
         except OSError as error:
             entry["reasons"].append(f"restored successfully; downloader receipt update failed: {error}")
-    except (OSError, ValueError, KeyError, TypeError, IndexError, RuntimeError, fetcher.CacheMiss) as error:
+    except (OSError, ValueError, KeyError, TypeError, IndexError, RuntimeError,
+            fetcher.CacheMiss, LocalError) as error:
         entry["reasons"] = [str(error)]
+        if getattr(error, "preserved_source", None) is not None:
+            entry["preserved_source"] = error.preserved_source
+        if isinstance(error, LocalError):
+            raise
+    except BaseException as error:
+        entry["reasons"] = [f"{type(error).__name__}: {error}"]
+        if getattr(error, "preserved_source", None) is not None:
+            entry["preserved_source"] = error.preserved_source
+        raise
     finally:
         try:
             if entry["status"] == "miss":
-                if cache_owned and cleanup_reason is not None:
-                    try:
-                        entry["cleanup"] = _cleanup_owned_miss(cache, result, cleanup_reason)
-                        entry["counts"]["cache_entries_removed"] = entry["cleanup"]["cache_entries_removed"]
-                    except (OSError, ValueError, RuntimeError) as error:
-                        entry["cleanup"] = {"status": "failed", "reason": str(error)}
-                        entry["reasons"].append(f"owned cache cleanup failed: {error}")
-                else:
-                    entry["cleanup"] = {"status": "preserved", "reason":
-                                        "installation failed; donor retained for retry" if validation_complete else
-                                        "ownership not fully validated or source validation had an I/O error"}
+                entry["failed_phase"] = entry.get("phase")
+                try:
+                    report_phase("failed")
+                finally:
+                    if cache_owned and cleanup_reason is not None:
+                        try:
+                            entry["cleanup"] = _cleanup_owned_miss(cache, result, cleanup_reason)
+                            entry["counts"]["cache_entries_removed"] = entry["cleanup"]["cache_entries_removed"]
+                        except (OSError, ValueError, RuntimeError) as error:
+                            entry["cleanup"] = {"status": "failed", "reason": str(error)}
+                            entry["reasons"].append(f"owned cache cleanup failed: {error}")
+                    elif "preserved_source" in entry:
+                        entry["cleanup"] = {"status": "preserved", "path": entry["preserved_source"],
+                                            "reason": "installation rollback failed; source preserved at reported path"}
+                    else:
+                        entry["cleanup"] = {"status": "preserved", "reason":
+                                            "installation failed; donor retained for retry" if validation_complete else
+                                            "ownership not fully validated or source validation had an I/O error"}
         finally:
             if locked:
                 lock.unlink()
-    write_report(work, entry)
+            if entry["status"] == "hit":
+                report_phase("complete")
+            else:
+                entry["duration_seconds"] = round(time.monotonic() - started, 3)
+                write_report(work, entry)
     return entry
 
 

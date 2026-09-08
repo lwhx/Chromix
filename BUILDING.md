@@ -147,7 +147,11 @@ restoration when requested. Its internal deadline is 140 minutes within the
 150-minute job, with 15 minutes reserved for diagnostics; normal build stages
 retain a 300-minute internal deadline and 40-minute handoff reserve. Full-cache
 fetching is capped at 60 minutes and further limited by the actual remaining
-budget. V8 Torque validation uses only the remaining non-reserved time. The
+budget. The downloader's shared retry deadline is 45 minutes, leaving time for
+extraction inside that cap; the earlier 15-minute inner deadline stopped the
+15 GB Windows artifact despite the longer stage budget. Miss reports retain the
+last attempt's partial and expected byte counts separately from verified bytes.
+V8 Torque validation uses only the remaining non-reserved time. The
 validation runner currently uploads diagnostics rather than its build tree, so
 stage 1 repeats restoration on its own runner.
 
@@ -240,7 +244,15 @@ importer still rejects v7 instead of checking it with the v5/v6 hash algorithm.
 Restore diagnostics retain available bounded log/dependency headers and file
 sizes before source validation; missing or unsafe metadata is recorded without
 following links, even when a rejected owned cache is removed. Unknown formats
-still stop restoration.
+still stop restoration. Counting, timestamp planning, and installation write
+phase reports before starting, with elapsed time and available counters.
+Timestamp planning validates each distinct successful input once, checks its
+mtime against each output's own cutoff, then revalidates input identity before
+returning the plan. This avoids repeating filesystem walks for shared headers;
+it neither caches results across restores nor permits concurrent source edits.
+Transient input I/O failures abort planning without deleting the donor. Caught
+installation interruptions roll back the move and timestamp changes; if rollback
+fails, the source is retained and its location is reported for recovery.
 
 Before any restored-output Ninja invocation, the build selects one native
 executable matching the log generation: Ninja 1.11 for v5, 1.12 for v6,
@@ -260,14 +272,17 @@ the pinned domain-substitution rules and applies with `--fuzz=0`. Interrupted
 or mismatched patch markers fail instead of accepting a partially patched tree.
 
 Native tool headers and executable probes check the actual runner architecture.
-On restored macOS trees, probes reconstruct a source-confined `DYLD_LIBRARY_PATH`
-from native LLVM and nightly Rust library directories, including before the first
-inspection. A relative library link supplies nightly rust-objcopy's existing
-loader path without changing executable bytes. A native, timed
-`rust-objcopy --version` probe with all `DYLD_*` variables removed must pass before
-tool preparation can finish. The pinned Mac bindgen action
-reinstates its library path in Python, so it does not depend on `DYLD_*` surviving
-Ninja's system-shell invocation. Runtime setup is refreshed after tool retrieval.
+Restored macOS tools run with inherited `DYLD_*` overrides removed. Only the
+bindgen child receives a temporary search directory containing a single symlink
+to native, source-confined `libclang.dylib`; LLVM's bundled C++ libraries are not
+exposed to clang, GN, Node, or system frameworks. This applies before the first
+inspection to avoid treating loader-environment failures as tool changes.
+A relative library link supplies nightly rust-objcopy's existing loader path
+without changing executable bytes. A native, timed `rust-objcopy --version`
+probe with all `DYLD_*` variables removed must pass before preparation finishes.
+A SHA256-pinned, idempotent repair applies the same libclang-only isolation inside
+the Mac bindgen action, after Ninja's system-shell invocation. Unknown wrapper
+contents stop preparation rather than receiving a partial edit.
 Required tool replacement happens only in Actions. A changed compiler/runtime
 invalidates compiled outputs; unknown external or missing Ninja dependencies
 invalidate their dependent outputs. Host generator contents (Node, Go, gperf,
@@ -341,6 +356,14 @@ shared libraries, or macOS launch restrictions can fail the check; such
 failures are not silently skipped. This small check does not validate GPU
 operation, GUI behavior, Playwright integration, Gatekeeper approval, or
 every supported OS version.
+
+The final Windows stage also verifies the ZIP checksum before fresh extraction.
+It checks the numeric product-version resources of both `chrome.exe` and
+`chrome.dll`, because Chromium's command-line `--version` handler is POSIX-only.
+If a versioned DLL directory would take precedence, its DLL must match the newly
+linked portable DLL byte-for-byte. A bounded `cmd.exe` invocation runs the
+extracted `chromix.cmd` with the same local headless DOM check; version metadata
+alone is not a launch test.
 
 Preparation, build, packaging, checksum, and smoke output are captured in
 per-stage log artifacts alongside generated `args.gn` when present.

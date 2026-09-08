@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Native macOS build using pinned ungoogled-chromium source layers.
 set -euo pipefail
+unset -- "${!DYLD_@}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$REPO/build/posix/upstream-cache.sh"
 WORK="${1:-$REPO/.chromix-build-mac}"
@@ -29,9 +30,6 @@ cd "$SRC"
 chromix_select_restored_ninja macos
 if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
   bash "$REPO/build/posix/prepare-restored-tools.sh" "$WORK" macos "$ARCH"
-  # A child may retrieve tools, but cannot export its refreshed paths to us.
-  MACOS_RUNTIME_ENV="$(python3 "$REPO/tools/macos_runtime.py" --src "$SRC" --arch "$ARCH")"
-  eval "$MACOS_RUNTIME_ENV"
 fi
 if [ ! -f "$SRC/.chromix-toolchain-ready" ]; then
   if [ -f "$SRC/.chromix-domain-substituted" ]; then

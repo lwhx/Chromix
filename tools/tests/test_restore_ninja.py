@@ -431,7 +431,8 @@ class RestoreNinjaShellTest(unittest.TestCase):
 
 @unittest.skipUnless(PWSH.exists(), "PowerShell required")
 class DirectWindowsRestoredBuildTest(unittest.TestCase):
-    def run_builder(self, *, restored=True, bindgen_present=False, fail="", ninja_rc=0, resume=False):
+    def run_builder(self, *, restored=True, bindgen_present=False, fail="", ninja_rc=0, resume=False,
+                    product_version="152.0.7977.82", metadata_present=True, chrome_present=True):
         temporary = tempfile.TemporaryDirectory(prefix="direct windows restored ")
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
@@ -444,7 +445,9 @@ class DirectWindowsRestoredBuildTest(unittest.TestCase):
         env = {**os.environ, "TEST_PYTHON": sys.executable, "TEST_REPO": str(repo),
                "TEST_WORK": str(work), "TEST_OUT": str(out), "TEST_CALLS": str(calls),
                "TEST_NINJA": str(chosen), "TEST_FAIL": fail, "TEST_RESTORED": str(int(restored)),
-               "TEST_NINJA_RC": str(ninja_rc), "TEST_RESUME": str(int(resume))}
+               "TEST_NINJA_RC": str(ninja_rc), "TEST_RESUME": str(int(resume)),
+               "TEST_PRODUCT_VERSION": product_version, "TEST_METADATA_PRESENT": str(int(metadata_present)),
+               "TEST_CHROME_PRESENT": str(int(chrome_present))}
         for name in ("NINJA", "PYTHONPATH", "PYTHONHOME"):
             env.pop(name, None)
 
@@ -484,7 +487,7 @@ class DirectWindowsRestoredBuildTest(unittest.TestCase):
         )
         executable = "#!" + sys.executable + "\n" + common
         good_gn = executable + "record('gn')\nassert sys.argv[1:] == ['gen', str(out), '--fail-on-unused-args']\n"
-        chrome = executable + "record('chrome')\nassert sys.argv[1:] == ['--version']\n"
+        chrome = executable + "record('chrome')\nraise SystemExit('browser must not run during metadata validation')\n"
         put(out / "gn.exe", executable + "record('wrong-gn')\nraise SystemExit(99)\n" if restored else good_gn, True)
         put(out / "chrome.exe", executable + "record('upstream-chrome')\nraise SystemExit(99)\n", True)
         put(src / "chrome/browser-fixture.cc", "chromium.9oo91esource.qjz9zk\n")
@@ -561,6 +564,7 @@ print(json.dumps({'phase': args.phase}))
         ninja += "assert sys.argv[1:] == ['-C', str(out), '-j', '3', 'chrome']\n"
         ninja += "if os.environ['TEST_RESTORED'] == '1': assert (work / 'upstream-reuse/baseline.json').is_file()\n"
         ninja += "if int(os.environ['TEST_NINJA_RC']): raise SystemExit(int(os.environ['TEST_NINJA_RC']))\n"
+        ninja += "if os.environ['TEST_CHROME_PRESENT'] == '0':\n    (out / 'chrome.exe').unlink(missing_ok=True)\n    raise SystemExit(0)\n"
         ninja += "(out / 'chrome.exe').write_text(" + repr(chrome) + ")\n(out / 'chrome.exe').chmod(0o755)\n"
         put(chosen, ninja, True)
         put(src / "third_party/ninja/ninja.exe", executable + "record('wrong-ninja')\nraise SystemExit(99)\n" if restored else ninja, True)
@@ -572,11 +576,26 @@ function python {
   & $env:TEST_PYTHON @pythonArgs
   $global:LASTEXITCODE = $LASTEXITCODE
 }
+function Get-Item {
+  param($LiteralPath)
+  if ($LiteralPath -ne (Join-Path $env:TEST_OUT 'chrome.exe')) { throw "unexpected version metadata path: $LiteralPath" }
+  if (-not (Test-Path -LiteralPath $LiteralPath -PathType Leaf)) { throw "missing built executable" }
+  Add-Content -LiteralPath $env:TEST_CALLS -Value 'version-metadata'
+  if ($env:TEST_METADATA_PRESENT -eq '0') { return [pscustomobject]@{ VersionInfo = $null } }
+  $parts = $env:TEST_PRODUCT_VERSION.Split('.')
+  return [pscustomobject]@{ VersionInfo = [pscustomobject]@{
+    ProductMajorPart = [int]$parts[0]; ProductMinorPart = [int]$parts[1]
+    ProductBuildPart = [int]$parts[2]; ProductPrivatePart = [int]$parts[3]
+    ProductVersion = 'untrusted display string'
+  } }
+}
 & (Join-Path $env:TEST_REPO 'build/windows/build.ps1') -WorkDir $env:TEST_WORK -Jobs 3 -Resume:($env:TEST_RESUME -eq '1')
 ''')
         result = subprocess.run([str(PWSH), "-NoProfile", "-File", str(runner)],
                                 env=env, capture_output=True, text=True, timeout=20)
         events = calls.read_text().splitlines() if calls.exists() else []
+        self.assertNotIn('chrome', events)
+        self.assertNotIn('upstream-chrome', events)
         self.assertEqual((out / ".ninja_log").read_text(), "# ninja log v6\n")
         self.assertEqual((out / ".ninja_deps").read_text(), "retained deps")
         self.assertEqual((src / "chrome/browser-fixture.cc").read_text(), "chromium.9oo91esource.qjz9zk\n")
@@ -586,7 +605,7 @@ function python {
         result, events, out, src = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(events, ['inspect', 'prep-patch', 'select', 'bindgen', 'finish', 'bootstrap', 'gn',
-                                  'plan', 'evidence-before', 'ninja', 'evidence-after', 'chrome'])
+                                  'plan', 'evidence-before', 'ninja', 'evidence-after', 'version-metadata'])
         evidence = out.parents[2] / 'upstream-reuse'
         self.assertTrue((evidence / 'baseline.json').is_file())
         self.assertEqual(json.loads((evidence / 'result.json').read_text()), {'exit_code': 0})
@@ -596,12 +615,14 @@ function python {
         self.assertEqual((src / "tools/clang/scripts/update.py").read_text(), "# commondatastorage.googleapis.com\n")
         self.assertNotIn("chromium.9oo91esource.qjz9zk", (src / "tools/rust/build_bindgen.py").read_text())
         self.assertFalse((src / "out/Chromix").exists())
+        self.assertIn("Windows PE product version verified: 152.0.7977.82", result.stdout)
+        self.assertIn("metadata only; not a runtime smoke test", result.stdout)
 
     def test_present_bindgen_still_finishes_without_endpoint_normalization(self):
         result, events, out, src = self.run_builder(bindgen_present=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(events, ['inspect', 'prep-patch', 'select', 'finish', 'bootstrap', 'gn',
-                                  'plan', 'evidence-before', 'ninja', 'evidence-after', 'chrome'])
+                                  'plan', 'evidence-before', 'ninja', 'evidence-after', 'version-metadata'])
         self.assertIn("commondatastorage.9oo91eapis.qjz9zk", (src / "tools/clang/scripts/update.py").read_text())
 
     def test_pre_gn_failures_never_execute_gn_or_ninja(self):
@@ -609,7 +630,7 @@ function python {
             with self.subTest(failure=failure):
                 result, events, _, _ = self.run_builder(fail=failure)
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertFalse({'gn', 'wrong-gn', 'ninja', 'wrong-ninja', 'chrome', 'upstream-chrome'} & set(events), events)
+                self.assertFalse({'gn', 'wrong-gn', 'ninja', 'wrong-ninja', 'version-metadata'} & set(events), events)
                 if failure == 'normalize':
                     self.assertNotIn('bindgen', events)
                     self.assertIn('endpoint normalization failed', result.stderr)
@@ -621,7 +642,7 @@ function python {
     def test_direct_resume_preserves_initial_evidence_baseline(self):
         result, events, out, _ = self.run_builder(resume=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(events[-4:], ['evidence-before', 'ninja', 'evidence-after', 'chrome'])
+        self.assertEqual(events[-4:], ['evidence-before', 'ninja', 'evidence-after', 'version-metadata'])
         baseline = out.parents[2] / 'upstream-reuse/baseline.json'
         self.assertEqual(baseline.read_text(), '{"original": true}')
         self.assertEqual(baseline.stat().st_mtime_ns, 1_700_000_000_000_000_000)
@@ -631,7 +652,7 @@ function python {
             with self.subTest(failure=failure):
                 result, events, _, _ = self.run_builder(fail=failure)
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertNotIn('chrome', events)
+                self.assertNotIn('version-metadata', events)
                 self.assertEqual(events[-1], failure)
                 self.assertEqual('ninja' in events, failure == 'evidence-after')
 
@@ -642,19 +663,48 @@ function python {
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn('ninja failed (exit 19)', result.stderr)
                 self.assertEqual(events[-3:], ['evidence-before', 'ninja', 'evidence-after'])
-                self.assertNotIn('chrome', events)
+                self.assertNotIn('version-metadata', events)
                 if failure:
                     self.assertRegex(result.stderr, r'evidence collection failed after[\s|]+Ninja \(exit 23\)')
                 else:
                     self.assertEqual(json.loads((out.parents[2] / 'upstream-reuse/result.json').read_text()),
                                      {'exit_code': 19})
 
+    def test_numeric_product_version_mismatch_rejects_completion(self):
+        for restored in (False, True):
+            for version in ("153.0.7977.82", "152.1.7977.82", "152.0.7978.82", "152.0.7977.83", "0.0.0.0"):
+                with self.subTest(restored=restored, version=version):
+                    result, events, _, _ = self.run_builder(restored=restored, product_version=version)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertRegex(result.stderr, r'does not match the pinned Chromium[\s|]+version')
+                    self.assertEqual(events[-1], 'version-metadata')
+                    if restored:
+                        self.assertEqual(events[-3:], ['ninja', 'evidence-after', 'version-metadata'])
+                    self.assertNotIn('product version verified', result.stdout)
+                    self.assertNotIn('==> Done:', result.stdout)
+
+    def test_missing_executable_or_version_metadata_rejects_completion(self):
+        for restored in (False, True):
+            for options, message, checked in (
+                    ({"chrome_present": False}, 'built Windows browser is missing', False),
+                    ({"metadata_present": False}, 'version metadata is missing', True)):
+                with self.subTest(restored=restored, options=options):
+                    result, events, _, _ = self.run_builder(restored=restored, **options)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn(message, result.stderr)
+                    self.assertEqual('version-metadata' in events, checked)
+                    if restored:
+                        self.assertIn('evidence-after', events)
+                    self.assertNotIn('product version verified', result.stdout)
+                    self.assertNotIn('==> Done:', result.stdout)
+
     def test_cold_builder_keeps_chromix_output_and_skips_restored_preparation(self):
         for bindgen_present in (False, True):
             with self.subTest(bindgen_present=bindgen_present):
                 result, events, out, src = self.run_builder(restored=False, bindgen_present=bindgen_present)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(events, ['prep-patch'] + ([] if bindgen_present else ['bindgen']) + ['gn', 'ninja', 'chrome'])
+                self.assertEqual(events, ['prep-patch'] + ([] if bindgen_present else ['bindgen']) +
+                                 ['gn', 'ninja', 'version-metadata'])
                 self.assertEqual(out.name, 'Chromix')
                 self.assertFalse((out.parents[2] / 'upstream-reuse').exists())
                 self.assertNotIn('upstream_extra', (out / 'args.gn').read_text())

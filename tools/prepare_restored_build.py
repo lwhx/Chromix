@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -18,13 +19,13 @@ import sys
 
 try:
     from .import_upstream_cache import CLANG, RUST, Miss, digest_file
-    from .macos_runtime import runtime_environment
+    from .macos_runtime import bindgen_environment, runtime_environment
     from .restore_upstream_cache import linked, verify_restored
     from .upstream_object_cache import ninja_deps, ninja_log, write_json
     from .upstream_script_identity import ENDPOINTS
 except ImportError:
     from import_upstream_cache import CLANG, RUST, Miss, digest_file
-    from macos_runtime import runtime_environment
+    from macos_runtime import bindgen_environment, runtime_environment
     from restore_upstream_cache import linked, verify_restored
     from upstream_object_cache import ninja_deps, ninja_log, write_json
     from upstream_script_identity import ENDPOINTS
@@ -129,9 +130,12 @@ def inspect_native_tools(src: Path, platform: str, arch: str) -> dict:
                 raise ValueError("tool is not executable")
             probe_arg = "/?" if name == "llvm-ml" else "--version"
             entry["probe_argument"] = probe_arg
-            completed = subprocess.run([str(path), probe_arg], cwd=src, text=True, env=probe_env,
-                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                       timeout=30, check=False)
+            context = (bindgen_environment(src, arch) if platform == "macos" and name == "bindgen"
+                       else nullcontext(probe_env))
+            with context as env:
+                completed = subprocess.run([str(path), probe_arg], cwd=src, text=True, env=env,
+                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                           timeout=30, check=False)
             entry["version"] = completed.stdout.strip()[:2000]
             if completed.returncode:
                 raise ValueError(f"{probe_arg} exited {completed.returncode}")

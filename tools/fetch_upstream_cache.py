@@ -51,7 +51,7 @@ OWNER = "chromix-upstream-cache-v1"
 API = "https://api.github.com"
 CHUNK = 1024 * 1024
 TIMEOUT = 60
-DOWNLOAD_SECONDS = 15 * 60
+DOWNLOAD_SECONDS = 45 * 60
 ATTEMPTS = 3
 MAX_EXTRACTED = 300 * 1024**3
 MAX_SELECTED = 30 * 1024**3
@@ -266,12 +266,14 @@ class GitHub:
         artifact = pin["artifact"]
         url = f"{API}/repos/{pin['repository']}/actions/artifacts/{artifact['id']}/zip"
         deadline = time.monotonic() + DOWNLOAD_SECONDS
+        size = 0
 
         def request():
-            result = hashlib.sha256()
-            size = 0
+            nonlocal size
             require(time.monotonic() < deadline, "download_timeout")
+            result = hashlib.sha256()
             with self.open(url, download=True) as response, path.open("wb") as output:
+                size = 0
                 while True:
                     require(time.monotonic() < deadline, "download_timeout")
                     chunk = response.read(CHUNK)
@@ -286,7 +288,13 @@ class GitHub:
                 raise http.client.IncompleteRead(b"", artifact["size_in_bytes"] - size)
             require("sha256:" + result.hexdigest() == artifact["digest"], "checksum_mismatch")
             return size
-        return self.retry(request)
+        try:
+            return self.retry(request)
+        except CacheMiss as error:
+            error.details.update(download_partial_bytes=size,
+                                 download_expected_bytes=artifact["size_in_bytes"],
+                                 download_timeout_seconds=DOWNLOAD_SECONDS)
+            raise
 
 
 def safe_name(name, *, posix=False):

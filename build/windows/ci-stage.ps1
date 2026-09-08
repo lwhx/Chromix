@@ -234,32 +234,71 @@ function Invoke-BoundedBrowser {
     [Parameter(Mandatory)] [string]$WorkingDirectory,
     [int]$TimeoutSec = 60
   )
+  $quoted = foreach ($value in (@($Launcher) + $Arguments)) {
+    # Smoke inputs do not need embedded quotes or cmd variable expansion.
+    if ($value -match '["%\r\n\0]') { throw "browser smoke input contains unsupported shell characters" }
+    # Preserve trailing backslashes before the closing quote in native argv.
+    '"' + ($value -replace '(\\+)$', '$1$1') + '"'
+  }
+  $commandLine = '/d /v:off /s /c "' + ($quoted -join ' ') + '"'
   $id = [Guid]::NewGuid().ToString('N')
   $stdout = Join-Path $env:TEMP "chromix-browser-$id.out"
   $stderr = Join-Path $env:TEMP "chromix-browser-$id.err"
+  $process = $null
   try {
-    $process = Start-Process -FilePath $Launcher -ArgumentList $Arguments `
+    $process = Start-Process -FilePath $env:COMSPEC -ArgumentList $commandLine `
       -WorkingDirectory $WorkingDirectory -PassThru -WindowStyle Hidden `
       -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    # Retain the native handle before polling so Windows PowerShell keeps ExitCode.
+    $null = $process.Handle
     $stopwatch = [Diagnostics.Stopwatch]::StartNew()
     while (-not $process.HasExited) {
       if ($stopwatch.Elapsed.TotalSeconds -gt $TimeoutSec) {
-        try { & taskkill.exe /PID $process.Id /T /F 2>&1 | Out-Null } catch {}
-        $process.WaitForExit()
+        $killer = $null
+        try {
+          $killer = Start-Process -FilePath (Join-Path $env:SystemRoot "System32\taskkill.exe") `
+            -ArgumentList "/PID $($process.Id) /T /F" -PassThru -WindowStyle Hidden
+          $null = $killer.Handle
+          if (-not $killer.WaitForExit(2000)) {
+            try { $killer.Kill() } catch {}
+            throw "taskkill timed out"
+          }
+          $killCode = $killer.ExitCode
+          if ($null -eq $killCode -or $killCode -ne 0) {
+            throw "taskkill failed with exit $killCode"
+          }
+        } catch {
+          Write-Host "==> browser smoke tree cleanup failed: $($_.Exception.Message)"
+        } finally {
+          if ($null -ne $killer) { $killer.Dispose() }
+        }
+        # Windows PowerShell 5.1 has no Kill(entireProcessTree) overload.
+        try {
+          if (-not $process.HasExited) { $process.Kill() }
+        } catch {
+          Write-Host "==> browser smoke fallback termination failed: $($_.Exception.Message)"
+        }
+        if (-not $process.WaitForExit(2000)) {
+          Write-Host "==> browser smoke process $($process.Id) is still running after bounded cleanup"
+        }
         throw "browser smoke command timed out after $TimeoutSec seconds"
       }
       Start-Sleep -Milliseconds 250
     }
-    $output = if (Test-Path $stdout) { Get-Content $stdout -Raw } else { "" }
-    $errors = if (Test-Path $stderr) { Get-Content $stderr -Raw } else { "" }
+    $process.WaitForExit()
+    $output = if (Test-Path -LiteralPath $stdout) { Get-Content -LiteralPath $stdout -Raw } else { "" }
+    $errors = if (Test-Path -LiteralPath $stderr) { Get-Content -LiteralPath $stderr -Raw } else { "" }
     Write-Host $output
     if ($errors) { Write-Host $errors }
-    if ($process.ExitCode -ne 0) {
-      throw "browser smoke command failed with exit $($process.ExitCode)"
+    $code = $process.ExitCode
+    if ($null -eq $code) { throw "browser smoke command exit code is unavailable" }
+    if ($code -ne 0) {
+      throw "browser smoke command failed with exit $code"
     }
     return $output
   } finally {
-    Remove-Item $stdout, $stderr -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
+    if ($null -ne $process) { $process.Dispose() }
   }
 }
 
@@ -269,7 +308,7 @@ function Verify-FinalBundle {
   if (-not (Test-Path $asset) -or -not (Test-Path $manifest)) {
     throw "final Windows bundle or SHA256SUMS is missing"
   }
-  $entry = Get-Content $manifest | Where-Object { $_ -match '^([0-9a-fA-F]{64})\s+chromix-win-x64\.zip$' }
+  $entry = @(Get-Content $manifest | Where-Object { $_ -match '^([0-9a-fA-F]{64})\s+chromix-win-x64\.zip$' })
   if ($entry.Count -ne 1) { throw "SHA256SUMS has no unique Windows ZIP entry" }
   $expected = [regex]::Match($entry[0], '^([0-9a-fA-F]{64})').Groups[1].Value.ToLowerInvariant()
   $actual = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -283,13 +322,27 @@ function Verify-FinalBundle {
   $bundle = Join-Path $smokeRoot "chromix"
   $launcher = Join-Path $bundle "chromix.cmd"
   $chrome = Join-Path $bundle "chrome.exe"
-  if (-not (Test-Path $launcher) -or -not (Test-Path $chrome)) {
-    throw "extracted Windows bundle is missing chromix.cmd or chrome.exe"
+  $chromeDll = Join-Path $bundle "chrome.dll"
+  if (-not (Test-Path $launcher) -or -not (Test-Path $chrome) -or -not (Test-Path $chromeDll)) {
+    throw "extracted Windows bundle is missing chromix.cmd, chrome.exe, or chrome.dll"
   }
-  $version = Invoke-BoundedBrowser -Launcher $launcher -Arguments @("--version") `
-    -WorkingDirectory $bundle -TimeoutSec 30
-  if ($version -notmatch [regex]::Escape($Revisions.ChromiumVersion)) {
-    throw "extracted Windows browser version does not match the pinned Chromium version"
+  # Chromium's --version handler is POSIX-only; check both Windows PE resources.
+  foreach ($binary in @($chrome, $chromeDll)) {
+    $info = (Get-Item -LiteralPath $binary).VersionInfo
+    $version = '{0}.{1}.{2}.{3}' -f $info.ProductMajorPart, $info.ProductMinorPart, `
+      $info.ProductBuildPart, $info.ProductPrivatePart
+    if ($version -cne $Revisions.ChromiumVersion) {
+      throw "extracted Windows browser version does not match the pinned Chromium version: $binary ($version)"
+    }
+    Write-Host "==> Windows product version verified: $binary ($version)"
+  }
+  # Windows prefers a versioned DLL directory over the adjacent portable DLL.
+  $versionedDll = Join-Path (Join-Path $bundle $Revisions.ChromiumVersion) "chrome.dll"
+  if (Test-Path -LiteralPath $versionedDll) {
+    if ((Get-FileHash -LiteralPath $versionedDll -Algorithm SHA256).Hash -ne
+        (Get-FileHash -LiteralPath $chromeDll -Algorithm SHA256).Hash) {
+      throw "versioned Windows DLL differs from the newly linked portable DLL"
+    }
   }
   $profile = Join-Path $smokeRoot "profile"
   $dom = Invoke-BoundedBrowser -Launcher $launcher -Arguments @(
@@ -394,6 +447,12 @@ if ($StageIndex -eq 1 -and -not $FromArtifact -and
     throw "required upstream cache fetch timed out"
   } elseif ($fetchRc -ne 0) {
     throw "upstream cache fetch helper failed (exit $fetchRc)"
+  }
+  # The fetcher exits zero for cache misses; report the cause before restore.
+  $fetchResult = Get-Content -LiteralPath (Join-Path $UpstreamCacheDir "result.json") -Raw | ConvertFrom-Json
+  if ($fetchResult.status -ne "hit") {
+    throw ("required upstream cache fetch failed: $($fetchResult.reason); " +
+           "phase=$($fetchResult.phase); duration_seconds=$($fetchResult.duration_seconds)")
   }
   python (Join-Path $Repo "tools\restore_upstream_cache.py") --phase restore `
     --platform windows --arch x64 --workdir $WorkDir --cache-dir $UpstreamCacheDir

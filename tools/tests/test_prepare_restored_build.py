@@ -253,18 +253,35 @@ class PrepareRestoredBuildTest(unittest.TestCase):
                 self.assertTrue(report["error"])
                 self.assertEqual("tools" in report, failure == "generator")
 
-    def test_mac_probe_runtime_is_reconstructed_after_system_shell_environment_loss(self):
+    def test_mac_probe_runtime_is_scoped_after_system_shell_environment_loss(self):
         self.fixture()
         library = self.src / prepare.CLANG / "lib/libclang.dylib"
         self.binary(library, "macos", "arm64")
-        expected = str(library.parent)
-        with self.native_context(), mock.patch.dict(os.environ, {}, clear=True), \
-                mock.patch.object(prepare.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="native")) as run:
-            result = prepare.prepare(self.work, "macos", "arm64", phase="inspect")
-        self.assertTrue(result["native_tools"])
-        self.assertFalse(result["needs_invalidation"])
-        for call in run.call_args_list:
-            self.assertEqual(call.kwargs["env"]["DYLD_LIBRARY_PATH"], expected)
+        self.binary(library.with_name("libc++abi.dylib"), "macos", "arm64")
+        for inherited in ({}, {"DYLD_LIBRARY_PATH": str(library.parent), "DYLD_INSERT_LIBRARIES": "/bad"}):
+            with self.subTest(inherited=inherited):
+                views, commands = [], []
+                def run(command, **kwargs):
+                    commands.append(Path(command[0]).name)
+                    env = kwargs["env"]
+                    if commands[-1] == "bindgen":
+                        view = Path(env["DYLD_LIBRARY_PATH"])
+                        views.append(view)
+                        self.assertEqual([path.name for path in view.iterdir()], ["libclang.dylib"])
+                        self.assertEqual((view / "libclang.dylib").resolve(), library)
+                        self.assertEqual(env, {"DYLD_LIBRARY_PATH": str(view)})
+                    else:
+                        self.assertEqual(env, {})
+                    return mock.Mock(returncode=0, stdout="native")
+                with self.native_context(), mock.patch.dict(os.environ, inherited, clear=True), \
+                        mock.patch.object(prepare.subprocess, "run", side_effect=run):
+                    result = prepare.prepare(self.work, "macos", "arm64", phase="inspect")
+                    self.assertEqual(dict(os.environ), inherited)
+                self.assertTrue(result["native_tools"])
+                self.assertFalse(result["needs_invalidation"])
+                self.assertEqual(set(commands), set(prepare.tool_paths("macos", "arm64")))
+                self.assertEqual(len(views), 1)
+                self.assertFalse(views[0].exists())
 
     def test_report_symlink_cannot_overwrite_external_file(self):
         self.fixture()

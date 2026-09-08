@@ -132,5 +132,17 @@ for relative, keys in RESTORED.items():
   Pop-Location
 }
 
-Write-Host "==> Done: $Out\chrome.exe"
-& "$Out\chrome.exe" --version
+$chrome = Join-Path $Out "chrome.exe"
+if (-not (Test-Path -LiteralPath $chrome -PathType Leaf)) {
+  throw "built Windows browser is missing: $chrome"
+}
+# Chromium's --version handler is POSIX-only; read the Windows PE resource.
+$info = (Get-Item -LiteralPath $chrome).VersionInfo
+if ($null -eq $info) { throw "built Windows browser version metadata is missing: $chrome" }
+$version = '{0}.{1}.{2}.{3}' -f $info.ProductMajorPart, $info.ProductMinorPart, `
+  $info.ProductBuildPart, $info.ProductPrivatePart
+if ($version -cne $Revisions.ChromiumVersion) {
+  throw "built Windows browser version does not match the pinned Chromium version: $chrome ($version)"
+}
+Write-Host "==> Windows PE product version verified: $version (metadata only; not a runtime smoke test)"
+Write-Host "==> Done: $chrome"

@@ -14,7 +14,9 @@ import tempfile
 import time
 import unittest
 import zipfile
+from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from tools import fetch_upstream_cache as fetcher
@@ -42,6 +44,23 @@ def archive_bytes(entries, zipped=False):
                     info.size = len(data)
                 archive.addfile(info, io.BytesIO(data) if kind == "file" else None)
     return output.getvalue()
+
+
+def write_ninja_metadata(out, records, version=5):
+    names = dict.fromkeys(name for output, _, _, inputs in records for name in (output, *inputs))
+    ids = {name: index for index, name in enumerate(names)}
+    raw = bytearray(b"# ninjadeps\n\x04\x00\x00\x00")
+    for name, index in ids.items():
+        encoded = name.encode()
+        payload = encoded + b"\0" * (-len(encoded) % 4) + struct.pack("<I", ~index & 0xffffffff)
+        raw += struct.pack("<I", len(payload)) + payload
+    for output, recorded, _, inputs in records:
+        payload = struct.pack(f"<{len(inputs) + 3}I", ids[output], recorded & 0xffffffff,
+                              recorded >> 32, *(ids[name] for name in inputs))
+        raw += struct.pack("<I", 0x80000000 | len(payload)) + payload
+    (out / ".ninja_deps").write_bytes(raw)
+    (out / ".ninja_log").write_text(f"# ninja log v{version}\n" + "".join(
+        f"0\t1\t{logged}\t{output}\t123456789abcdef0\n" for output, _, logged, _ in records))
 
 
 class RestoreUpstreamCacheTest(unittest.TestCase):
@@ -136,6 +155,23 @@ class RestoreUpstreamCacheTest(unittest.TestCase):
         return restore.run_restore(phase, self.platform, self.arch, self.work,
                                    self.cache if cache else None, repo=self.repo)
 
+    def timestamp_outputs(self):
+        out = self.donor / "out/Default"
+        recorded = 1_700_000_000_123_456_789
+        floor = recorded // 10**9 * 10**9
+        os.utime(self.donor / "chrome/source.cc", ns=(floor - 10**9,) * 2)
+        records = []
+        for name in ("obj/output.o", "obj/second.o"):
+            self.write(out / name, name)
+            os.utime(out / name, ns=(floor,) * 2)
+            records.append((name, recorded, recorded, ["../../chrome/source.cc"]))
+        write_ninja_metadata(out, records)
+        return recorded, floor
+
+    def donor_snapshot(self):
+        return {path.relative_to(self.donor): (path.read_bytes(), path.stat().st_mtime_ns)
+                for path in self.donor.rglob("*") if path.is_file()}
+
     def test_restore_moves_complete_source_and_writes_receipt(self):
         source_mtime = (self.donor / "chrome/source.cc").stat().st_mtime_ns
         output_mtime = (self.donor / "out/Default/obj/output.o").stat().st_mtime_ns
@@ -151,6 +187,178 @@ class RestoreUpstreamCacheTest(unittest.TestCase):
         self.assertEqual(receipt["original_args"]["bytes"], len(receipt["original_args"]["text"].encode()))
         self.assertFalse((src / ".chromix-source-ready").exists())
         self.assertFalse((src / ".chromix-patches").exists())
+
+    def test_phase_reports_precede_work_and_preserve_receipt_semantics(self):
+        counts = restore.donor_counts(self.donor)
+        recorded = 1_700_000_000_123_456_789
+        plan = {"outputs_restored": 1, "repairs": [{"output": "obj/output.o",
+                "from_ns": recorded // 10**9 * 10**9, "to_ns": recorded}], "skipped": {"fixture": 2}}
+        output = self.donor / "out/Default/obj/output.o"
+        os.utime(output, ns=(plan["repairs"][0]["from_ns"],) * 2)
+        observed = []
+        install = restore.install
+
+        def check(phase):
+            report = json.loads((self.work / restore.REPORT).read_text())
+            self.assertEqual(report["phase"], phase)
+            self.assertEqual(report["status"], "miss")
+            self.assertEqual(report["counts"]["files_moved"], 0)
+            self.assertEqual(report["ninja_state"][".ninja_log"]["header_hex"], b"# ninja log v5\n".hex())
+            self.assertNotIn("receipt", report)
+            self.assertGreaterEqual(report["duration_seconds"], 0)
+            observed.append(report)
+            return report
+
+        def counted(src):
+            self.assertEqual(check("donor_counts")["progress"]["files_counted"], 0)
+            return counts
+
+        def planned(src):
+            self.assertEqual(check("ninja_mtime_plan")["progress"]["files_counted"], counts["files_moved"])
+            return plan
+
+        def installed(donor, work, receipt):
+            self.assertEqual(check("install")["progress"]["outputs_planned"], 1)
+            self.assertNotIn("phase", receipt)
+            self.assertNotIn("progress", receipt)
+            self.assertEqual(receipt["ninja_mtimes"], plan)
+            install(donor, work, receipt)
+
+        with mock.patch.object(restore, "donor_counts", side_effect=counted), \
+                mock.patch.object(restore, "ninja_mtime_plan", side_effect=planned), \
+                mock.patch.object(restore, "install", side_effect=installed), \
+                mock.patch("builtins.print") as printed:
+            entry = self.invoke()
+        self.assertEqual(entry["status"], "hit", entry)
+        self.assertEqual(entry["phase"], "complete")
+        self.assertEqual(entry["counts"], counts)
+        self.assertEqual(entry["progress"]["outputs_skipped"], 2)
+        self.assertEqual(set(entry["phase_durations_seconds"]),
+                         {"validate_cache", "validate_source", "donor_counts", "ninja_mtime_plan", "install"})
+        self.assertTrue(all(value >= 0 for value in entry["phase_durations_seconds"].values()))
+        self.assertEqual(len(observed), 3)
+        messages = [call for call in printed.call_args_list if "upstream cache restore: phase=" in call.args[0]]
+        self.assertEqual(len(messages), 6)
+        self.assertTrue(all(call.kwargs == {"file": sys.stderr, "flush": True} for call in messages))
+        self.assertEqual(json.loads((self.work / restore.REPORT).read_text()),
+                         {key: value for key, value in entry.items() if key != "receipt"})
+
+    def test_failed_phase_and_headers_are_written_before_owned_cleanup(self):
+        cleanup = restore._cleanup_owned_miss
+
+        def inspect_cleanup(cache, result, reason):
+            report = json.loads((self.work / restore.REPORT).read_text())
+            self.assertEqual(report["phase"], "failed")
+            self.assertEqual(report["failed_phase"], "ninja_mtime_plan")
+            self.assertEqual(report["reasons"], ["fixture plan failure"])
+            self.assertGreater(report["progress"]["files_counted"], 0)
+            self.assertIn("ninja_mtime_plan", report["phase_durations_seconds"])
+            self.assertIn("header_hex", report["ninja_state"][".ninja_deps"])
+            self.assertTrue(self.donor.exists())
+            return cleanup(cache, result, reason)
+
+        with mock.patch.object(restore, "ninja_mtime_plan", side_effect=restore.Miss("fixture plan failure")), \
+                mock.patch.object(restore, "_cleanup_owned_miss", side_effect=inspect_cleanup) as cleaned, \
+                mock.patch.object(restore, "install") as install:
+            entry = self.invoke()
+        cleaned.assert_called_once()
+        install.assert_not_called()
+        self.assertEqual(entry["phase"], "failed")
+        self.assertEqual(entry["cleanup"]["status"], "removed")
+        self.assertFalse((self.cache / ".lock").exists())
+        self.assertEqual(json.loads((self.work / restore.REPORT).read_text()), entry)
+
+    def test_interrupted_counting_leaves_early_report_with_ninja_headers(self):
+        with mock.patch.object(restore, "donor_counts", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.invoke()
+        report = json.loads((self.work / restore.REPORT).read_text())
+        self.assertEqual(report["phase"], "failed")
+        self.assertEqual(report["failed_phase"], "donor_counts")
+        self.assertIn("header_hex", report["ninja_state"][".ninja_log"])
+        self.assertEqual(report["cleanup"]["status"], "preserved")
+        self.assertTrue(self.donor.exists())
+        self.assertFalse((self.cache / ".lock").exists())
+
+    def test_early_reports_reject_a_report_link_appearing_during_validation(self):
+        outside = Path(self.tmp.name) / "outside-report"
+        outside.write_text("unowned")
+        original = restore.source_args
+
+        def linked_report(src, identity):
+            report = self.work / restore.REPORT
+            report.unlink()
+            report.symlink_to(outside)
+            return original(src, identity)
+
+        with mock.patch.object(restore, "source_args", side_effect=linked_report), \
+                mock.patch.object(restore, "donor_counts") as counts, \
+                mock.patch.object(restore, "install") as install:
+            with self.assertRaisesRegex(restore.LocalError, "diagnostic report is symlinked"):
+                self.invoke()
+        counts.assert_not_called()
+        install.assert_not_called()
+        self.assertEqual(outside.read_text(), "unowned")
+        self.assertTrue(self.donor.exists())
+        self.assertFalse((self.cache / ".lock").exists())
+
+    def test_mutating_input_rejects_restore_without_installing_a_plan(self):
+        out = self.donor / "out/Default"
+        source = self.donor / "chrome/source.cc"
+        recorded = 1_700_000_000_123_456_789
+        floor = recorded // 10**9 * 10**9
+        os.utime(source, ns=(floor - 10**9,) * 2)
+        os.utime(out / "obj/output.o", ns=(floor,) * 2)
+        write_ninja_metadata(out, [("obj/output.o", recorded, recorded, ["../../chrome/source.cc"])])
+        fresh = restore.objects.input_is_fresh
+
+        def mutate(mtime, record):
+            source.write_text("changed during planning")
+            return fresh(mtime, record)
+
+        with mock.patch.object(restore.objects, "input_is_fresh", side_effect=mutate), \
+                mock.patch.object(restore, "install") as install:
+            entry = self.invoke()
+        install.assert_not_called()
+        self.assertEqual(entry["status"], "miss")
+        self.assertEqual(entry["failed_phase"], "ninja_mtime_plan")
+        self.assertIn("input changed during timestamp planning", entry["reasons"][0])
+        self.assertFalse((self.work / "src").exists())
+
+    def test_end_pass_io_error_preserves_donor_and_verified_fetch_receipt(self):
+        self.timestamp_outputs()
+        before = self.donor_snapshot()
+        result_path = self.cache / "result.json"
+        receipt = (result_path.read_bytes(), result_path.stat().st_mtime_ns)
+        relative = restore.objects.relative_path
+        attempts = 0
+
+        def fail_revalidation(value, *args, **kwargs):
+            nonlocal attempts
+            if value == "../../chrome/source.cc":
+                attempts += 1
+                if attempts == 2:
+                    raise OSError(errno.EIO, "one-shot end-pass input failure")
+            return relative(value, *args, **kwargs)
+
+        with mock.patch.object(restore.objects, "relative_path", side_effect=fail_revalidation), \
+                mock.patch.object(restore, "install") as install, \
+                mock.patch.object(restore, "_cleanup_owned_miss") as cleanup, \
+                mock.patch.object(restore.shutil, "rmtree") as remove:
+            entry = self.invoke()
+        self.assertEqual(attempts, 2)
+        install.assert_not_called()
+        cleanup.assert_not_called()
+        remove.assert_not_called()
+        self.assertEqual(entry["status"], "miss")
+        self.assertEqual(entry["failed_phase"], "ninja_mtime_plan")
+        self.assertEqual(entry["cleanup"]["status"], "preserved")
+        self.assertIn("one-shot end-pass input failure", entry["reasons"][0])
+        self.assertEqual(self.donor_snapshot(), before)
+        self.assertEqual((result_path.read_bytes(), result_path.stat().st_mtime_ns), receipt)
+        self.assertFalse((self.work / "src").exists())
+        self.assertFalse((self.cache / ".lock").exists())
+        self.assertEqual(self.invoke()["status"], "hit")
 
     def test_all_five_manifest_targets_restore(self):
         for platform, arch in (("linux", "x64"), ("linux", "arm64"),
@@ -759,6 +967,171 @@ class RestoreUpstreamCacheTest(unittest.TestCase):
         self.assertEqual((self.donor / "out/Default/.ninja_deps").read_bytes(), before)
         self.assertFalse((self.work / "src").exists())
 
+    def test_install_exceptions_and_interruptions_restore_donor_bytes_mtimes_and_receipt(self):
+        for failure_type in (RuntimeError, KeyboardInterrupt):
+            for point in ("after_move", "partial_repair", "after_marker", "after_publish"):
+                with self.subTest(failure=failure_type.__name__, point=point):
+                    self.make_cache()
+                    recorded, floor = self.timestamp_outputs()
+                    before = self.donor_snapshot()
+                    root_mtime = self.donor.stat().st_mtime_ns
+                    result_path = self.cache / "result.json"
+                    receipt = (result_path.read_bytes(), result_path.stat().st_mtime_ns)
+                    failure = failure_type("fixture install failure")
+                    move, utime = shutil.move, os.utime
+                    write_json, rename = restore.importer.write_json, os.rename
+                    injected = False
+
+                    def moved(source, destination, **kwargs):
+                        result = move(source, destination, **kwargs)
+                        if point == "after_move":
+                            raise failure
+                        return result
+
+                    def repaired(path, *args, **kwargs):
+                        nonlocal injected
+                        if point == "partial_repair" and Path(path).name == "second.o" and not injected:
+                            injected = True
+                            first = Path(path).with_name("output.o")
+                            self.assertEqual(first.stat().st_mtime_ns, recorded)
+                            raise failure
+                        return utime(path, *args, **kwargs)
+
+                    def marked(path, value):
+                        write_json(path, value)
+                        if point == "after_marker" and path.name == restore.MARKER:
+                            raise failure
+
+                    def published(source, destination):
+                        rename(source, destination)
+                        if point == "after_publish" and Path(destination) == self.work / "src":
+                            raise failure
+
+                    with mock.patch.object(restore.shutil, "move", side_effect=moved), \
+                            mock.patch.object(restore.os, "utime", side_effect=repaired), \
+                            mock.patch.object(restore.importer, "write_json", side_effect=marked), \
+                            mock.patch.object(restore.os, "rename", side_effect=published):
+                        if failure_type is KeyboardInterrupt:
+                            with self.assertRaises(KeyboardInterrupt) as caught:
+                                self.invoke()
+                            self.assertIs(caught.exception, failure)
+                        else:
+                            self.assertEqual(self.invoke()["status"], "miss")
+                    self.assertTrue(self.donor.is_dir())
+                    self.assertEqual(self.donor_snapshot(), before)
+                    self.assertEqual(self.donor.stat().st_mtime_ns, root_mtime)
+                    self.assertEqual((result_path.read_bytes(), result_path.stat().st_mtime_ns), receipt)
+                    self.assertFalse((self.work / "src").exists())
+                    self.assertFalse((self.cache / ".lock").exists())
+                    self.assertEqual(list(self.work.glob(".chromix-upstream-restore-*")), [])
+                    report = json.loads((self.work / restore.REPORT).read_text())
+                    self.assertEqual(report["failed_phase"], "install")
+                    self.assertEqual(report["cleanup"]["status"], "preserved")
+                    self.assertNotIn("preserved_source", report)
+
+    def test_install_rollback_failure_preserves_staging_and_reports_its_location(self):
+        cases = ((RuntimeError, OSError), (RuntimeError, RuntimeError),
+                 (RuntimeError, KeyboardInterrupt), (KeyboardInterrupt, OSError))
+        for failure_type, rollback_type in cases:
+            with self.subTest(failure=failure_type.__name__, rollback=rollback_type.__name__):
+                self.make_cache()
+                self.timestamp_outputs()
+                before = self.donor_snapshot()
+                result_path = self.cache / "result.json"
+                receipt = (result_path.read_bytes(), result_path.stat().st_mtime_ns)
+                failure = failure_type("fixture installation interrupted")
+                rollback_error = rollback_type("fixture rollback rename failed")
+                write_json, rename = restore.importer.write_json, os.rename
+
+                def marked(path, value):
+                    write_json(path, value)
+                    if path.name == restore.MARKER:
+                        raise failure
+
+                def fail_return(source, destination):
+                    if Path(destination) == self.donor:
+                        raise rollback_error
+                    return rename(source, destination)
+
+                expected = KeyboardInterrupt if KeyboardInterrupt in (failure_type, rollback_type) else restore.LocalError
+                with mock.patch.object(restore.importer, "write_json", side_effect=marked), \
+                        mock.patch.object(restore.os, "rename", side_effect=fail_return), \
+                        mock.patch.object(restore.shutil, "rmtree", wraps=shutil.rmtree) as remove:
+                    with self.assertRaises(expected) as caught:
+                        self.invoke()
+                remove.assert_not_called()
+                if failure_type is KeyboardInterrupt:
+                    self.assertIs(caught.exception, failure)
+                elif rollback_type is KeyboardInterrupt:
+                    self.assertIs(caught.exception, rollback_error)
+                staged = Path(caught.exception.preserved_source)
+                self.assertTrue(staged.is_dir())
+                self.assertEqual(staged.name, "src")
+                self.assertTrue(staged.parent.name.startswith(".chromix-upstream-restore-"))
+                self.assertFalse(self.donor.exists())
+                self.assertFalse((self.work / "src").exists())
+                self.assertFalse((self.cache / ".lock").exists())
+                self.assertEqual({path.relative_to(staged): (path.read_bytes(), path.stat().st_mtime_ns)
+                                  for path in staged.rglob("*") if path.is_file()}, before)
+                self.assertEqual((result_path.read_bytes(), result_path.stat().st_mtime_ns), receipt)
+                report = json.loads((self.work / restore.REPORT).read_text())
+                self.assertEqual(report["cleanup"]["status"], "preserved")
+                self.assertEqual(report["cleanup"]["path"], str(staged))
+                self.assertEqual(report["preserved_source"], str(staged))
+                self.assertNotIn("donor retained", report["cleanup"]["reason"])
+                shutil.rmtree(staged.parent)
+
+    def test_linked_donor_cannot_hide_the_only_staged_source_copy(self):
+        self.timestamp_outputs()
+        before = self.donor_snapshot()
+        receipt = (self.cache / "result.json").read_bytes()
+
+        def occupied(staged, plan, journal):
+            self.donor.symlink_to(staged, target_is_directory=True)
+            raise OSError("fixture apply failure with linked donor")
+
+        with mock.patch.object(restore, "apply_mtime_plan", side_effect=occupied), \
+                mock.patch.object(restore.shutil, "rmtree", wraps=shutil.rmtree) as remove:
+            with self.assertRaises(restore.LocalError) as caught:
+                self.invoke()
+        remove.assert_not_called()
+        staged = Path(caught.exception.preserved_source)
+        self.assertTrue(staged.is_dir())
+        self.assertTrue(self.donor.is_symlink())
+        self.assertEqual(self.donor.resolve(), staged)
+        self.assertEqual({path.relative_to(staged): (path.read_bytes(), path.stat().st_mtime_ns)
+                          for path in staged.rglob("*") if path.is_file()}, before)
+        self.assertEqual((self.cache / "result.json").read_bytes(), receipt)
+        self.assertFalse((self.work / "src").exists())
+        report = json.loads((self.work / restore.REPORT).read_text())
+        self.assertEqual(report["cleanup"]["path"], str(staged))
+        self.assertNotIn("donor retained", report["cleanup"]["reason"])
+        self.assertFalse((self.cache / ".lock").exists())
+
+    def test_interrupt_after_rollback_rename_reports_the_real_donor_path(self):
+        self.timestamp_outputs()
+        before = self.donor_snapshot()
+        receipt = (self.cache / "result.json").read_bytes()
+        rename = os.rename
+
+        def returned(source, destination):
+            rename(source, destination)
+            if Path(destination) == self.donor:
+                raise KeyboardInterrupt("fixture signal after rollback rename")
+
+        with mock.patch.object(restore, "apply_mtime_plan", side_effect=RuntimeError("fixture failure")), \
+                mock.patch.object(restore.os, "rename", side_effect=returned):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                self.invoke()
+        self.assertEqual(caught.exception.preserved_source, str(self.donor))
+        self.assertEqual(self.donor_snapshot(), before)
+        self.assertEqual((self.cache / "result.json").read_bytes(), receipt)
+        self.assertFalse((self.work / "src").exists())
+        report = json.loads((self.work / restore.REPORT).read_text())
+        self.assertEqual(report["cleanup"]["path"], str(self.donor))
+        self.assertEqual(report["preserved_source"], str(self.donor))
+        self.assertFalse((self.cache / ".lock").exists())
+
     def test_destination_appearing_during_restore_is_preserved(self):
         move = shutil.move
 
@@ -880,7 +1253,7 @@ class NinjaTimestampTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.src = Path(self.tmp.name)
+        self.src = Path(self.tmp.name).resolve()
         self.out = self.src / "out/Default"
         (self.out / "obj").mkdir(parents=True)
         self.output = self.out / "obj/a.o"
@@ -894,16 +1267,299 @@ class NinjaTimestampTest(unittest.TestCase):
         self.metadata()
 
     def metadata(self, output="obj/a.o", dependency="../../a.cc", logged=None, version=5):
-        raw = bytearray(b"# ninjadeps\n\x04\x00\x00\x00")
-        for index, name in enumerate((output, dependency)):
-            name = name.encode()
-            payload = name + b"\0" * ((-len(name)) % 4) + struct.pack("<I", ~index & 0xffffffff)
-            raw += struct.pack("<I", len(payload)) + payload
-        record = struct.pack("<4I", 0, self.recorded & 0xffffffff, self.recorded >> 32, 1)
-        raw += struct.pack("<I", 0x80000000 | len(record)) + record
-        (self.out / ".ninja_deps").write_bytes(raw)
-        (self.out / ".ninja_log").write_text(
-            f"# ninja log v{version}\n0\t1\t{logged or self.recorded}\t{output}\t123456789abcdef0\n")
+        write_ninja_metadata(self.out, [(output, self.recorded, logged or self.recorded, [dependency])],
+                             version=version)
+
+    def shared_metadata(self, dependencies=None, logged=None):
+        dependencies = dependencies or ["../../a.cc"] * 8
+        recorded = self.recorded
+        logs = logged or [recorded] * 3
+        records = []
+        for index, timestamp in enumerate(logs):
+            name = f"obj/shared-{index}.o"
+            path = self.out / name
+            path.write_bytes(b"object")
+            os.utime(path, ns=(self.floor, self.floor))
+            records.append((name, recorded, timestamp, dependencies))
+        write_ninja_metadata(self.out, records, version=6)
+        return [self.out / name for name, _, _, _ in records]
+
+    def test_shared_inputs_are_validated_twice_per_original_name_not_per_edge(self):
+        names = ["../../a.cc", "../.././a.cc"]
+        self.shared_metadata(names * 8)
+        with mock.patch.object(restore.objects, "relative_path", wraps=restore.objects.relative_path) as relative, \
+                mock.patch.object(restore, "safe_path", wraps=restore.safe_path) as safe:
+            plan = restore.ninja_mtime_plan(self.src)
+        self.assertEqual(plan["outputs_restored"], 3)
+        inputs = Counter(call.args[0] for call in relative.call_args_list if not call.kwargs.get("output"))
+        self.assertEqual(inputs, {name: 2 for name in names})
+        self.assertEqual(sum(call.args == (self.src, Path("a.cc")) for call in safe.call_args_list), 4)
+
+    def test_shared_input_freshness_is_checked_for_each_output_and_each_call(self):
+        for logs in ([self.recorded, self.recorded - 10**9, self.recorded],
+                     [self.recorded - 10**9, self.recorded, self.recorded]):
+            with self.subTest(logs=logs):
+                self.shared_metadata(logged=logs)
+                plan = restore.ninja_mtime_plan(self.src)
+                self.assertEqual(plan["outputs_restored"], 2)
+                self.assertEqual(plan["skipped"], {"recorded input is newer or same-second ambiguous": 1})
+        os.utime(self.input, ns=(self.floor, self.floor))
+        self.assertEqual(restore.ninja_mtime_plan(self.src)["outputs_restored"], 0)
+        os.utime(self.input, ns=(self.floor - 2 * 10**9, self.floor - 2 * 10**9))
+        self.assertEqual(restore.ninja_mtime_plan(self.src)["outputs_restored"], 3)
+
+    def test_failed_input_checks_are_not_cached(self):
+        self.shared_metadata(["../../a.cc"])
+        relative = restore.objects.relative_path
+        attempts = 0
+
+        def transient(value, *args, **kwargs):
+            nonlocal attempts
+            if value == "../../a.cc":
+                attempts += 1
+                if attempts == 1:
+                    raise OSError("transient input failure")
+            return relative(value, *args, **kwargs)
+
+        with mock.patch.object(restore.objects, "relative_path", side_effect=transient):
+            plan = restore.ninja_mtime_plan(self.src)
+        self.assertEqual(attempts, 3)
+        self.assertEqual(plan["outputs_restored"], 2)
+        self.assertEqual(plan["skipped"], {"transient input failure": 1})
+
+    def test_source_modified_during_planning_aborts_before_any_repair(self):
+        outputs = self.shared_metadata()
+        fresh = restore.objects.input_is_fresh
+        changed = False
+
+        def mutate(mtime, record):
+            nonlocal changed
+            if not changed:
+                changed = True
+                self.input.write_bytes(b"changed source")
+                os.utime(self.input, ns=(mtime, mtime))
+            return fresh(mtime, record)
+
+        with mock.patch.object(restore.objects, "input_is_fresh", side_effect=mutate), \
+                mock.patch.object(restore, "apply_mtime_plan") as apply:
+            with self.assertRaisesRegex(restore.Miss, "input changed during timestamp planning"):
+                restore.restore_ninja_output_mtimes(self.src)
+        apply.assert_not_called()
+        self.assertTrue(all(path.stat().st_mtime_ns == self.floor for path in outputs))
+
+    def test_cached_input_disappearance_or_io_error_rejects_the_whole_plan(self):
+        self.shared_metadata()
+        relative = restore.objects.relative_path
+        for error in (FileNotFoundError("removed input"), OSError("unreadable input"),
+                      RuntimeError("cyclic input")):
+            with self.subTest(error=error):
+                attempts = 0
+
+                def fail_revalidation(value, *args, **kwargs):
+                    nonlocal attempts
+                    if value == "../../a.cc":
+                        attempts += 1
+                        if attempts == 2:
+                            raise error
+                    return relative(value, *args, **kwargs)
+
+                expected = type(error) if isinstance(error, OSError) else restore.Miss
+                with mock.patch.object(restore.objects, "relative_path", side_effect=fail_revalidation), \
+                        mock.patch.object(restore, "apply_mtime_plan") as apply:
+                    with self.assertRaises(expected) as caught:
+                        restore.restore_ninja_output_mtimes(self.src)
+                if isinstance(error, OSError):
+                    self.assertIs(caught.exception, error)
+                else:
+                    self.assertIn("input changed during timestamp planning", str(caught.exception))
+                apply.assert_not_called()
+                self.assertEqual(attempts, 2)
+
+    def test_revalidation_compares_every_stat_identity_field(self):
+        self.shared_metadata()
+        fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns", "st_nlink")
+        original_stat = Path.stat
+        fresh = restore.objects.input_is_fresh
+        for field in fields:
+            with self.subTest(field=field):
+                revalidating = False
+                changed_calls = 0
+
+                def mark_cached(mtime, record):
+                    nonlocal revalidating
+                    revalidating = True
+                    return fresh(mtime, record)
+
+                def changed_stat(path, *args, **kwargs):
+                    nonlocal changed_calls
+                    info = original_stat(path, *args, **kwargs)
+                    if revalidating and path == self.input and kwargs.get("follow_symlinks", True):
+                        changed_calls += 1
+                        values = {name: getattr(info, name) for name in fields}
+                        values[field] += 1
+                        return SimpleNamespace(**values)
+                    return info
+
+                with mock.patch.object(Path, "stat", changed_stat), \
+                        mock.patch.object(restore.objects, "input_is_fresh", side_effect=mark_cached):
+                    with self.assertRaisesRegex(restore.Miss, "input changed during timestamp planning"):
+                        restore.ninja_mtime_plan(self.src)
+                self.assertGreater(changed_calls, 0)
+
+    def test_input_links_are_rejected_before_caching_and_on_revalidation(self):
+        alias = self.src / "alias"
+        for target, directory in ((self.input, False), (self.src, True),
+                                  (self.src.parent, True), (self.src / "absent", False)):
+            with self.subTest(target=target):
+                alias.symlink_to(target, target_is_directory=directory)
+                dependency = "../../alias/a.cc" if directory else "../../alias"
+                self.shared_metadata([dependency])
+                with mock.patch.object(restore.objects, "relative_path",
+                                       wraps=restore.objects.relative_path) as relative:
+                    plan = restore.ninja_mtime_plan(self.src)
+                self.assertEqual(plan["outputs_restored"], 0)
+                self.assertEqual(sum(call.args[0] == dependency for call in relative.call_args_list), 3)
+                alias.unlink()
+        saved = self.src / "saved.cc"
+        self.shared_metadata()
+        fresh = restore.objects.input_is_fresh
+        for target in (saved, self.src.parent / "outside.cc"):
+            with self.subTest(replacement=target):
+                changed = False
+
+                def replace_input(mtime, record):
+                    nonlocal changed
+                    if not changed:
+                        changed = True
+                        self.input.rename(saved)
+                        self.input.symlink_to(target)
+                    return fresh(mtime, record)
+
+                with mock.patch.object(restore.objects, "input_is_fresh", side_effect=replace_input):
+                    with self.assertRaisesRegex(restore.Miss, "input changed during timestamp planning"):
+                        restore.ninja_mtime_plan(self.src)
+                self.input.unlink()
+                saved.rename(self.input)
+
+    def test_input_junction_checks_apply_initially_and_during_revalidation(self):
+        self.shared_metadata()
+        for delayed in (False, True):
+            with self.subTest(delayed=delayed):
+                became_linked = not delayed
+                fresh = restore.objects.input_is_fresh
+
+                def junction(path):
+                    return path == self.input and became_linked
+
+                def mutate(mtime, record):
+                    nonlocal became_linked
+                    became_linked = True
+                    return fresh(mtime, record)
+
+                with mock.patch.object(Path, "is_junction", junction, create=True), \
+                        mock.patch.object(restore.objects, "input_is_fresh", side_effect=mutate):
+                    if delayed:
+                        with self.assertRaisesRegex(restore.Miss, "input changed during timestamp planning"):
+                            restore.ninja_mtime_plan(self.src)
+                    else:
+                        plan = restore.ninja_mtime_plan(self.src)
+                        self.assertEqual(plan["outputs_restored"], 0)
+                        self.assertEqual(sum(plan["skipped"].values()), 3)
+
+    @unittest.skipUnless(os.name == "nt" and hasattr(Path, "is_junction"), "native Windows junction required")
+    def test_native_input_directory_junction_is_rejected(self):
+        target = self.src / "headers"
+        target.mkdir()
+        (target / "a.cc").write_bytes(b"source")
+        alias = self.src / "junction"
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(alias), str(target)],
+                       check=True, capture_output=True)
+        try:
+            self.shared_metadata(["../../junction/a.cc"])
+            self.assertEqual(restore.ninja_mtime_plan(self.src)["outputs_restored"], 0)
+        finally:
+            alias.rmdir()
+
+    def test_generated_input_also_output_is_revalidated_before_repairs(self):
+        generated = self.out / "gen/shared.h"
+        generated.parent.mkdir()
+        generated.write_bytes(b"generated")
+        os.utime(generated, ns=(self.floor - 10**9, self.floor - 10**9))
+        os.utime(self.input, ns=(self.floor - 2 * 10**9, self.floor - 2 * 10**9))
+        records = [("gen/shared.h", self.recorded - 10**9, self.recorded - 10**9, ["../../a.cc"]),
+                   ("obj/a.o", self.recorded, self.recorded, ["gen/shared.h", "../../a.cc"])]
+        write_ninja_metadata(self.out, records)
+        before = [(path, path.read_bytes(), path.stat().st_mtime_ns)
+                  for path in (self.input, self.out / ".ninja_log", self.out / ".ninja_deps")]
+        plan = restore.ninja_mtime_plan(self.src)
+        self.assertEqual(plan["outputs_restored"], 2)
+        self.assertEqual(generated.stat().st_mtime_ns, self.floor - 10**9)
+        self.assertEqual(restore.restore_ninja_output_mtimes(self.src), plan)
+        self.assertEqual(generated.stat().st_mtime_ns, self.recorded - 10**9)
+        self.assertEqual(self.output.stat().st_mtime_ns, self.recorded)
+        for path, content, mtime in before:
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), (content, mtime))
+
+    def test_apply_failure_rolls_back_already_repaired_outputs(self):
+        original_utime = os.utime
+        for failure_type in (OSError, RuntimeError, KeyboardInterrupt):
+            with self.subTest(failure=failure_type.__name__):
+                outputs = self.shared_metadata()
+                marker = self.src / restore.MARKER
+                marker.write_bytes(b"existing receipt")
+                paths = [*outputs, self.input, self.out / ".ninja_log", self.out / ".ninja_deps", marker]
+                before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+                failure = failure_type("fixture timestamp failure")
+                failed = False
+
+                def fail_second(path, *args, **kwargs):
+                    nonlocal failed
+                    if Path(path) == outputs[1] and not failed:
+                        failed = True
+                        self.assertEqual(outputs[0].stat().st_mtime_ns, self.recorded)
+                        raise failure
+                    return original_utime(path, *args, **kwargs)
+
+                with mock.patch.object(restore.os, "utime", side_effect=fail_second):
+                    with self.assertRaises(failure_type) as caught:
+                        restore.restore_ninja_output_mtimes(self.src)
+                self.assertIs(caught.exception, failure)
+                self.assertTrue(failed)
+                self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
+
+    def test_standalone_rollback_failure_preserves_source_and_interrupt(self):
+        original_utime = os.utime
+        for failure_type in (RuntimeError, KeyboardInterrupt):
+            with self.subTest(failure=failure_type.__name__):
+                outputs = self.shared_metadata()
+                marker = self.src / restore.MARKER
+                marker.write_bytes(b"existing receipt")
+                paths = [*outputs, self.input, self.out / ".ninja_log", self.out / ".ninja_deps", marker]
+                before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+                failure = failure_type("fixture timestamp interruption")
+                failed = False
+
+                def fail_apply_and_rollback(path, *args, **kwargs):
+                    nonlocal failed
+                    if Path(path) == outputs[1]:
+                        if not failed:
+                            failed = True
+                            raise failure
+                        raise OSError("fixture rollback utime failed")
+                    return original_utime(path, *args, **kwargs)
+
+                expected = KeyboardInterrupt if failure_type is KeyboardInterrupt else restore.LocalError
+                with mock.patch.object(restore.os, "utime", side_effect=fail_apply_and_rollback):
+                    with self.assertRaises(expected) as caught:
+                        restore.restore_ninja_output_mtimes(self.src)
+                if failure_type is KeyboardInterrupt:
+                    self.assertIs(caught.exception, failure)
+                self.assertEqual(caught.exception.preserved_source, str(self.src))
+                self.assertEqual(outputs[0].stat().st_mtime_ns, self.recorded)
+                for path in paths:
+                    self.assertEqual(path.read_bytes(), before[path][0])
+                    if path != outputs[0]:
+                        self.assertEqual(path.stat().st_mtime_ns, before[path][1])
 
     def test_exact_floor_only_and_hash_deps_input_unchanged(self):
         before = [(p, p.read_bytes(), p.stat().st_mtime_ns)

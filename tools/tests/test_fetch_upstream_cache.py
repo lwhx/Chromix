@@ -275,6 +275,70 @@ class FetchUpstreamCacheTest(unittest.TestCase):
                 cache.CacheMiss, "download_timeout"):
             client.download(pin, path)
 
+    def test_long_download_uses_full_budget_and_preserves_timeout_evidence(self):
+        data = b"fixture" * 10
+        pin = copy.deepcopy(self.pin)
+        pin["artifact"].update(digest=digest(data), size_in_bytes=len(data))
+        path = self.root / "long-download"
+        client = cache.GitHub("")
+        client.open = mock.Mock(return_value=Response(data))
+        with mock.patch.object(cache.time, "monotonic", side_effect=[0, 1, 901, 1000]):
+            self.assertEqual(client.download(pin, path), len(data))
+        self.assertEqual(cache.sha256(path), digest(data))
+        client.open = mock.Mock(return_value=Response(data))
+        with mock.patch.object(cache.time, "monotonic", side_effect=[0, 1, 2699, 2701]), \
+                self.assertRaisesRegex(cache.CacheMiss, "download_timeout") as failed:
+            client.download(pin, path)
+        self.assertEqual(failed.exception.details, {
+            "download_partial_bytes": len(data), "download_expected_bytes": len(data),
+            "download_timeout_seconds": 2700,
+        })
+
+    def test_download_retries_share_a_single_deadline(self):
+        data = b"fixture"
+        pin = copy.deepcopy(self.pin)
+        pin["artifact"].update(digest=digest(data), size_in_bytes=len(data))
+        client = cache.GitHub("")
+        client.open = mock.Mock(return_value=Response(data[:2]))
+        with mock.patch.object(cache.time, "sleep"), \
+                mock.patch.object(cache.time, "monotonic", side_effect=[0, 1, 2, 3, 2701]), \
+                self.assertRaisesRegex(cache.CacheMiss, "download_timeout") as failed:
+            client.download(pin, self.root / "retry-download")
+        self.assertEqual(client.open.call_count, 1)
+        self.assertEqual(failed.exception.details["download_partial_bytes"], 2)
+
+    def test_failed_retry_connection_preserves_prior_partial_byte_count(self):
+        data = b"fixture"
+        pin = copy.deepcopy(self.pin)
+        pin["artifact"].update(digest=digest(data), size_in_bytes=len(data))
+        path = self.root / "failed-retry-download"
+        client = cache.GitHub("")
+        client.open = mock.Mock(side_effect=[Response(data[:2]), TimeoutError("connect timeout")])
+        with mock.patch.object(cache.time, "sleep"), \
+                mock.patch.object(cache.time, "monotonic", side_effect=[0, 1, 2, 3, 4, 2701]), \
+                self.assertRaisesRegex(cache.CacheMiss, "download_timeout") as failed:
+            client.download(pin, path)
+        self.assertEqual(client.open.call_count, 2)
+        self.assertEqual(path.read_bytes(), data[:2])
+        self.assertEqual(failed.exception.details["download_partial_bytes"], 2)
+
+    def test_fetch_retains_partial_download_evidence_after_cleanup(self):
+        client = self.fixture_client()
+        details = {"download_partial_bytes": 2, "download_expected_bytes": 7,
+                   "download_timeout_seconds": 2700}
+        def download(pin, path):
+            path.write_bytes(b"fi")
+            raise cache.CacheMiss("download_timeout", details=details)
+        client.download = mock.Mock(side_effect=download)
+        result = cache.fetch("windows", "x64", self.destination, root=self.root, client=client)
+        self.assertEqual(result["status"], "miss")
+        self.assertEqual(result["reason"], "download_timeout")
+        self.assertEqual(result["phase"], "download")
+        self.assertEqual(result["download_bytes"], 0)
+        self.assertEqual({key: result[key] for key in details}, details)
+        self.assertEqual({path.name for path in self.destination.iterdir()}, {"result.json"})
+        self.assertEqual(json.loads((self.destination / "result.json").read_text()), result)
+
     def test_bad_hash_never_opens_archive(self):
         client = self.fixture_client()
         client.open = mock.Mock(return_value=Response(b"corrupt"))
@@ -1070,7 +1134,7 @@ class FetchUpstreamCacheTest(unittest.TestCase):
                 cache.CacheMiss, "archive_too_large"):
             extractor.add("src/tools/rust/update.py", "file", 3, 0o644, MTIME, io.BytesIO(b"abc"))
         self.assertEqual(cache.MAX_SELECTED, 30 * 1024**3)
-        self.assertEqual(cache.DOWNLOAD_SECONDS, 15 * 60)
+        self.assertEqual(cache.DOWNLOAD_SECONDS, 45 * 60)
 
     def test_source_selection_uses_full_limit_and_disk_headroom(self):
         for platform in ("linux", "macos", "windows"):

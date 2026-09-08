@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import hashlib
 import os
 from pathlib import Path
 import platform
-import shlex
 import struct
 import subprocess
 import sys
+import tempfile
 
 LIBRARY_DIRS = (
     "third_party/llvm-build/Release+Asserts/lib",
@@ -18,6 +20,28 @@ LIBRARY_DIRS = (
 )
 TRIPLES = {"arm64": "aarch64-apple-darwin", "x64": "x86_64-apple-darwin"}
 CPUS = {"arm64": 0x100000C, "x64": 0x1000007}
+BINDGEN_WRAPPER = "build/rust/gni_impl/run_bindgen.py"
+BINDGEN_ORIGINAL_SHA256 = "53c0e089ad4cef4f718faccccbc3a139a38eca97773e0530b8b4f989010b5a82"
+BINDGEN_PATCHED_SHA256 = "2d33e7077b2472aa701d503d4cfa5df6470e4d5a22377f8dbf59f4df1e840143"
+BINDGEN_ORIGINAL_ENV = b'''    env = os.environ
+    if args.ld_library_path:
+      if sys.platform == 'darwin':
+        env["DYLD_LIBRARY_PATH"] = args.ld_library_path
+'''
+BINDGEN_SCOPED_ENV = b'''    env = os.environ.copy()
+    if sys.platform == 'darwin':
+      env = {key: value for key, value in env.items()
+             if not key.startswith('DYLD_')}
+    if args.ld_library_path:
+      if sys.platform == 'darwin':
+        # Expose libclang without overriding the system C++ runtime.
+        library_path = stack.enter_context(
+            tempfile.TemporaryDirectory(prefix='chromix-bindgen-'))
+        os.symlink(os.path.realpath(os.path.join(args.ld_library_path,
+                                                'libclang.dylib')),
+                   os.path.join(library_path, 'libclang.dylib'))
+        env["DYLD_LIBRARY_PATH"] = library_path
+'''
 
 
 def _source_root(src: Path, arch: str) -> Path:
@@ -64,23 +88,52 @@ def _native(path: Path, arch: str) -> bool:
 
 
 def runtime_environment(src: Path, arch: str, environ=None) -> dict[str, str]:
-    """Return a probe/build environment; never mutate the source or caller's env."""
+    """Return a clean probe/build environment without advertising toolchain libs."""
+    _source_root(src, arch)
+    return {key: value for key, value in (os.environ if environ is None else environ).items()
+            if not key.startswith("DYLD_")}
+
+
+@contextmanager
+def bindgen_environment(src: Path, arch: str, environ=None):
+    """Expose only native libclang for the lifetime of a bindgen child."""
     root = _source_root(src, arch)
-    directories = []
-    for relative in LIBRARY_DIRS:
-        directory = _inside(root, root / relative)
-        if not directory.is_dir():
+    env = runtime_environment(root, arch, environ)
+    for relative in (LIBRARY_DIRS[1], LIBRARY_DIRS[0]):
+        library = _inside(root, root / relative / "libclang.dylib")
+        if not _native(library, arch):
             continue
-        libraries = [_inside(root, path) for path in sorted(directory.glob("*.dylib"))]
-        if libraries and all(_native(path, arch) for path in libraries):
-            if str(directory) not in directories:
-                directories.append(str(directory))
-    # Do not inherit loader overrides, fallback paths, or injection settings.
-    env = {key: value for key, value in (os.environ if environ is None else environ).items()
-           if not key.startswith("DYLD_")}
-    if directories:
-        env["DYLD_LIBRARY_PATH"] = ":".join(directories)
-    return env
+        with tempfile.TemporaryDirectory(prefix="chromix-bindgen-") as directory:
+            view = Path(directory).resolve()
+            if any(c in str(view) for c in (":", "\n", "\r", "\0")):
+                raise ValueError(f"unsafe macOS libclang view: {view}")
+            (view / "libclang.dylib").symlink_to(library)
+            env["DYLD_LIBRARY_PATH"] = str(view)
+            yield env
+        return
+    yield env
+
+
+def repair_bindgen_wrapper(src: Path, arch: str) -> None:
+    """Repair only the pinned wrapper, accepting its exact patched state on resume."""
+    root = _source_root(src, arch)
+    path = root / BINDGEN_WRAPPER
+    _inside(root, path)
+    if any(parent.is_symlink() for parent in (path, *path.parents)):
+        raise ValueError(f"linked bindgen wrapper: {path}")
+    original = path.read_bytes()
+    digest = hashlib.sha256(original).hexdigest()
+    if digest == BINDGEN_PATCHED_SHA256:
+        return
+    if digest != BINDGEN_ORIGINAL_SHA256:
+        raise ValueError(f"unknown bindgen wrapper SHA256: {digest}")
+    if original.count(BINDGEN_ORIGINAL_ENV) != 1 or original.count(b"import sys\n") != 1:
+        raise ValueError("pinned bindgen wrapper block mismatch")
+    patched = original.replace(b"import sys\n", b"import sys\nimport tempfile\n")
+    patched = patched.replace(BINDGEN_ORIGINAL_ENV, BINDGEN_SCOPED_ENV)
+    if hashlib.sha256(patched).hexdigest() != BINDGEN_PATCHED_SHA256:
+        raise ValueError("patched bindgen wrapper SHA256 mismatch")
+    path.write_bytes(patched)
 
 
 def _loader_paths(root: Path, arch: str) -> tuple[Path, Path, Path]:
@@ -143,18 +196,18 @@ def main(argv=None) -> int:
     parser.add_argument("--arch", choices=tuple(TRIPLES), required=True)
     parser.add_argument("--prepare-loader", action="store_true")
     parser.add_argument("--verify-loader", action="store_true")
+    parser.add_argument("--repair-bindgen-wrapper", action="store_true")
     args = parser.parse_args(argv)
     try:
-        env = runtime_environment(args.src, args.arch)
+        runtime_environment(args.src, args.arch)
         if args.prepare_loader:
             prepare_runtime_loader(args.src, args.arch)
+        if args.repair_bindgen_wrapper:
+            repair_bindgen_wrapper(args.src, args.arch)
         if args.verify_loader:
             verify_runtime_loader(args.src, args.arch)
-        inherited = sorted(key for key in os.environ if key.startswith("DYLD_") and key != "DYLD_LIBRARY_PATH")
-        if inherited:
-            print("unset -- " + " ".join(shlex.quote(key) for key in inherited))
-        value = env.get("DYLD_LIBRARY_PATH")
-        print("export DYLD_LIBRARY_PATH=" + shlex.quote(value) if value else "unset DYLD_LIBRARY_PATH")
+        # Scrub in the parent shell even if SIP hid its DYLD_* from Python.
+        print('unset -- "${!DYLD_@}"')
     except (OSError, ValueError, RuntimeError) as error:
         print(f"macOS runtime preparation failed: {error}", file=sys.stderr)
         return 1

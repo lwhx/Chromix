@@ -430,15 +430,42 @@ Add-Content $env:CALL_LOG ("ninja:" + $OutDir.Replace('\', '/'))
 
     def test_required_miss_disk_shortage_and_timeout_fail_in_validation_too(self):
         for validate in (False, True):
-            for reason in ("unavailable", "insufficient_disk_space", "cache_timeout"):
+            for reason in ("unavailable", "insufficient_disk_space", "cache_timeout", "download_timeout"):
                 with self.subTest(validate=validate, reason=reason):
                     self.fixture.seed("windows", "x64", reason=reason)
                     result = self.run_stage(validate=validate)
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertIn("restore receipt missing", result.stderr)
+                    self.assertIn(f"required upstream cache fetch failed: {reason}", result.stderr)
                     self.assertEqual(json.loads((self.fixture.cache / "result.json").read_text())["reason"], reason)
-                    self.assertEqual(self.fixture.called(), ["fetch", "restore"])
+                    self.assertEqual(self.fixture.called(), ["fetch"])
+                    self.assertFalse((self.fixture.work / "src").exists())
                     self.fixture.calls.unlink()
+
+    def test_download_timeout_reports_phase_and_duration_without_attempting_restore(self):
+        self.fixture.seed("windows", "x64", reason="download_timeout")
+        report = self.fixture.cache / "result.json"
+        result = json.loads(report.read_text())
+        result.update(phase="download", duration_seconds=901.657)
+        report.write_text(json.dumps(result))
+        failed = self.run_stage(validate=True)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("required upstream cache fetch failed: download_timeout", failed.stderr)
+        self.assertIn("phase=download", failed.stderr)
+        self.assertIn("duration_seconds=901.657", failed.stderr)
+        self.assertNotIn("restore receipt missing", failed.stderr)
+        self.assertEqual(self.fixture.called(), ["fetch"])
+        self.assertFalse((self.fixture.work / "src").exists())
+
+    def test_missing_invalid_or_incomplete_fetch_report_fails_before_restore(self):
+        for content in (None, "not json", "{}", "null"):
+            with self.subTest(content=content):
+                if content is not None:
+                    self.fixture.put(self.fixture.cache / "result.json", content)
+                result = self.run_stage(validate=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.fixture.called(), ["fetch"])
+                self.assertFalse((self.fixture.work / "src").exists())
+                self.fixture.calls.unlink()
 
     def test_required_budget_and_fetch_errors_do_not_reach_prepare(self):
         for minutes, rc, calls in ((45, 0, []), (140, 124, ["fetch"]), (140, 7, ["fetch"])):
@@ -483,7 +510,7 @@ Add-Content $env:CALL_LOG ("ninja:" + $OutDir.Replace('\', '/'))
                 self.fixture.seed("windows", "x64", reason="unavailable")
                 result = self.run_stage(enabled=False, **option)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(self.fixture.called(), ["fetch", "restore"])
+                self.assertEqual(self.fixture.called(), ["fetch"])
                 self.fixture.calls.unlink()
 
 
@@ -1069,6 +1096,8 @@ function Save-Handoff { param($Mode); Add-Content -LiteralPath $env:MOCK_CALLS -
 function Invoke-Tracked {
   param($File, $ArgList, $Cwd, $TimeoutSec)
   Add-Content -LiteralPath $env:MOCK_CALLS -Value "fetch"
+  New-Item -ItemType Directory -Force -Path $UpstreamCacheDir | Out-Null
+  Set-Content -LiteralPath (Join-Path $UpstreamCacheDir "result.json") -Value '{"status":"hit"}'
   return [int]$env:MOCK_FETCH_RC
 }
 function python {

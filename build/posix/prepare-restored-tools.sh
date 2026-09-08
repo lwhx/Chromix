@@ -6,6 +6,9 @@ WORK="${1:?usage: prepare-restored-tools.sh WORKDIR linux|macos x64|arm64}"
 PLATFORM="${2:?platform is required}"
 ARCH="${3:?architecture is required}"
 case "$PLATFORM:$ARCH" in linux:x64|linux:arm64|macos:x64|macos:arm64) ;; *) exit 2 ;; esac
+if [ "$PLATFORM" = macos ]; then
+  unset -- "${!DYLD_@}"
+fi
 HOST="$(uname -m)"
 case "$HOST" in x86_64) HOST=x64 ;; aarch64) HOST=arm64 ;; esac
 SYSTEM="$(uname -s)"
@@ -76,7 +79,8 @@ if [ "$PLATFORM" = macos ]; then
     BINDGEN_NATIVE=0
   fi
   if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
-    MACOS_RUNTIME_ENV="$(python3 "$REPO/tools/macos_runtime.py" --src "$SRC" --arch "$ARCH" --prepare-loader)"
+    MACOS_RUNTIME_ENV="$(python3 "$REPO/tools/macos_runtime.py" --src "$SRC" --arch "$ARCH" \
+      --prepare-loader --repair-bindgen-wrapper)"
     eval "$MACOS_RUNTIME_ENV"
     python3 "$REPO/tools/macos_runtime.py" --src "$SRC" --arch "$ARCH" --verify-loader > /dev/null
   fi
