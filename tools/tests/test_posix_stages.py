@@ -1,9 +1,11 @@
 """Regression tests for the upstream-modeled POSIX staged CI scripts and workflow."""
+import io
 import os
 import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +18,7 @@ CI_PARTS = REPO / "build" / "posix" / "ci-parts.sh"
 GEN_WORKFLOW = REPO / "tools" / "gen_posix_workflow.py"
 WORKFLOW = REPO / ".github" / "workflows" / "build-posix-github.yml"
 MAIN_WORKFLOW = REPO / ".github" / "workflows" / "build-cross-platform.yml"
+BASH32 = Path(os.path.expanduser("~/.local/bash-3.2-for-ci/bash"))
 
 
 class PosixStageSyntaxTest(unittest.TestCase):
@@ -37,14 +40,34 @@ class PosixSnapshotRoundTripTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.work = self.root / "work"
-        (self.work / "src").mkdir(parents=True)
-        marker = self.work / "src/.chromix-source-ready"
-        marker.write_text("linux|x64|152.0.7977.82|core|platform|patchhash\n")
-        executable = self.work / "src/tool"
-        executable.write_text("#!/bin/sh\necho ok\n")
-        executable.chmod(0o755)
-        (self.work / "link-target").write_text("fixture")
+        self.fixture_files = {
+            "src/.chromix-source-ready":
+                "linux|x64|152.0.7977.82|core|platform|patchhash\n",
+            "src/.chromix-ungoogled-core": "core-commit\n",
+            "src/.chromix-ungoogled-platform": "platform-commit\n",
+            "src/.chromix-chromium-version": "152.0.7977.82\n",
+            "src/tool": "#!/bin/sh\necho ok\n",
+            "tooling/depot_tools/gclient": "tooling fixture\n",
+            "src/download_cache/keep": "not the root cache\n",
+            "tooling/handoff/custom parts/keep": "not the parts directory\n",
+            "tooling/handoff/custom [1]*?\\tail/keep": "literal nested path\n",
+            ".root-marker": "hidden root marker\n",
+            "-C": "not a tar option\n",
+            "line\nbreak": "NUL-delimited name\n",
+            "link-target": "fixture",
+        }
+        self.mtime = 1700000000
+        for name, contents in self.fixture_files.items():
+            path = self.work / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(contents)
+            path.chmod(0o755 if name == "src/tool" else 0o640)
+            os.utime(path, (self.mtime, self.mtime))
         (self.work / "src/symlink").symlink_to("../link-target")
+        (self.work / "tooling/download_cache").symlink_to("../download_cache")
+        (self.work / "broken-link").symlink_to("missing-target")
+        for directory in ("src", "tooling", "tooling/depot_tools"):
+            os.utime(self.work / directory, (self.mtime, self.mtime))
         # A small volume size forces the multi-volume slicing path in tests.
         self.env = {
             **os.environ,
@@ -58,33 +81,54 @@ class PosixSnapshotRoundTripTest(unittest.TestCase):
         rng = __import__("random").Random(0)
         return bytes(rng.getrandbits(8) for _ in range(64 * 1024 * repeat))
 
-    def snapshot(self, extra_env=None):
-        parts_dir = self.root / f"parts-{len(list(self.root.iterdir()))}"
+    def snapshot(self, extra_env=None, parts_dir=None, shell="bash", work=None):
+        if parts_dir is None:
+            parts_dir = self.root / f"parts-{len(list(self.root.iterdir()))}"
         result = subprocess.run(
-            ["bash", str(CI_PARTS), str(self.work), str(parts_dir)],
-            capture_output=True, text=True,
+            [str(shell), str(CI_PARTS), str(work or self.work), str(parts_dir)],
+            capture_output=True, text=True, cwd=self.root, timeout=60,
             env={**self.env, **(extra_env or {})})
         return parts_dir, result
 
-    def restore(self, parts_dir, dest):
-        # The real chain merges every slot artifact into one directory before
-        # sorting; volumes only compare correctly by their numeric suffix.
+    def snapshot_tar(self, parts_dir):
+        # Volumes only compare correctly by their numeric suffix, not slot.
         archives = sorted(
             (p for p in parts_dir.rglob("tree.tar.zst.*")
              if p.name != "tree.tar.zst."),
             key=lambda p: int(p.name.rsplit(".", 1)[1]))
         self.assertTrue(archives)
-        with subprocess.Popen(
-            ["zstd", "-d", "-T0"], stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE) as zstd_proc:
-            for archive in archives:
-                zstd_proc.stdin.write(archive.read_bytes())
-            zstd_proc.stdin.close()
-            extract = subprocess.run(
-                ["tar", "-xpf", "-", "-C", str(dest)],
-                stdin=zstd_proc.stdout, capture_output=True)
-            zstd_proc.wait(timeout=60)
+        decoded = subprocess.run(
+            ["zstd", "-d", "-T0"],
+            input=b"".join(p.read_bytes() for p in archives),
+            capture_output=True, timeout=60)
+        self.assertEqual(decoded.returncode, 0, decoded.stderr)
+        return decoded.stdout
+
+    def restore(self, parts_dir, dest, extra_env=None):
+        extract = subprocess.run(
+            ["tar", "-xpf", "-", "-C", str(dest)],
+            input=self.snapshot_tar(parts_dir), capture_output=True, timeout=60,
+            env={**self.env, **(extra_env or {})})
         self.assertEqual(extract.returncode, 0, extract.stderr)
+
+    def assert_fixture(self, dest):
+        for name, contents in self.fixture_files.items():
+            with self.subTest(path=name):
+                path = dest / name
+                self.assertEqual(path.read_text(), contents)
+                expected_mode = 0o755 if name == "src/tool" else 0o640
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), expected_mode)
+                self.assertEqual(path.stat().st_mtime, self.mtime)
+        for name, target in (("src/symlink", "../link-target"),
+                             ("tooling/download_cache", "../download_cache"),
+                             ("broken-link", "missing-target")):
+            self.assertTrue((dest / name).is_symlink(), name)
+            self.assertEqual(os.readlink(dest / name), target)
+        self.assertEqual((dest / "src/symlink").read_text(), "fixture")
+        # GNU tar's default format stores whole-second mtimes.
+        for directory in ("src", "tooling", "tooling/depot_tools"):
+            self.assertEqual(int((dest / directory).stat().st_mtime),
+                             int((self.work / directory).stat().st_mtime))
 
     def test_round_trip_preserves_modes_symlinks_and_markers(self):
         # ~384 KiB of random bytes against 64 KiB volumes exercises multi-volume
@@ -107,15 +151,181 @@ class PosixSnapshotRoundTripTest(unittest.TestCase):
         restored = self.root / "restored"
         restored.mkdir()
         self.restore(parts_dir, restored)
-        tool = restored / "src/tool"
-        self.assertTrue(tool.is_file())
-        self.assertEqual(tool.stat().st_mode & stat.S_IXUSR, stat.S_IXUSR)
-        self.assertTrue((restored / "src/symlink").is_symlink())
-        self.assertEqual((restored / "src/symlink").read_text(), "fixture")
-        marker_key = (self.work / "src/.chromix-source-ready").read_text()
-        self.assertEqual((restored / "src/.chromix-source-ready").read_text(),
-                         marker_key)
+        self.assert_fixture(restored)
         self.assertEqual((restored / "src/payload.bin").read_bytes(), payload)
+
+    def nested_round_trips(self, shell="bash", extra_env=None):
+        excluded_files = (
+            ".snapshot-stage-0/p1/tree.tar.zst.001",
+            ".snapshot-stage-99/stage/tree.tar.zst",
+            "src/.snapshot-stage-old/stale-volume",
+            "download_cache/chromium.tar.xz",
+        )
+        for name in excluded_files:
+            path = self.work / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("must not enter the snapshot")
+        # A similar name must not be swallowed by the literal custom exclusion.
+        neighbor = self.work / "handoff/custom 1xZtail/keep"
+        neighbor.parent.mkdir(parents=True)
+        neighbor.write_text("neighbor fixture")
+        destinations = (".snapshot-stage-1", "handoff/custom parts",
+                        "handoff/custom [1]*?\\tail")
+        for index, relative in enumerate(destinations):
+            with self.subTest(shell=str(shell), destination=relative):
+                parts = self.work / relative
+                stale = parts / "p4/tree.tar.zst.999"
+                stale.parent.mkdir(parents=True)
+                stale.write_text("stale upload")
+                # Exercise relative ROOT/PARTS_DIR with spaces in the cwd.
+                _, result = self.snapshot(
+                    extra_env, parts_dir=parts.relative_to(self.root),
+                    shell=shell, work=Path("work"))
+                self.assertEqual(result.returncode, 0,
+                                 result.stdout + result.stderr)
+                self.assertNotIn("file changed as we read it", result.stderr)
+                self.assertFalse(stale.exists())
+                self.assertFalse((parts / "stage").exists())
+                with tarfile.open(fileobj=io.BytesIO(self.snapshot_tar(parts))) as tree:
+                    members = {str(Path(member.name)): member
+                               for member in tree.getmembers()}
+                names = set(members)
+                self.assertTrue(set(self.fixture_files) <= names)
+                self.assertIn("tooling/depot_tools", names)
+                self.assertIn("handoff/custom 1xZtail/keep", names)
+                self.assertFalse(any(
+                    any(part.startswith(".snapshot-stage-") for part in Path(name).parts)
+                    or name == "download_cache" or name.startswith("download_cache/")
+                    or name == relative or name.startswith(relative + "/")
+                    or Path(name).name.startswith("tree.tar.zst")
+                    for name in names), names)
+                for name in self.fixture_files:
+                    self.assertEqual(members[name].mtime, self.mtime)
+                for name, target in (("src/symlink", "../link-target"),
+                                     ("tooling/download_cache", "../download_cache"),
+                                     ("broken-link", "missing-target")):
+                    self.assertIn(name, members)
+                    self.assertTrue(members[name].issym(), name)
+                    self.assertEqual(members[name].linkname, target)
+                restored = self.root / f"nested-restored-{index}"
+                cached = restored / "download_cache/preexisting-download"
+                cached.parent.mkdir(parents=True)
+                cached.write_text("separately restored cache")
+                for attempt in range(2):
+                    with self.subTest(restore=attempt):
+                        self.restore(parts, restored, extra_env)
+                        self.assert_fixture(restored)
+                        self.assertEqual(int(restored.stat().st_mtime),
+                                         int(members["."].mtime))
+                        self.assertEqual(cached.read_text(), "separately restored cache")
+                        self.assertFalse(
+                            (restored / "download_cache/chromium.tar.xz").exists())
+                        self.assertFalse((restored / relative).exists())
+                        self.assertFalse(list(restored.rglob(".snapshot-stage-*")))
+                        self.assertFalse(list(restored.rglob("tree.tar.zst*")))
+                # Subsequent cases should not package a prior custom destination.
+                shutil.rmtree(parts)
+
+    def test_nested_destinations_exclude_snapshots_and_cache_and_restore_twice(self):
+        self.nested_round_trips()
+
+    @unittest.skipUnless(BASH32.is_file(), "locally built bash 3.2 required")
+    def test_nested_destinations_under_bash_3_2(self):
+        self.nested_round_trips(shell=BASH32)
+
+    @unittest.skipUnless(shutil.which("bsdtar"), "BSD tar required")
+    def test_nested_destinations_under_bsd_tar(self):
+        bindir = self.root / "bsd-bin"
+        bindir.mkdir()
+        (bindir / "tar").symlink_to(shutil.which("bsdtar"))
+        self.nested_round_trips(extra_env={
+            "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}"})
+
+    @unittest.skipUnless(shutil.which("bsdtar") and BASH32.is_file(),
+                         "BSD tar and locally built bash 3.2 required")
+    def test_nested_destinations_under_bsd_tar_and_bash_3_2(self):
+        bindir = self.root / "bsd-bin"
+        bindir.mkdir()
+        (bindir / "tar").symlink_to(shutil.which("bsdtar"))
+        self.nested_round_trips(shell=BASH32, extra_env={
+            "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}"})
+
+    def test_tree_with_only_excluded_entries_restores_empty(self):
+        shells = ["bash"] + ([str(BASH32)] if BASH32.is_file() else [])
+        tars = ["tar"] + (["bsdtar"] if shutil.which("bsdtar") else [])
+        for shell_index, shell in enumerate(shells):
+            for tar_name in tars:
+                with self.subTest(shell=shell, tar=tar_name):
+                    base = self.root / f"empty-{shell_index}-{tar_name}"
+                    work = base / "work"
+                    cache = work / "download_cache/keep"
+                    cache.parent.mkdir(parents=True)
+                    cache.write_text("separate cache")
+                    bindir = base / "bin"
+                    bindir.mkdir()
+                    (bindir / "tar").symlink_to(shutil.which(tar_name))
+                    env = {"PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}"}
+                    parts, result = self.snapshot(
+                        env, parts_dir=work / ".snapshot-stage-1",
+                        work=work, shell=shell)
+                    self.assertEqual(result.returncode, 0,
+                                     result.stdout + result.stderr)
+                    with tarfile.open(fileobj=io.BytesIO(self.snapshot_tar(parts))) as tree:
+                        self.assertEqual(tree.getnames(), [".", "."])
+                    restored = base / "restored"
+                    restored.mkdir()
+                    for attempt in range(2):
+                        self.restore(parts, restored, env)
+                        self.assertEqual(list(restored.iterdir()), [])
+                    self.assertEqual(cache.read_text(), "separate cache")
+
+    def test_symlinked_nested_destination_is_excluded_by_physical_path(self):
+        actual = self.work / "handoff/custom parts"
+        actual.mkdir(parents=True)
+        alias = self.root / "parts-alias"
+        alias.symlink_to(actual, target_is_directory=True)
+        root_alias = self.root / "root-alias"
+        root_alias.symlink_to(self.work, target_is_directory=True)
+        _, result = self.snapshot(parts_dir=alias, work=root_alias)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        restored = self.root / "symlink-restored"
+        restored.mkdir()
+        self.restore(actual, restored)
+        self.assert_fixture(restored)
+        self.assertFalse((restored / "handoff/custom parts").exists())
+        self.assertFalse(list(restored.rglob("tree.tar.zst*")))
+
+    def test_parts_equal_to_or_containing_root_are_rejected_before_cleanup(self):
+        for case in ("same", "parent", "dotdot", "same-symlink", "parent-symlink"):
+            with self.subTest(case=case):
+                base = self.root / case
+                work = base / "work"
+                (work / "src").mkdir(parents=True)
+                marker = work / "src/keep"
+                marker.write_text("do not delete source")
+                sibling = base / "keep"
+                sibling.write_text("do not delete siblings")
+                parts = work if case == "same" else base
+                if case == "dotdot":
+                    parts = work / "src/.."
+                elif case.endswith("-symlink"):
+                    parts = base / "parts-link"
+                    parts.symlink_to(work if case == "same-symlink" else base,
+                                     target_is_directory=True)
+                _, result = self.snapshot(parts_dir=parts, work=work)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("must not equal or contain root", result.stderr)
+                self.assertEqual(marker.read_text(), "do not delete source")
+                self.assertEqual(sibling.read_text(), "do not delete siblings")
+                self.assertFalse(list(base.rglob("tree.tar.zst*")))
+
+    def test_sibling_destination_with_root_name_prefix_is_allowed(self):
+        parts, result = self.snapshot(parts_dir=self.root / "work-parts")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        restored = self.root / "sibling-restored"
+        restored.mkdir()
+        self.restore(parts, restored)
+        self.assert_fixture(restored)
 
     def test_exceeding_the_volume_budget_aborts_instead_of_uploading_broken_state(self):
         # Three 64 KiB volumes of random data against a two-volume budget must
@@ -181,8 +391,10 @@ class PosixSnapshotRoundTripTest(unittest.TestCase):
         source = (REPO / "build" / "build.sh").read_text(encoding="utf-8")
         # Upstream setup_toolchain keys Node/Go to the host architecture;
         # the target only selects sysroots and GN args.
-        self.assertIn('GO_ARCH="$HOST_ARCH"', source)
-        self.assertNotIn('GO_ARCH="$ARCH"', source.replace('GO_ARCH="$HOST_ARCH"', ''))
+        self.assertIn('case "$HOST_ARCH" in', source)
+        self.assertIn('x64) GO_ARCH=amd64', source)
+        self.assertIn('arm64) GO_ARCH=arm64', source)
+        self.assertNotIn('GO_ARCH="$ARCH"', source)
         self.assertIn('third_party/dawn/tools/golang/linux-$GO_ARCH/bin/go', source)
         self.assertIn('SYSROOT_ARCH=amd64', source)
         self.assertIn('SYSROOT_ARCH=arm64', source)
@@ -277,15 +489,16 @@ class PosixStageRestoreRejectsMismatchedSnapshotTest(unittest.TestCase):
 
 class GenPosixWorkflowTest(unittest.TestCase):
     def test_workflow_matches_generator_output(self):
-        subprocess.run([sys.executable, str(GEN_WORKFLOW)],
-                       cwd=str(REPO), check=True, capture_output=True)
-        before = subprocess.run(["sha256sum", str(WORKFLOW)],
-                                 capture_output=True, text=True).stdout
-        subprocess.run([sys.executable, str(GEN_WORKFLOW)], cwd=str(REPO),
-                       check=True, capture_output=True)
-        after = subprocess.run(["sha256sum", str(WORKFLOW)],
-                                capture_output=True, text=True).stdout
-        self.assertEqual(before, after)
+        with tempfile.TemporaryDirectory(prefix="chromix workflow ") as temp:
+            generated = Path(temp) / WORKFLOW.relative_to(REPO)
+            generated.parent.mkdir(parents=True)
+            subprocess.run([sys.executable, str(GEN_WORKFLOW)],
+                           cwd=temp, check=True, capture_output=True)
+            self.assertEqual(generated.read_bytes(), WORKFLOW.read_bytes())
+            before = generated.read_bytes()
+            subprocess.run([sys.executable, str(GEN_WORKFLOW)],
+                           cwd=temp, check=True, capture_output=True)
+            self.assertEqual(generated.read_bytes(), before)
 
     def test_workflow_has_no_collapsed_gha_expressions(self):
         # f-strings collapse ${{ ... }} to ${ ... }, which Actions cannot
@@ -330,9 +543,8 @@ class GenPosixWorkflowTest(unittest.TestCase):
         stage2 = next(s for s in jobs["posix-2"]["steps"]
                       if s.get("name") == "Run stage 2")["run"]
         self.assertNotIn("--from-snapshot", stage1)
-        # A dotted inputs.max_stages rendered as '' on the first real run:
-        # expression property access is literal, so dashed input keys need
-        # bracket syntax. Lock the rendered argument shape per stage.
+        # inputs.max_stages rendered empty because the declared key is max-stages.
+        # Lock the exact input name and rendered argument shape per stage.
         self.assertIn(
             "--stage-index 1 --max-stages '${{ inputs['max-stages'] }}' "
             '--deadline-epoch "$DEADLINE_EPOCH"', stage1)
@@ -357,6 +569,25 @@ class GenPosixWorkflowTest(unittest.TestCase):
         self.assertEqual(len(restore), 1)
         self.assertGreaterEqual(checked, 32)
 
+    def test_every_stage_selects_sdk_and_only_uploads_successful_handoffs(self):
+        import yaml
+        data = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        for job in data["jobs"].values():
+            steps = job["steps"]
+            names = [step.get("name", "") for step in steps]
+            self.assertLess(names.index("Select compatible Xcode"),
+                            names.index("Inspect macOS toolchain"))
+            self.assertLess(names.index("Select compatible Xcode"),
+                            names.index("Restore pinned source downloads"))
+            snapshot_steps = [s for s in steps if s.get("name", "").startswith("Upload tree part")]
+            snapshot_steps.append(next(s for s in steps if s.get("name") == "Verify handoff snapshot"))
+            self.assertEqual(len(snapshot_steps), 5)
+            for step in snapshot_steps:
+                self.assertEqual(step["if"], "success() && steps.stage.outputs.upload_snapshot == 'true'")
+                self.assertNotIn("ci-parts.sh", step.get("run", ""))
+            logs = next(s for s in steps if s.get("name") == "Upload build diagnostics")
+            self.assertEqual(logs["if"], "always()")
+
     def test_main_workflow_references_posix_reusable_jobs(self):
         source = MAIN_WORKFLOW.read_text(encoding="utf-8")
         for artifact in ("chromix-linux-x64", "chromix-linux-arm64",
@@ -372,11 +603,10 @@ class GenPosixWorkflowTest(unittest.TestCase):
 class WorkflowInputIntegrityTest(unittest.TestCase):
     """Every inputs reference must hit a declared key of its own workflow.
 
-    GitHub Actions resolves `inputs.foo` with literal property access: for a
-    dashed input like max-stages only `${{ inputs['max-stages'] }}` works,
-    while `${{ inputs.max_stages }}` silently renders empty. The first real
-    POSIX run died on exactly that (`--max-stages ''`). This audit across all
-    workflows catches the whole class, including future renames.
+    GitHub Actions resolves input names literally: `inputs.max_stages` does
+    not reference the declared `max-stages` key. The first real POSIX run
+    died on that mismatch (`--max-stages ''`). This audit across all workflows
+    catches undeclared names, including future renames.
     """
 
     WORKFLOWS = REPO / ".github" / "workflows"
@@ -384,7 +614,7 @@ class WorkflowInputIntegrityTest(unittest.TestCase):
     def test_input_references_match_declared_input_keys(self):
         import re
         import yaml
-        dotted = re.compile(r"\$\{\{\s*inputs\.([A-Za-z0-9_]+)")
+        dotted = re.compile(r"\$\{\{\s*inputs\.([A-Za-z0-9_-]+)")
         bracketed = re.compile(r"\$\{\{\s*inputs\['([^']+)'")
         files = sorted(self.WORKFLOWS.glob("*.yml"))
         self.assertGreaterEqual(len(files), 5)

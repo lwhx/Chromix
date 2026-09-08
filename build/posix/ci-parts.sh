@@ -22,14 +22,46 @@ VOLUME_BYTES="${CHROMIX_SNAPSHOT_VOLUME_BYTES:-$((9 * 1024 * 1024 * 1024))}"
 command -v zstd >/dev/null 2>&1 || { echo "zstd is not installed" >&2; exit 1; }
 [ -d "$ROOT" ] || { echo "snapshot root does not exist: $ROOT" >&2; exit 1; }
 
-mkdir -p "$PARTS_DIR"
+ROOT="$(CDPATH= cd -- "$ROOT" && pwd -P)"
+mkdir -p -- "$PARTS_DIR"
+PARTS_DIR="$(CDPATH= cd -- "$PARTS_DIR" && pwd -P)"
+# Resolve symlinks and .. before checking the destructive cleanup boundary.
+case "$ROOT/" in
+  "${PARTS_DIR%/}/"*)
+    echo "snapshot parts directory must not equal or contain root: $PARTS_DIR" >&2
+    exit 1
+    ;;
+esac
 rm -rf "${PARTS_DIR:?}"/*
 
 stage_dir="$PARTS_DIR/stage"
 archive="$stage_dir/tree.tar.zst"
 mkdir -p "$stage_dir"
 
-tar -cpf - -C "$ROOT" . | zstd -f -T0 -3 -o "$archive"
+# BSD tar exclusions are unanchored: ./download_cache also drops the required
+# tooling/download_cache symlink. find -path matches the full relative path.
+find_excludes=(-name '.snapshot-stage-*' -o -path './download_cache')
+case "$PARTS_DIR" in
+  "${ROOT%/}/"*)
+    parts_relative="${PARTS_DIR#"${ROOT%/}/"}"
+    # find -path interprets globs, so escape the literal destination path.
+    parts_pattern="${parts_relative//\\/\\\\}"
+    parts_pattern="${parts_pattern//\*/\\*}"
+    parts_pattern="${parts_pattern//\?/\\?}"
+    parts_pattern="${parts_pattern//\[/\\[}"
+    find_excludes+=(-o -path "./$parts_pattern")
+    ;;
+esac
+# Disable tar recursion so only the pruned, NUL-delimited entries are archived.
+# Repeat directory metadata last, children before parents, for BSD re-restores.
+# Keep the initial traversal order for GNU tar's deferred symlink restoration.
+(
+  cd -- "$ROOT"
+  find . \( "${find_excludes[@]}" \) -prune -o -print0
+  find . \( "${find_excludes[@]}" \) -prune -o -type d -print0 |
+    TMPDIR="$stage_dir" LC_ALL=C sort -zr
+) | tar -cpf - --no-recursion --null -C "$ROOT" -T - |
+  zstd -f -T0 -3 -o "$archive"
 
 total="$(stat -c %s "$archive" 2>/dev/null || stat -f %z "$archive")"
 volumes=$(( (total + VOLUME_BYTES - 1) / VOLUME_BYTES ))

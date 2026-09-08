@@ -52,9 +52,11 @@ system libraries and a working Chromium sandbox.
 
 ## Native macOS builds
 
-Use Xcode 16 or newer with a macOS 15 SDK or newer, the command-line tools,
-Python 3, Git, Ninja, Node.js, `zip`, `unzip`, and `shasum`. Chromium 152's local
-source sets `mac_sdk_min = "15"`; an older SDK is not a supported starting point.
+Use Xcode 26 or newer with a macOS 26 SDK or newer, the command-line tools,
+Python 3, Git, Ninja, Node.js, Go, `zip`, `unzip`, and `shasum`. Although Chromium
+152's GN configuration still declares `mac_sdk_min = "15"`, `launch_mac.cc`
+references an API declared only by SDK 26; the runtime availability guard does
+not make that declaration available when compiling against an older SDK.
 Budget at least 100 GB free as a starting estimate, with the same caveat about
 simultaneous source, toolchain, object, staging, ZIP, and smoke-test storage.
 The architecture must match the runner or host:
@@ -87,14 +89,19 @@ as `152.0.7977.82` in `chrome/VERSION`. Inspection of that tree shows:
   **26+**; system Xcode defaults to manual modules. SDK 15 alone does not prove
   that other GN/toolchain paths or APIs will build successfully.
 
-CI records `xcode-select -p`, `xcodebuild -version`, and the selected SDK, then
-reads the SDK floor/reference from the freshly prepared source. A selected SDK
-below the floor fails; one below the reference emits a warning. The source's
-`docs/mac_build_instructions.md` explicitly does not guarantee older SDKs.
-`macos-14` in particular cannot be assumed to provide the reference Xcode/SDK;
-`macos-15-intel` is not proof of compatibility either. These fixed runners need
-real builds before support can be claimed. This workflow neither downloads a
-private Apple toolchain nor changes SDK pins/GN requirements to hide a mismatch.
+Before source preparation, `build/macos/select-xcode.sh` preserves a supported
+`DEVELOPER_DIR` or active Xcode, otherwise searches installed Xcode applications
+for an actual macOS SDK >=26. It records the Xcode version and SDK path and
+exports the selected `DEVELOPER_DIR` through `GITHUB_ENV` for every CI stage.
+The native macOS build invokes the same helper. Missing SDK 26 fails early.
+
+The September 2026 `macos-15` and `macos-15-intel` runner inventories include
+Xcode 26 while their default Xcode 16.4 supplies SDK 15.5. The pinned upstream
+macOS build explicitly selects Xcode 26 as well. Choosing the installed SDK
+addresses the observed `posix_spawn_file_actions_addchdir` compile failure;
+a complete Chromium build remains necessary to establish compatibility with
+other APIs. This workflow neither downloads a private Apple toolchain nor
+changes SDK pins/GN requirements to hide a mismatch.
 
 ## GitHub Actions cross-platform build
 
@@ -131,8 +138,11 @@ snapshotting inside GitHub's 355/360-minute limits:
 4. continue Ninja through `build/build.sh` / `build/macos/build.sh`;
 5. on deadline exit 124, pack `${workdir}` with `build/posix/ci-parts.sh`
    into multi-volume `tree.tar.zst.*` files via `tar | zstd`, preserving
-   mtimes, modes, and symlinks so incremental Ninja state survives;
-6. upload up to four volume artifacts; the next stage downloads them with
+   mtimes, modes, and symlinks so incremental Ninja state survives; the packer
+   excludes all snapshot staging directories and the separately cached
+   `download_cache`, preventing the archive from reading its own output;
+6. verify the handoff contains at least one numbered volume, then upload up to
+   four volume artifacts; the next stage downloads them with
    `actions/download-artifact@v4` (`merge-multiple: true`, sorted part order)
    and resumes.
 
@@ -185,10 +195,15 @@ every supported OS version.
 
 Preparation, build, packaging, checksum, and smoke output are captured in
 per-stage log artifacts alongside generated `args.gn` when present.
-Diagnostics upload uses `always()` so ordinary failed steps still upload logs,
-and each failed stage still packs and uploads its tree so the next run can
-resume from the last good handoff. Hard job termination, runner loss, or a
-full disk can prevent even that upload.
+Diagnostics upload uses `always()` so ordinary failed steps still upload logs.
+Tree uploads run only after a successful deadline handoff, never after a hard
+compile failure or final completion. The workflow does not pack an already
+packed handoff a second time. This avoids delaying failure reporting and
+unnecessary multi-gigabyte uploads; the failed macOS Intel job in run
+34204781261 spent ten minutes in an upload that ended with `Upload progress
+stalled`. Completed handoff uploads still depend on network availability and
+artifact limits; a failed upload stops the chain. Hard job termination, runner
+loss, or a full disk can prevent diagnostic uploads too.
 
 **CI cost and capacity:** filtered pushes to `main` and manual dispatches start
 four POSIX chains plus the Windows 12-stage chain. Each POSIX stage now spans a

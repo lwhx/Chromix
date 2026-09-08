@@ -14,7 +14,10 @@ esac
 # Host tools (Node/Go used by generators) must run on the actual host; the
 # target architecture only selects sysroots and output binaries. Upstream
 # portablelinux keeps linux-amd64 Go on x64 hosts regardless of ARCH.
-GO_ARCH="$HOST_ARCH"
+case "$HOST_ARCH" in
+  x64) GO_ARCH=amd64 ;;
+  arm64) GO_ARCH=arm64 ;;
+esac
 if [ "$(uname -s)" != Linux ] || [ "$HOST_ARCH" != "$ARCH" ]; then
   echo "a native Linux $ARCH host is required" >&2; exit 2
 fi
@@ -51,6 +54,7 @@ ln -sfn "$(command -v clang-format)" buildtools/linux64-format/clang-format
 # linux-arm64 on arm64 hosts regardless of the target architecture.
 mkdir -p "third_party/dawn/tools/golang/linux-$GO_ARCH/bin"
 ln -sfn "$(command -v go)" "third_party/dawn/tools/golang/linux-$GO_ARCH/bin/go"
+"third_party/dawn/tools/golang/linux-$GO_ARCH/bin/go" version
 if [ ! -f "$SRC/.chromix-toolchain-ready" ]; then
   if [ -f "$SRC/.chromix-domain-substituted" ]; then
     echo "toolchain is incomplete in a domain-substituted source tree; use a clean work directory" >&2; exit 1

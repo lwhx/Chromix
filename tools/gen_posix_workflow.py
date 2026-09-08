@@ -105,7 +105,11 @@ LINUX_CLEAN = """      - name: Free Linux disk space
           /usr/local/go/bin/go version
 """
 
-MAC_STEPS = """      - name: Inspect macOS toolchain
+MAC_STEPS = """      - name: Select compatible Xcode
+        if: runner.os == 'macOS'
+        run: bash build/macos/select-xcode.sh
+
+      - name: Inspect macOS toolchain
         if: runner.os == 'macOS'
         run: |
           {
@@ -185,19 +189,16 @@ DOWNLOAD_STEP = """      - name: Download tree from previous stage
           path: ${{ runner.temp }}/chromix-restore
 """
 
-SNAPSHOT_ENSURE = """      - name: Ensure tree snapshot exists even when handoff failed to pack
-        if: always()
+SNAPSHOT_ENSURE = """      - name: Verify handoff snapshot
+        if: success() && steps.stage.outputs.upload_snapshot == 'true'
         run: |
-          WORK="${RUNNER_TEMP}/chromix-build"
-          SNAP="$WORK/.snapshot-stage-%(stage)d"
-          rm -rf "$SNAP"
-          mkdir -p "$SNAP"
-          [ -d "$WORK/src" ] || { echo "no work tree to snapshot"; exit 0; }
-          bash build/posix/ci-parts.sh "$WORK" "$SNAP" >/dev/null && echo "snapshot packed at $SNAP"
+          SNAP="${RUNNER_TEMP}/chromix-build/.snapshot-stage-%(stage)d"
+          test -d "$SNAP/p1"
+          find "$SNAP" -type f -name 'tree.tar.zst.*' -print -quit | grep -q .
 """
 
 UPLOAD_PARTS = """      - name: Upload tree part 1
-        if: always()
+        if: success() && steps.stage.outputs.upload_snapshot == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact }}-tree-s%(stage)d-attempt-${{ github.run_attempt }}-part1
@@ -206,7 +207,7 @@ UPLOAD_PARTS = """      - name: Upload tree part 1
           retention-days: 3
           compression-level: 0
       - name: Upload tree part 2
-        if: always()
+        if: success() && steps.stage.outputs.upload_snapshot == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact }}-tree-s%(stage)d-attempt-${{ github.run_attempt }}-part2
@@ -215,7 +216,7 @@ UPLOAD_PARTS = """      - name: Upload tree part 1
           retention-days: 3
           compression-level: 0
       - name: Upload tree part 3
-        if: always()
+        if: success() && steps.stage.outputs.upload_snapshot == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact }}-tree-s%(stage)d-attempt-${{ github.run_attempt }}-part3
@@ -224,7 +225,7 @@ UPLOAD_PARTS = """      - name: Upload tree part 1
           retention-days: 3
           compression-level: 0
       - name: Upload tree part 4
-        if: always()
+        if: success() && steps.stage.outputs.upload_snapshot == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact }}-tree-s%(stage)d-attempt-${{ github.run_attempt }}-part4

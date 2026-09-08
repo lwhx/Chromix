@@ -177,6 +177,11 @@ ASSET="chromix-linux-$ARCH.zip"
 [ -s "$ASSET" ] || die "packaging did not produce $ASSET in $DEST_DIST"
 grep -E "^[0-9a-fA-F]{64}  $ASSET\$" SHA256SUMS >/dev/null ||
   die "SHA256SUMS is missing the entry for $ASSET"
+if [ "$PLATFORM" = linux ]; then
+  sha256sum -c SHA256SUMS || die "bundle checksum verification failed"
+else
+  shasum -a 256 -c SHA256SUMS || die "bundle checksum verification failed"
+fi
 
 SMOKE_DIR="$WORK/smoke"
 rm -rf "$SMOKE_DIR"

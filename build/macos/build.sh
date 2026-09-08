@@ -10,6 +10,8 @@ case "$ARCH" in arm64|x64) ;; *) echo "unsupported macOS architecture: $ARCH" >&
 if [ "$(uname -s)" != Darwin ] || [ "$HOST_ARCH" != "$ARCH" ]; then
   echo "a native macOS $ARCH host is required" >&2; exit 2
 fi
+source "$REPO/build/macos/select-xcode.sh"
+select_macos_xcode
 mkdir -p "$WORK"
 WORK="$(cd "$WORK" && pwd)"
 SRC="$WORK/src"
