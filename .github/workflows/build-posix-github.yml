@@ -254,6 +254,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact }}-logs-s1-attempt-${{ github.run_attempt }}
+          include-hidden-files: true
           path: |
             ${{ runner.temp }}/chromix-logs/
             ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
@@ -265,6 +266,7 @@ jobs:
             ${{ runner.temp }}/chromix-build/upstream-cache-ninja.json
             ${{ runner.temp }}/chromix-build/upstream-cache-import.json
             ${{ runner.temp }}/chromix-build/upstream-cache-plan.log
+            ${{ runner.temp }}/chromix-build/upstream-reuse/
             ${{ runner.temp }}/chromix-build/upstream-object-cache.json
             ${{ runner.temp }}/chromix-upstream/result.json
           if-no-files-found: warn
@@ -489,6 +491,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact }}-logs-s2-attempt-${{ github.run_attempt }}
+          include-hidden-files: true
           path: |
             ${{ runner.temp }}/chromix-logs/
             ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
@@ -500,6 +503,7 @@ jobs:
             ${{ runner.temp }}/chromix-build/upstream-cache-ninja.json
             ${{ runner.temp }}/chromix-build/upstream-cache-import.json
             ${{ runner.temp }}/chromix-build/upstream-cache-plan.log
+            ${{ runner.temp }}/chromix-build/upstream-reuse/
             ${{ runner.temp }}/chromix-build/upstream-object-cache.json
             ${{ runner.temp }}/chromix-upstream/result.json
           if-no-files-found: warn
@@ -724,6 +728,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact }}-logs-s3-attempt-${{ github.run_attempt }}
+          include-hidden-files: true
           path: |
             ${{ runner.temp }}/chromix-logs/
             ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
@@ -735,6 +740,7 @@ jobs:
             ${{ runner.temp }}/chromix-build/upstream-cache-ninja.json
             ${{ runner.temp }}/chromix-build/upstream-cache-import.json
             ${{ runner.temp }}/chromix-build/upstream-cache-plan.log
+            ${{ runner.temp }}/chromix-build/upstream-reuse/
             ${{ runner.temp }}/chromix-build/upstream-object-cache.json
             ${{ runner.temp }}/chromix-upstream/result.json
           if-no-files-found: warn
@@ -959,6 +965,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact }}-logs-s4-attempt-${{ github.run_attempt }}
+          include-hidden-files: true
           path: |
             ${{ runner.temp }}/chromix-logs/
             ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
@@ -970,6 +977,7 @@ jobs:
             ${{ runner.temp }}/chromix-build/upstream-cache-ninja.json
             ${{ runner.temp }}/chromix-build/upstream-cache-import.json
             ${{ runner.temp }}/chromix-build/upstream-cache-plan.log
+            ${{ runner.temp }}/chromix-build/upstream-reuse/
             ${{ runner.temp }}/chromix-build/upstream-object-cache.json
             ${{ runner.temp }}/chromix-upstream/result.json
           if-no-files-found: warn
@@ -1194,6 +1202,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact }}-logs-s5-attempt-${{ github.run_attempt }}
+          include-hidden-files: true
           path: |
             ${{ runner.temp }}/chromix-logs/
             ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
@@ -1205,6 +1214,7 @@ jobs:
             ${{ runner.temp }}/chromix-build/upstream-cache-ninja.json
             ${{ runner.temp }}/chromix-build/upstream-cache-import.json
             ${{ runner.temp }}/chromix-build/upstream-cache-plan.log
+            ${{ runner.temp }}/chromix-build/upstream-reuse/
             ${{ runner.temp }}/chromix-build/upstream-object-cache.json
             ${{ runner.temp }}/chromix-upstream/result.json
           if-no-files-found: warn
@@ -1429,6 +1439,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact }}-logs-s6-attempt-${{ github.run_attempt }}
+          include-hidden-files: true
           path: |
             ${{ runner.temp }}/chromix-logs/
             ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
@@ -1440,6 +1451,7 @@ jobs:
             ${{ runner.temp }}/chromix-build/upstream-cache-ninja.json
             ${{ runner.temp }}/chromix-build/upstream-cache-import.json
             ${{ runner.temp }}/chromix-build/upstream-cache-plan.log
+            ${{ runner.temp }}/chromix-build/upstream-reuse/
             ${{ runner.temp }}/chromix-build/upstream-object-cache.json
             ${{ runner.temp }}/chromix-upstream/result.json
           if-no-files-found: warn
@@ -1664,6 +1676,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact }}-logs-s7-attempt-${{ github.run_attempt }}
+          include-hidden-files: true
           path: |
             ${{ runner.temp }}/chromix-logs/
             ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
@@ -1675,6 +1688,7 @@ jobs:
             ${{ runner.temp }}/chromix-build/upstream-cache-ninja.json
             ${{ runner.temp }}/chromix-build/upstream-cache-import.json
             ${{ runner.temp }}/chromix-build/upstream-cache-plan.log
+            ${{ runner.temp }}/chromix-build/upstream-reuse/
             ${{ runner.temp }}/chromix-build/upstream-object-cache.json
             ${{ runner.temp }}/chromix-upstream/result.json
           if-no-files-found: warn
@@ -1899,6 +1913,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact }}-logs-s8-attempt-${{ github.run_attempt }}
+          include-hidden-files: true
           path: |
             ${{ runner.temp }}/chromix-logs/
             ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
@@ -1910,6 +1925,7 @@ jobs:
             ${{ runner.temp }}/chromix-build/upstream-cache-ninja.json
             ${{ runner.temp }}/chromix-build/upstream-cache-import.json
             ${{ runner.temp }}/chromix-build/upstream-cache-plan.log
+            ${{ runner.temp }}/chromix-build/upstream-reuse/
             ${{ runner.temp }}/chromix-build/upstream-object-cache.json
             ${{ runner.temp }}/chromix-upstream/result.json
           if-no-files-found: warn

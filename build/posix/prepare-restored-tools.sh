@@ -16,6 +16,10 @@ if [ "$HOST" != "$ARCH" ] || { [ "$PLATFORM" = linux ] && [ "$SYSTEM" != Linux ]
 fi
 WORK="$(cd "$WORK" && pwd)"
 SRC="$WORK/src"
+if [ "$PLATFORM" = macos ] && [ -f "$SRC/.chromix-upstream-restored.json" ]; then
+  MACOS_RUNTIME_ENV="$(python3 "$REPO/tools/macos_runtime.py" --src "$SRC" --arch "$ARCH")"
+  eval "$MACOS_RUNTIME_ENV"
+fi
 INSPECT="$(python3 "$REPO/tools/prepare_restored_build.py" --phase inspect \
   --platform "$PLATFORM" --arch "$ARCH" --workdir "$WORK")"
 field() {
@@ -70,6 +74,11 @@ if [ "$PLATFORM" = macos ]; then
     [ "$ARCH" != x64 ] || RESOURCE_ARCH=x86_64
     python3 "$WORK/tooling/ungoogled-chromium-macos/retrieve_and_unpack_resource.py" -p "$RESOURCE_ARCH"
     BINDGEN_NATIVE=0
+  fi
+  if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
+    MACOS_RUNTIME_ENV="$(python3 "$REPO/tools/macos_runtime.py" --src "$SRC" --arch "$ARCH" --prepare-loader)"
+    eval "$MACOS_RUNTIME_ENV"
+    python3 "$REPO/tools/macos_runtime.py" --src "$SRC" --arch "$ARCH" --verify-loader > /dev/null
   fi
   if [ "$BINDGEN_NATIVE" != 1 ]; then
     python3 tools/rust/build_bindgen.py --skip-test

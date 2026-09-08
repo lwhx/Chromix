@@ -17,6 +17,10 @@ mkdir -p "$WORK"
 WORK="$(cd "$WORK" && pwd)"
 SRC="$WORK/src"
 OUT="$SRC/out/Chromix"
+if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
+  MACOS_RUNTIME_ENV="$(python3 "$REPO/tools/macos_runtime.py" --src "$SRC" --arch "$ARCH")"
+  eval "$MACOS_RUNTIME_ENV"
+fi
 "$REPO/build/prepare-ungoogled.sh" "$WORK" macos "$ARCH"
 if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
   OUT="$SRC/out/Default"
@@ -25,6 +29,9 @@ cd "$SRC"
 chromix_select_restored_ninja macos
 if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
   bash "$REPO/build/posix/prepare-restored-tools.sh" "$WORK" macos "$ARCH"
+  # A child may retrieve tools, but cannot export its refreshed paths to us.
+  MACOS_RUNTIME_ENV="$(python3 "$REPO/tools/macos_runtime.py" --src "$SRC" --arch "$ARCH")"
+  eval "$MACOS_RUNTIME_ENV"
 fi
 if [ ! -f "$SRC/.chromix-toolchain-ready" ]; then
   if [ -f "$SRC/.chromix-domain-substituted" ]; then
@@ -60,5 +67,5 @@ if [ ! -x "$OUT/gn" ]; then
 fi
 "$OUT/gn" gen "$OUT" --fail-on-unused-args
 chromix_report_upstream_plan chrome
-"$CHROMIX_NINJA" -C "$OUT" -j "${CHROMIX_JOBS:-$(sysctl -n hw.ncpu)}" chrome
+chromix_build_restored_target macos "${CHROMIX_JOBS:-$(sysctl -n hw.ncpu)}" chrome
 printf '==> Done: %s\n' "$OUT/Chromium.app"

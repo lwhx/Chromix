@@ -91,6 +91,26 @@ class CrossPlatformBuildRegressionTest(unittest.TestCase):
         self.assertEqual(workflow.count("- name: Install restored-build Ninja v6"), 8)
         self.assertEqual(workflow.count("chromix-build/upstream-cache-ninja.json"), 8)
 
+    def test_all_initial_stages_upload_preparation_and_hidden_receipts(self):
+        import yaml
+
+        for filename, jobs in (("build-posix-github.yml", [f"posix-{n}" for n in range(1, 9)]),
+                               ("build-win-x64-github.yml", ["validate", "build-1"])):
+            workflow = yaml.safe_load((REPO / ".github/workflows" / filename).read_text())
+            for job in jobs:
+                with self.subTest(workflow=filename, job=job):
+                    diagnostics = [step for step in workflow["jobs"][job]["steps"]
+                                   if "diagnostics" in step.get("name", "")]
+                    self.assertEqual(len(diagnostics), 1)
+                    options = diagnostics[0]["with"]
+                    self.assertTrue(options["include-hidden-files"])
+                    for name in ("upstream-cache-preparation.json", ".chromix-upstream-restored.json",
+                                 ".chromix-restored-patches.json"):
+                        self.assertIn(name, options["path"])
+                    self.assertNotIn("**", options["path"])
+                    if filename == "build-posix-github.yml":
+                        self.assertIn("chromix-build/upstream-reuse/", options["path"])
+
     def test_build_arguments_cover_host_toolchain_compatibility(self):
         linux = (REPO / "build" / "build.sh").read_text(encoding="utf-8")
         macos = (REPO / "build" / "args.macos.gn").read_text(encoding="utf-8")

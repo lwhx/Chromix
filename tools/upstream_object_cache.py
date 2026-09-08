@@ -294,7 +294,7 @@ def ninja_log(path: Path) -> dict:
                 raise Miss("malformed Ninja log")
             start, end, mtime, output, command_hash = fields
             if (not all(re.fullmatch(r"[0-9]+", value) for value in (start, end, mtime))
-                    or int(end) < int(start) or not 0 < int(mtime) < 1 << 63):
+                    or int(end) < int(start) or not 0 <= int(mtime) < 1 << 63):
                 raise Miss("invalid Ninja log timestamp")
             if not output or "\x00" in output:
                 raise Miss("invalid Ninja log output")
@@ -467,6 +467,8 @@ def object_times(actual: int, dependency: int, logged: int, version: int,
                  allow_truncated_mtimes: bool) -> dict:
     if version not in (5, 6, 7):
         raise Miss("unsupported Ninja log timestamp version")
+    if not all(0 < value < 1 << 63 for value in (actual, dependency, logged)):
+        raise Miss("missing Ninja object/dependency timestamp")
     # v6/v7 use command-start time (or restat mtime); v5 uses output mtime.
     # Metadata retains nanoseconds even when a trusted GNU tar archive does not.
     if (actual != dependency and not (

@@ -18,7 +18,7 @@ REPORT = "upstream-cache-ninja.json"
 HEADER_LIMIT = 128
 PATH_LIMIT = 4096
 CANDIDATE_LIMIT = 64
-LOG_FAMILIES = {5: (10, 11), 6: (12,), 7: (13,)}
+LOG_FAMILIES = {5: (11,), 6: (12,), 7: (13,)}
 
 
 def host_identity() -> tuple[str, str]:
@@ -67,7 +67,7 @@ def binary_architectures(path: Path, system: str) -> set[str]:
 
 
 def version_format(version: str) -> int | None:
-    match = re.fullmatch(r"1\.(10|11|12|13)\.[0-9]+(?:\.chromium\.[0-9]+)?", version)
+    match = re.fullmatch(r"1\.(11|12|13)\.[0-9]+(?:\.chromium\.[0-9]+)?", version)
     if match:
         minor = int(match[1])
         return next(log for log, minors in LOG_FAMILIES.items() if minor in minors)

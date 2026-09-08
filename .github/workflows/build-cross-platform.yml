@@ -19,6 +19,8 @@ on:
       - 'tools/apply_restored_patches.py'
       - 'tools/prepare_restored_build.py'
       - 'tools/restore_ninja.py'
+      - 'tools/macos_runtime.py'
+      - 'tools/restored_reuse_evidence.py'
       - 'tools/gen_posix_workflow.py'
       - 'tools/merge_gn_args.py'
       - '.github/workflows/build-cross-platform.yml'

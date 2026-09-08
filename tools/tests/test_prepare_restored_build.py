@@ -184,6 +184,97 @@ class PrepareRestoredBuildTest(unittest.TestCase):
         run.assert_not_called()
         self.assertTrue(json.loads((self.src / prepare.INSPECTION).read_text())["needs_invalidation"])
 
+    def test_inspect_writes_uploadable_native_probe_report(self):
+        receipt = self.fixture()
+        with self.native_context():
+            result = prepare.prepare(self.work, "macos", "arm64", phase="inspect")
+        report = json.loads((self.work / "upstream-cache-preparation.json").read_text())
+        self.assertEqual(report, result)
+        self.assertEqual(report["source_identity"], receipt["identity"])
+        self.assertFalse(report["ready_for_gn"])
+        self.assertFalse((self.src / prepare.MARKER).exists())
+
+    def test_finish_failure_overwrites_stale_report_with_exact_probe_output(self):
+        self.fixture()
+        with self.native_context():
+            prepare.prepare(self.work, "macos", "arm64")
+        marker = (self.src / prepare.MARKER).read_bytes()
+        obj = self.object("a.o")
+        def run(command, **kwargs):
+            failed = Path(command[0]).name == "bindgen"
+            return mock.Mock(returncode=-6 if failed else 0, stdout=(
+                "dyld: Library not loaded: @rpath/libclang.dylib\nReason: no LC_RPATH's found"
+                if failed else "native tool"))
+        with self.native_context(), mock.patch.object(prepare.subprocess, "run", side_effect=run):
+            with self.assertRaisesRegex(ValueError, r"bindgen \(--version exited -6\)"):
+                prepare.prepare(self.work, "macos", "arm64")
+        report = json.loads((self.work / "upstream-cache-preparation.json").read_text())
+        pending = json.loads((self.src / prepare.INSPECTION).read_text())
+        self.assertFalse(report["ready_for_gn"])
+        self.assertEqual(report["phase"], "finish")
+        self.assertEqual(pending["phase"], "inspect")
+        self.assertEqual(report["tools"], pending["tools"])
+        self.assertIn("libclang.dylib", report["tools"]["bindgen"]["version"])
+        self.assertIn("bindgen", report["error"])
+        self.assertEqual((self.src / prepare.MARKER).read_bytes(), marker)
+        self.assertTrue(obj.exists())
+
+    def test_environment_failure_retains_probe_report_without_claiming_ready(self):
+        self.fixture()
+        with self.native_context(), mock.patch.object(prepare, "environment_identity", side_effect=ValueError("SDK missing")):
+            with self.assertRaisesRegex(ValueError, "SDK missing"):
+                prepare.prepare(self.work, "macos", "arm64")
+        report = json.loads((self.work / "upstream-cache-preparation.json").read_text())
+        self.assertFalse(report["ready_for_gn"])
+        self.assertTrue(report["tools"]["bindgen"]["native"])
+        self.assertEqual(report["operation"], "environment_identity")
+        self.assertEqual(report["error"], "SDK missing")
+        self.assertFalse((self.src / prepare.MARKER).exists())
+
+    def test_early_failure_replaces_stale_success_without_losing_probe_evidence(self):
+        self.fixture()
+        for failure in ("receipt", "marker", "generator"):
+            with self.subTest(failure=failure), self.native_context():
+                prepare.prepare(self.work, "macos", "arm64")
+                if failure == "receipt":
+                    context = mock.patch.object(prepare, "verify_restored", side_effect=ValueError("receipt rejected"))
+                    operation = "verify_restored"
+                elif failure == "marker":
+                    context = mock.patch.object(prepare, "_read_marker", side_effect=ValueError("malformed marker"))
+                    operation = "read_preparation_markers"
+                else:
+                    context = mock.patch.object(prepare, "generator_fingerprint", side_effect=OSError("generator unreadable"))
+                    operation = "generator_fingerprint"
+                with context, self.assertRaises((ValueError, OSError)):
+                    prepare.prepare(self.work, "macos", "arm64")
+                report = json.loads((self.work / "upstream-cache-preparation.json").read_text())
+                self.assertFalse(report["ready_for_gn"])
+                self.assertEqual(report["operation"], operation)
+                self.assertTrue(report["error"])
+                self.assertEqual("tools" in report, failure == "generator")
+
+    def test_mac_probe_runtime_is_reconstructed_after_system_shell_environment_loss(self):
+        self.fixture()
+        library = self.src / prepare.CLANG / "lib/libclang.dylib"
+        self.binary(library, "macos", "arm64")
+        expected = str(library.parent)
+        with self.native_context(), mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(prepare.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="native")) as run:
+            result = prepare.prepare(self.work, "macos", "arm64", phase="inspect")
+        self.assertTrue(result["native_tools"])
+        self.assertFalse(result["needs_invalidation"])
+        for call in run.call_args_list:
+            self.assertEqual(call.kwargs["env"]["DYLD_LIBRARY_PATH"], expected)
+
+    def test_report_symlink_cannot_overwrite_external_file(self):
+        self.fixture()
+        target = self.write(self.work / "keep", "keep")
+        (self.work / "upstream-cache-preparation.json").symlink_to(target)
+        with self.native_context():
+            with self.assertRaisesRegex(ValueError, "unsafe"):
+                prepare.prepare(self.work, "macos", "arm64", phase="inspect")
+        self.assertEqual(target.read_text(), "keep")
+
     def test_windows_is_not_executed_on_a_posix_host(self):
         self.fixture("windows", "x64")
         with mock.patch.object(prepare, "host_identity", return_value=("linux", "x64")), \

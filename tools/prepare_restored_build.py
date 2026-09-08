@@ -18,11 +18,13 @@ import sys
 
 try:
     from .import_upstream_cache import CLANG, RUST, Miss, digest_file
+    from .macos_runtime import runtime_environment
     from .restore_upstream_cache import linked, verify_restored
     from .upstream_object_cache import ninja_deps, ninja_log, write_json
     from .upstream_script_identity import ENDPOINTS
 except ImportError:
     from import_upstream_cache import CLANG, RUST, Miss, digest_file
+    from macos_runtime import runtime_environment
     from restore_upstream_cache import linked, verify_restored
     from upstream_object_cache import ninja_deps, ninja_log, write_json
     from upstream_script_identity import ENDPOINTS
@@ -111,6 +113,7 @@ def tool_paths(platform: str, arch: str) -> dict[str, Path]:
 def inspect_native_tools(src: Path, platform: str, arch: str) -> dict:
     system, machine = host_identity()
     native_host = (system, machine) == (platform, arch)
+    probe_env = runtime_environment(src, arch) if native_host and platform == "macos" else None
     tools = {}
     for name, relative in tool_paths(platform, arch).items():
         path = src / relative
@@ -126,7 +129,7 @@ def inspect_native_tools(src: Path, platform: str, arch: str) -> dict:
                 raise ValueError("tool is not executable")
             probe_arg = "/?" if name == "llvm-ml" else "--version"
             entry["probe_argument"] = probe_arg
-            completed = subprocess.run([str(path), probe_arg], cwd=src, text=True,
+            completed = subprocess.run([str(path), probe_arg], cwd=src, text=True, env=probe_env,
                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                        timeout=30, check=False)
             entry["version"] = completed.stdout.strip()[:2000]
@@ -481,18 +484,34 @@ def prepare_tooling_links(work: Path, platform: str, arch: str) -> None:
 
 def prepare(workdir: Path, platform: str, arch: str, *, phase="finish", repo: Path = ROOT) -> dict:
     workdir = workdir.absolute()
+    report_path = _safe_file(workdir, "upstream-cache-preparation.json")
+    data = {"schema_version": SCHEMA, "phase": phase, "platform": platform, "arch": arch,
+            "ready_for_gn": False, "operation": "verify_restored"}
+    write_json(report_path, data)
+    try:
+        return _prepare(workdir, platform, arch, phase=phase, repo=repo, report_path=report_path, data=data)
+    except (OSError, ValueError, Miss, RuntimeError, subprocess.SubprocessError) as error:
+        data.update(ready_for_gn=False, error=str(error))
+        write_json(report_path, data)
+        raise
+
+
+def _prepare(workdir: Path, platform: str, arch: str, *, phase: str, repo: Path,
+             report_path: Path, data: dict) -> dict:
     receipt = verify_restored(workdir, platform, arch, repo=repo)
+    data.update(source_identity=receipt.get("identity"), operation="read_preparation_markers")
     src = workdir / "src"
     marker = _safe_file(src, MARKER)
     pending_path = _safe_file(src, INSPECTION)
-    report_path = _safe_file(workdir, "upstream-cache-preparation.json")
     old, pending = _read_marker(marker), _read_marker(pending_path)
     for entry in (old, pending):
         if entry and (entry.get("platform"), entry.get("arch")) != (platform, arch):
             raise ValueError("restored preparation identity changed")
     if old and old.get("source_identity") != receipt.get("identity"):
         raise ValueError("restored preparation source identity changed")
+    data["operation"] = "inspect_native_tools"
     inspection = validate_native_tools(src, platform, arch)
+    data.update(inspection)
     incompatible = (not inspection["toolchains_native"] or any(
         entry.get("wrong_host", False) for name, entry in inspection["tools"].items()
         if name not in ("node", "gn")))
@@ -501,26 +520,35 @@ def prepare(workdir: Path, platform: str, arch: str, *, phase="finish", repo: Pa
         for name, entry in inspection["tools"].items() if name not in ("node", "gn")))
     needs_invalidation = (incompatible or changed_since_inspect
                           or bool(pending and pending.get("needs_invalidation")))
+    data["operation"] = "generator_fingerprint"
     generators = generator_fingerprint(src, platform, arch)
     generators_changed = (bool(pending and pending.get("generators_changed"))
                           or bool(pending and pending.get("generator_fingerprint") != generators)
                           or bool(old and old.get("generator_fingerprint") != generators))
-    data = {"schema_version": SCHEMA, "phase": phase, "platform": platform, "arch": arch,
-            **inspection, "needs_invalidation": needs_invalidation,
-            "generator_fingerprint": generators, "generators_changed": generators_changed}
+    data.update(needs_invalidation=needs_invalidation, generator_fingerprint=generators,
+                generators_changed=generators_changed, operation="validate_native_tools")
+    if phase not in ("inspect", "finish"):
+        raise ValueError(f"unsupported preparation phase: {phase}")
+    write_json(report_path, data)
     if phase == "inspect":
         write_json(pending_path, data)
         return data
-    if phase != "finish":
-        raise ValueError(f"unsupported preparation phase: {phase}")
     if not inspection["toolchains_native"] or not inspection["tools"]["node"]["native"]:
+        failed = [f"{name} ({entry.get('reason', 'probe failed')})"
+                  for name, entry in inspection["tools"].items() if name != "gn" and not entry["native"]]
+        message = "restored toolchain/node cannot execute on the native host; prepare tools before finish: " + "; ".join(failed)
+        data["error"] = message
+        write_json(report_path, data)
         write_json(pending_path, dict(data, phase="inspect"))
-        raise ValueError("restored toolchain/node cannot execute on the native host; prepare tools before finish")
+        raise ValueError(message)
+    data["operation"] = "environment_identity"
     environment = environment_identity(src, platform)
+    data["operation"] = "tool_fingerprint"
     fingerprint = tool_fingerprint(src, platform, arch)
     tool_changed = needs_invalidation or bool(old and old.get("tool_fingerprint") != fingerprint)
     environment_changed = not old or old.get("environment") != environment
     first_finish = old is None
+    data["operation"] = "invalidate_outputs"
     products = remove_final_products(src, platform) if first_finish else []
     generated = (invalidate_generated_outputs(src) if first_finish or generators_changed
                  else {"removed_outputs": 0, "unknown_outputs": []})
@@ -535,7 +563,7 @@ def prepare(workdir: Path, platform: str, arch: str, *, phase="finish", repo: Pa
     if removed_gn:
         data["native_tools"] = False
         data["tools"]["gn"].update(native=False, exists=False, reason="GN bootstrap required after tool invalidation")
-    data.update(phase="finish", ready_for_gn=True, needs_invalidation=False, generators_changed=False,
+    data.update(phase="finish", operation="complete", ready_for_gn=True, needs_invalidation=False, generators_changed=False,
                 source_identity=receipt.get("identity"), environment=environment, tool_fingerprint=fingerprint,
                 dependencies=dependencies, compiled_outputs=compiled, generated_outputs=generated, removed_gn=removed_gn,
                 removed_final_products=products, counters={

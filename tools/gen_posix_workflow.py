@@ -292,6 +292,7 @@ FINAL_UPLOADS = """      - name: Upload final bundle
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact }}-logs-s%(stage)d-attempt-${{ github.run_attempt }}
+          include-hidden-files: true
           path: |
             ${{ runner.temp }}/chromix-logs/
             ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
@@ -303,6 +304,7 @@ FINAL_UPLOADS = """      - name: Upload final bundle
             ${{ runner.temp }}/chromix-build/upstream-cache-ninja.json
             ${{ runner.temp }}/chromix-build/upstream-cache-import.json
             ${{ runner.temp }}/chromix-build/upstream-cache-plan.log
+            ${{ runner.temp }}/chromix-build/upstream-reuse/
             ${{ runner.temp }}/chromix-build/upstream-object-cache.json
             ${{ runner.temp }}/chromix-upstream/result.json
           if-no-files-found: warn

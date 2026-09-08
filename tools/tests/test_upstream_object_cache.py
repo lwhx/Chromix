@@ -55,6 +55,24 @@ class NinjaMetadataTest(unittest.TestCase):
                         self.assertEqual(path.read_bytes(), content)
                         self.assertEqual(cache.stamp(path), before)
 
+    def test_zero_output_timestamp_is_valid_metadata_but_not_reusable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / ".ninja_log"
+            for version in (5, 6, 7):
+                path.write_text(f"# ninja log v{version}\n0\t1\t0\tabsent-stamp\tabc\n")
+                self.assertEqual(cache.ninja_log(path)["absent-stamp"], (0, 0xABC, version))
+                with self.assertRaises(cache.Miss):
+                    cache.object_times(10, 10, 0, version, False)
+
+    @unittest.skipUnless(Path("/tmp/chromix-ninja-v1.11.1/ninja").is_file(), "official Ninja 1.11 fixture required")
+    def test_real_v5_command_without_output_emits_zero_timestamp(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            out = Path(temporary)
+            (out / "build.ninja").write_text("rule absent\n  command = true\nbuild absent-stamp: absent\n")
+            subprocess.run(["/tmp/chromix-ninja-v1.11.1/ninja", "absent-stamp"], cwd=out,
+                           check=True, capture_output=True, timeout=10)
+            self.assertEqual(cache.ninja_log(out / ".ninja_log")["absent-stamp"][0], 0)
+
     def test_duplicate_log_outputs_use_last_record_not_largest_timestamp(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / ".ninja_log"
@@ -96,7 +114,7 @@ class NinjaMetadataTest(unittest.TestCase):
         for index, values in (
             (0, ("-1", "start", "1_0", " 0", "+0")),
             (1, ("-1", "end", "", "1.5")),
-            (2, ("-1", "0", "mtime", "1_000", str(1 << 63))),
+            (2, ("-1", "mtime", "1_000", str(1 << 63))),
             (3, ("", "obj/a\x00.o")),
             (4, ("", "xyz", "-1", "+1", "0x123", "1_2", " 123", "1" * 17)),
         ):

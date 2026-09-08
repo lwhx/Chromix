@@ -243,8 +243,9 @@ following links, even when a rejected owned cache is removed. Unknown formats
 still stop restoration.
 
 Before any restored-output Ninja invocation, the build selects one native
-executable matching the log generation: Ninja 1.10/1.11 for v5, 1.12 for v6,
-and 1.13 for v7. Its path, version, architecture, and rejected candidates are
+executable matching the log generation: Ninja 1.11 for v5, 1.12 for v6,
+and 1.13 for v7. Ninja 1.10 can read v5 but lacks the input-query tool required
+by retention diagnostics. Its path, version, architecture, and rejected candidates are
 recorded in `upstream-cache-ninja.json`. The same executable runs the plan and
 compile; an incompatible reader is never allowed to discard the old log.
 Linux Actions also install checksum-pinned Ninja 1.12.1 for x64/arm64 alongside
@@ -259,6 +260,14 @@ the pinned domain-substitution rules and applies with `--fuzz=0`. Interrupted
 or mismatched patch markers fail instead of accepting a partially patched tree.
 
 Native tool headers and executable probes check the actual runner architecture.
+On restored macOS trees, probes reconstruct a source-confined `DYLD_LIBRARY_PATH`
+from native LLVM and nightly Rust library directories, including before the first
+inspection. A relative library link supplies nightly rust-objcopy's existing
+loader path without changing executable bytes. A native, timed
+`rust-objcopy --version` probe with all `DYLD_*` variables removed must pass before
+tool preparation can finish. The pinned Mac bindgen action
+reinstates its library path in Python, so it does not depend on `DYLD_*` surviving
+Ninja's system-shell invocation. Runtime setup is refreshed after tool retrieval.
 Required tool replacement happens only in Actions. A changed compiler/runtime
 invalidates compiled outputs; unknown external or missing Ninja dependencies
 invalidate their dependent outputs. Host generator contents (Node, Go, gperf,
@@ -275,7 +284,11 @@ flags, host tools, SDKs, or dependency paths can require substantial recompilati
 Diagnostics include `upstream-cache-restore.json`,
 `upstream-cache-preparation.json`, the source's `.chromix-upstream-restored.json`
 receipt, the downloader's `result.json`, and `upstream-cache-plan.log` from
-`ninja -n`. Downloader phase logs distinguish metadata checks, download, outer
+`ninja -n`. Preparation writes the uploadable report during inspection and before
+finalization, so failed native probes retain their exact output and are marked
+`ready_for_gn: false` rather than leaving a stale success report. Diagnostic
+uploads include the explicitly listed hidden restoration and patch receipts.
+Downloader phase logs distinguish metadata checks, download, outer
 archive unpacking, full source/object extraction, and source verification.
 Disk rejection preserves free/required bytes, the failure phase, and any written
 extraction bytes/member before cleanup; a cleaned-up miss is not reported as a
@@ -287,6 +300,23 @@ elapsed time; local regression tests use small fixtures and sparse patch checks,
 without downloading full build artifacts or compiling Chromium. Artifact expiry
 requires reviewing and updating the pinned manifest rather than silently
 selecting the newest upload.
+
+`upstream-reuse/baseline.json` preserves a bounded sample before the first actual
+Chromix Ninja build, after GN and the plan. It samples at most 128 `.o`/`.obj`
+inputs of the requested targets, hashing at most 64 MiB total and 8 MiB per file.
+The baseline records full Ninja log entries, hashes, sizes, and nanosecond mtimes;
+resumed stages retain it rather than sampling newly compiled objects. Each actual
+invocation writes `upstream-reuse/result.json` with its exit code and a comparison
+to that original baseline. Both reports must survive handoffs. Each observation
+verifies the previous complete log prefix, and any observed rebuild or lost log
+continuity permanently disqualifies the affected samples. Only unchanged samples
+in the target inputs after a
+successful invocation count as observed retention. Failed or timed-out builds,
+changed graphs, truncated logs, and zero retained samples do not establish reuse.
+These small reports are uploaded on every build stage. This measures retention
+since the first Chromix build in a verified upstream source tree; it does not
+independently reconstruct the donor's per-object history or imply a whole-tree
+cache-hit percentage.
 
 Host toolchains follow the host architecture, not the target: Node resolves
 through `third_party/node/linux/node-linux-$HOST_ARCH/bin/node` with an extra
@@ -405,10 +435,13 @@ pwsh build/windows/build.ps1 -WorkDir D:\chromix-build -Resume -Jobs 8
 For GitHub Actions, stage 1 defaults to the pinned Windows `build-artifact`
 through `use_upstream_cache`. An optional `upstream_run_id` must equal the run in
 `build/upstream-cache.json`; it cannot select an arbitrary upload. The
-`UPSTREAM_ACTIONS_TOKEN` secret grants Actions read access. Windows keeps its
-canonical prepared source and only imports bindgen when the compiler and Rust
-contents match. Chromium object reuse on Windows remains disabled because SDK
-and relocation compatibility have not been established.
+`UPSTREAM_ACTIONS_TOKEN` secret grants Actions read access. Windows restores the
+complete pinned source and `out/Default`, appends Chromix patches, and regenerates
+GN arguments for the current runner. Compiler/runtime changes invalidate compiled
+outputs; missing or external SDK dependencies invalidate their readers. Compatible
+objects and Ninja state remain available for incremental compilation, and upstream
+final browser binaries are removed to force a Chromix link. This full-tree path
+is separate from the legacy optional bindgen/object importer.
 
 `-Resume` still validates the prepared source marker against the current
 ungoogled pins and patch-content hash. A stale or mixed source tree is rejected.

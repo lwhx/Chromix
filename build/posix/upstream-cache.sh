@@ -58,6 +58,26 @@ chromix_select_restored_ninja() {
   fi
 }
 
+chromix_build_restored_target() {
+  local platform="$1" jobs="$2" rc=0 evidence_rc=0 target
+  shift 2
+  local evidence_args=(--workdir "$WORK" --platform "$platform" --arch "$ARCH"
+    --ninja "$CHROMIX_NINJA")
+  for target in "$@"; do
+    evidence_args+=(--target "$target")
+  done
+  if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
+    python3 "$REPO/tools/restored_reuse_evidence.py" --phase before "${evidence_args[@]}" || return 1
+  fi
+  "$CHROMIX_NINJA" -C "$OUT" -j "$jobs" "$@" || rc=$?
+  if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
+    python3 "$REPO/tools/restored_reuse_evidence.py" --phase after "${evidence_args[@]}" \
+      --exit-code "$rc" || evidence_rc=$?
+  fi
+  [ "$rc" -eq 0 ] || return "$rc"
+  return "$evidence_rc"
+}
+
 chromix_report_upstream_plan() {
   if [ -n "${CHROMIX_UPSTREAM_CACHE_DIR:-}" ] || [ -f "$WORK/src/.chromix-upstream-restored.json" ]; then
     # A dry run records planned work; it cannot establish elapsed-time savings.

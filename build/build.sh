@@ -117,5 +117,5 @@ if [ ! -x "$OUT/gn" ]; then
 fi
 "$OUT/gn" gen "$OUT" --fail-on-unused-args
 chromix_report_upstream_plan chrome chrome_crashpad_handler chrome_sandbox
-"$CHROMIX_NINJA" -C "$OUT" -j "${CHROMIX_JOBS:-$(getconf _NPROCESSORS_ONLN)}" chrome chrome_crashpad_handler chrome_sandbox
+chromix_build_restored_target linux "${CHROMIX_JOBS:-$(getconf _NPROCESSORS_ONLN)}" chrome chrome_crashpad_handler chrome_sandbox
 "$OUT/chrome" --version

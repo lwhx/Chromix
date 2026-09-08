@@ -549,8 +549,24 @@ if ($ninjaBudget -lt 20) {
   Save-Handoff -Mode Synced
   return
 }
+if ($RestoredUpstream) {
+  # The collector preserves the initial baseline across artifact resumes.
+  & python (Join-Path $Repo "tools\restored_reuse_evidence.py") --phase before `
+    --workdir $WorkDir --platform windows --arch x64 --ninja $Ninja --target chrome
+  if ($LASTEXITCODE -ne 0) { throw "restored reuse evidence collection failed before Ninja (exit $LASTEXITCODE)" }
+}
 $rc = Invoke-Tracked -File $Ninja `
   -ArgList "-C `"$OutDir`" -j 4 chrome" -Cwd $Src -TimeoutSec ($ninjaBudget * 60)
+if ($RestoredUpstream) {
+  try {
+    & python (Join-Path $Repo "tools\restored_reuse_evidence.py") --phase after `
+      --workdir $WorkDir --platform windows --arch x64 --ninja $Ninja --target chrome --exit-code $rc
+    if ($LASTEXITCODE -ne 0) { throw "restored reuse evidence collection failed after Ninja (exit $LASTEXITCODE)" }
+  } catch {
+    if ($rc -ne 0) { throw "ninja failed (exit $rc); $($_.Exception.Message)" }
+    throw
+  }
+}
 
 if ($rc -eq 0) {
   New-Item -ItemType Directory -Force -Path "$Root\dist" | Out-Null

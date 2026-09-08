@@ -98,7 +98,7 @@ class RestoreNinjaTest(unittest.TestCase):
                     self.assertEqual(self.report()["selected"]["version"], version)
 
     def test_compatibility_map_does_not_guess_future_versions(self):
-        for version, expected in (("1.10.1", 5), ("1.11.1", 5), ("1.12.1", 6),
+        for version, expected in (("1.10.1", None), ("1.11.1", 5), ("1.12.1", 6),
                                   ("1.12.1.chromium.4", 6), ("1.13.2", 7),
                                   ("1.14.0", None), ("2.0.0", None), ("1.9.0", None),
                                   ("1.13.2-git", None), ("1.13", None)):
@@ -326,10 +326,11 @@ class RestoreNinjaShellTest(unittest.TestCase):
             path.chmod(0o755)
 
         for relative in ("build/build.sh", "build/macos/build.sh", "build/posix/upstream-cache.sh",
-                         "tools/merge_gn_args.py"):
+                         "tools/merge_gn_args.py", "tools/macos_runtime.py"):
             destination = self.repo / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REPO / relative, destination)
+        (self.repo / "tools/restored_reuse_evidence.py").write_text("import sys\nassert '--phase' in sys.argv\n")
         shell(self.repo / "build/prepare-ungoogled.sh", "exit 0\n")
         shell(self.repo / "build/posix/prepare-restored-tools.sh", 'touch "$1/src/.chromix-toolchain-ready"\n')
         shell(self.repo / "build/macos/select-xcode.sh", "select_macos_xcode() { :; }\n")
@@ -413,7 +414,9 @@ class RestoreNinjaShellTest(unittest.TestCase):
         for name, system in (("build/build.sh", "linux"), ("build/macos/build.sh", "macos")):
             source = (REPO / name).read_text()
             self.assertLess(source.index(f"chromix_select_restored_ninja {system}"), source.index('"$OUT/gn" gen'))
-            self.assertIn('"$CHROMIX_NINJA" -C "$OUT"', source)
+            self.assertIn(f"chromix_build_restored_target {system}", source)
+            helper = (REPO / "build/posix/upstream-cache.sh").read_text()
+            self.assertIn('"$CHROMIX_NINJA" -C "$OUT" -j "$jobs" "$@"', helper)
         stage = (REPO / "build/windows/ci-stage.ps1").read_text()
         self.assertEqual(stage.count("Invoke-Tracked -File $Ninja"), 2)
         self.assertIn("& $Ninja -C $OutDir -n chrome", stage)
@@ -428,7 +431,7 @@ class RestoreNinjaShellTest(unittest.TestCase):
 
 @unittest.skipUnless(PWSH.exists(), "PowerShell required")
 class DirectWindowsRestoredBuildTest(unittest.TestCase):
-    def run_builder(self, *, restored=True, bindgen_present=False, fail=""):
+    def run_builder(self, *, restored=True, bindgen_present=False, fail="", ninja_rc=0, resume=False):
         temporary = tempfile.TemporaryDirectory(prefix="direct windows restored ")
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
@@ -440,7 +443,8 @@ class DirectWindowsRestoredBuildTest(unittest.TestCase):
         chosen = root / "selected ninja.exe"
         env = {**os.environ, "TEST_PYTHON": sys.executable, "TEST_REPO": str(repo),
                "TEST_WORK": str(work), "TEST_OUT": str(out), "TEST_CALLS": str(calls),
-               "TEST_NINJA": str(chosen), "TEST_FAIL": fail, "TEST_RESTORED": str(int(restored))}
+               "TEST_NINJA": str(chosen), "TEST_FAIL": fail, "TEST_RESTORED": str(int(restored)),
+               "TEST_NINJA_RC": str(ninja_rc), "TEST_RESUME": str(int(resume))}
         for name in ("NINJA", "PYTHONPATH", "PYTHONHOME"):
             env.pop(name, None)
 
@@ -464,6 +468,11 @@ class DirectWindowsRestoredBuildTest(unittest.TestCase):
         put(out / "changed-compiler.obj", "upstream object")
         if restored:
             put(src / ".chromix-upstream-restored.json", "{}")
+        baseline = work / 'upstream-reuse/baseline.json'
+        if resume:
+            put(src / '.chromix-source-ready', 'ready')
+            put(baseline, '{"original": true}')
+            os.utime(baseline, ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
 
         common = (
             "import os, sys\nfrom pathlib import Path\n"
@@ -512,6 +521,33 @@ if ($env:TEST_FAIL -eq 'prep-patch') { throw "preparation failed" }
         finish += "    for name in ('gn.exe', 'chrome.exe', 'changed-compiler.obj'): (out / name).unlink()\n"
         put(repo / "tools/prepare_restored_build.py", finish)
         put(repo / "tools/restore_ninja.py", common + "record('select')\nprint(os.environ['TEST_NINJA'])\n")
+        evidence = common + '''import argparse, json
+parser = argparse.ArgumentParser()
+parser.add_argument('--phase', choices=('before', 'after'), required=True)
+parser.add_argument('--workdir', required=True)
+parser.add_argument('--platform', choices=('windows',), required=True)
+parser.add_argument('--arch', choices=('x64',), required=True)
+parser.add_argument('--ninja', required=True)
+parser.add_argument('--target', choices=('chrome',), required=True)
+parser.add_argument('--exit-code', type=int)
+args = parser.parse_args()
+assert args.workdir == str(work) and args.ninja == os.environ['TEST_NINJA']
+assert Path(os.environ['TEST_CALLS']).read_text().splitlines()[-1] == ('plan' if args.phase == 'before' else 'ninja')
+record('evidence-' + args.phase)
+directory = work / 'upstream-reuse'
+directory.mkdir(exist_ok=True)
+baseline = directory / 'baseline.json'
+if args.phase == 'before':
+    assert args.exit_code is None
+    if not baseline.exists():
+        baseline.write_text('{}')
+else:
+    assert baseline.is_file()
+    assert args.exit_code == int(os.environ['TEST_NINJA_RC'])
+    (directory / 'result.json').write_text(json.dumps({'exit_code': args.exit_code}))
+print(json.dumps({'phase': args.phase}))
+'''
+        put(repo / "tools/restored_reuse_evidence.py", evidence)
         bootstrap = common + "record('bootstrap')\n"
         bootstrap += "assert sys.argv[1:] == ['-o', str(out / 'gn.exe'), '--skip-generate-buildfiles']\n"
         bootstrap += "if os.environ['TEST_RESTORED'] == '1':\n"
@@ -519,8 +555,12 @@ if ($env:TEST_FAIL -eq 'prep-patch') { throw "preparation failed" }
         bootstrap += "    assert not (out / 'gn.exe').exists() and not (out / 'chrome.exe').exists()\n"
         bootstrap += "(out / 'gn.exe').write_text(" + repr(good_gn) + ")\n(out / 'gn.exe').chmod(0o755)\n"
         put(src / "tools/gn/bootstrap/bootstrap.py", bootstrap)
-        ninja = executable + "record('ninja')\n"
+        ninja = executable + "if '-n' in sys.argv:\n"
+        ninja += "    record('plan')\n    assert sys.argv[1:] == ['-C', str(out), '-n', 'chrome']\n    raise SystemExit(0)\n"
+        ninja += "record('ninja')\n"
         ninja += "assert sys.argv[1:] == ['-C', str(out), '-j', '3', 'chrome']\n"
+        ninja += "if os.environ['TEST_RESTORED'] == '1': assert (work / 'upstream-reuse/baseline.json').is_file()\n"
+        ninja += "if int(os.environ['TEST_NINJA_RC']): raise SystemExit(int(os.environ['TEST_NINJA_RC']))\n"
         ninja += "(out / 'chrome.exe').write_text(" + repr(chrome) + ")\n(out / 'chrome.exe').chmod(0o755)\n"
         put(chosen, ninja, True)
         put(src / "third_party/ninja/ninja.exe", executable + "record('wrong-ninja')\nraise SystemExit(99)\n" if restored else ninja, True)
@@ -532,7 +572,7 @@ function python {
   & $env:TEST_PYTHON @pythonArgs
   $global:LASTEXITCODE = $LASTEXITCODE
 }
-& (Join-Path $env:TEST_REPO 'build/windows/build.ps1') -WorkDir $env:TEST_WORK -Jobs 3
+& (Join-Path $env:TEST_REPO 'build/windows/build.ps1') -WorkDir $env:TEST_WORK -Jobs 3 -Resume:($env:TEST_RESUME -eq '1')
 ''')
         result = subprocess.run([str(PWSH), "-NoProfile", "-File", str(runner)],
                                 env=env, capture_output=True, text=True, timeout=20)
@@ -545,7 +585,11 @@ function python {
     def test_direct_restored_builder_finishes_before_bootstrapping_incompatible_gn(self):
         result, events, out, src = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(events, ['inspect', 'prep-patch', 'select', 'bindgen', 'finish', 'bootstrap', 'gn', 'ninja', 'chrome'])
+        self.assertEqual(events, ['inspect', 'prep-patch', 'select', 'bindgen', 'finish', 'bootstrap', 'gn',
+                                  'plan', 'evidence-before', 'ninja', 'evidence-after', 'chrome'])
+        evidence = out.parents[2] / 'upstream-reuse'
+        self.assertTrue((evidence / 'baseline.json').is_file())
+        self.assertEqual(json.loads((evidence / 'result.json').read_text()), {'exit_code': 0})
         self.assertFalse((out / "changed-compiler.obj").exists())
         self.assertIn("upstream_extra = true", (out / "args.gn").read_text())
         self.assertIn("symbol_level = 0", (out / "args.gn").read_text())
@@ -556,7 +600,8 @@ function python {
     def test_present_bindgen_still_finishes_without_endpoint_normalization(self):
         result, events, out, src = self.run_builder(bindgen_present=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(events, ['inspect', 'prep-patch', 'select', 'finish', 'bootstrap', 'gn', 'ninja', 'chrome'])
+        self.assertEqual(events, ['inspect', 'prep-patch', 'select', 'finish', 'bootstrap', 'gn',
+                                  'plan', 'evidence-before', 'ninja', 'evidence-after', 'chrome'])
         self.assertIn("commondatastorage.9oo91eapis.qjz9zk", (src / "tools/clang/scripts/update.py").read_text())
 
     def test_pre_gn_failures_never_execute_gn_or_ninja(self):
@@ -573,6 +618,37 @@ function python {
                 elif failure == 'finish':
                     self.assertNotIn('bootstrap', events)
 
+    def test_direct_resume_preserves_initial_evidence_baseline(self):
+        result, events, out, _ = self.run_builder(resume=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(events[-4:], ['evidence-before', 'ninja', 'evidence-after', 'chrome'])
+        baseline = out.parents[2] / 'upstream-reuse/baseline.json'
+        self.assertEqual(baseline.read_text(), '{"original": true}')
+        self.assertEqual(baseline.stat().st_mtime_ns, 1_700_000_000_000_000_000)
+
+    def test_evidence_and_plan_failures_are_fatal_before_version_check(self):
+        for failure in ('plan', 'evidence-before', 'evidence-after'):
+            with self.subTest(failure=failure):
+                result, events, _, _ = self.run_builder(fail=failure)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertNotIn('chrome', events)
+                self.assertEqual(events[-1], failure)
+                self.assertEqual('ninja' in events, failure == 'evidence-after')
+
+    def test_failed_ninja_is_recorded_and_not_masked_by_evidence_failure(self):
+        for failure in ('', 'evidence-after'):
+            with self.subTest(failure=failure):
+                result, events, out, _ = self.run_builder(fail=failure, ninja_rc=19)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn('ninja failed (exit 19)', result.stderr)
+                self.assertEqual(events[-3:], ['evidence-before', 'ninja', 'evidence-after'])
+                self.assertNotIn('chrome', events)
+                if failure:
+                    self.assertRegex(result.stderr, r'evidence collection failed after[\s|]+Ninja \(exit 23\)')
+                else:
+                    self.assertEqual(json.loads((out.parents[2] / 'upstream-reuse/result.json').read_text()),
+                                     {'exit_code': 19})
+
     def test_cold_builder_keeps_chromix_output_and_skips_restored_preparation(self):
         for bindgen_present in (False, True):
             with self.subTest(bindgen_present=bindgen_present):
@@ -580,6 +656,7 @@ function python {
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(events, ['prep-patch'] + ([] if bindgen_present else ['bindgen']) + ['gn', 'ninja', 'chrome'])
                 self.assertEqual(out.name, 'Chromix')
+                self.assertFalse((out.parents[2] / 'upstream-reuse').exists())
                 self.assertNotIn('upstream_extra', (out / 'args.gn').read_text())
                 self.assertTrue((out / 'changed-compiler.obj').exists())
                 self.assertIn('commondatastorage.9oo91eapis.qjz9zk', (src / 'tools/clang/scripts/update.py').read_text())

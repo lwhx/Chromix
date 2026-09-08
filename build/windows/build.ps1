@@ -107,8 +107,27 @@ for relative, keys in RESTORED.items():
   & $gn gen $Out --fail-on-unused-args
   if ($LASTEXITCODE -ne 0) { throw "gn gen failed" }
 
+  if (Test-Path (Join-Path $Src ".chromix-upstream-restored.json")) {
+    & $Ninja -C $Out -n chrome *> (Join-Path $WorkDir "upstream-cache-plan.log")
+    if ($LASTEXITCODE -ne 0) { throw "restored upstream build-plan check failed" }
+    # The collector preserves the initial baseline across resumed builds.
+    & python (Join-Path $Repo "tools\restored_reuse_evidence.py") --phase before `
+      --workdir $WorkDir --platform windows --arch x64 --ninja $Ninja --target chrome
+    if ($LASTEXITCODE -ne 0) { throw "restored reuse evidence collection failed before Ninja (exit $LASTEXITCODE)" }
+  }
   & $Ninja -C $Out -j $Jobs chrome
-  if ($LASTEXITCODE -ne 0) { throw "ninja failed" }
+  $ninjaRc = $LASTEXITCODE
+  if (Test-Path (Join-Path $Src ".chromix-upstream-restored.json")) {
+    try {
+      & python (Join-Path $Repo "tools\restored_reuse_evidence.py") --phase after `
+        --workdir $WorkDir --platform windows --arch x64 --ninja $Ninja --target chrome --exit-code $ninjaRc
+      if ($LASTEXITCODE -ne 0) { throw "restored reuse evidence collection failed after Ninja (exit $LASTEXITCODE)" }
+    } catch {
+      if ($ninjaRc -ne 0) { throw "ninja failed (exit $ninjaRc); $($_.Exception.Message)" }
+      throw
+    }
+  }
+  if ($ninjaRc -ne 0) { throw "ninja failed (exit $ninjaRc)" }
 } finally {
   Pop-Location
 }

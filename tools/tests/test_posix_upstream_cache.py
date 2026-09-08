@@ -64,7 +64,7 @@ class PosixUpstreamCacheTest(unittest.TestCase):
                 path.chmod(0o755)
 
             builder = "build/build.sh" if platform == "linux" else "build/macos/build.sh"
-            for relative in (builder, "build/posix/upstream-cache.sh", "tools/merge_gn_args.py"):
+            for relative in (builder, "build/posix/upstream-cache.sh", "tools/merge_gn_args.py", "tools/macos_runtime.py"):
                 target = repo / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(REPO / relative, target)
@@ -76,6 +76,16 @@ assert (Path({str(src)!r}) / '.chromix-upstream-restored.json').is_file()
 with open(os.environ['CALL_LOG'], 'a') as output:
     output.write('ninja-guard\\n')
 print(os.environ['SELECTED_NINJA'])
+''')
+            (repo / "tools/restored_reuse_evidence.py").write_text('''import os, sys
+from pathlib import Path
+args = sys.argv[1:]
+phase = args[args.index('--phase') + 1]
+assert args[args.index('--ninja') + 1] == os.environ['SELECTED_NINJA']
+if phase == 'after':
+    assert args[args.index('--exit-code') + 1] == '0'
+with open(os.environ['CALL_LOG'], 'a') as output:
+    output.write('evidence-' + phase + '\\n')
 ''')
             script(repo / "build/prepare-ungoogled.sh", 'printf "prepare\\n" >> "$CALL_LOG"\n')
             script(repo / "build/posix/prepare-restored-tools.sh",
@@ -119,7 +129,7 @@ print(os.environ['SELECTED_NINJA'])
                 self.assertEqual(log.read_text().splitlines(), ["prepare", "ninja-guard", "tools"])
             else:
                 self.assertEqual(log.read_text().splitlines(),
-                                 ["prepare", "ninja-guard", "tools", "gn", "ninja", "ninja"] * 2)
+                                 ["prepare", "ninja-guard", "tools", "gn", "ninja", "evidence-before", "ninja", "evidence-after"] * 2)
                 args = (out / "args.gn").read_text()
                 self.assertIn("upstream_extra = true", args)
                 self.assertIn("symbol_level = 0", args)
@@ -140,6 +150,40 @@ print(os.environ['SELECTED_NINJA'])
         for platform in ("linux", "macos"):
             with self.subTest(platform=platform):
                 self.run_restored_builder(platform, "x64", fail_tools=True)
+
+    def test_actual_build_evidence_gates_and_preserves_ninja_failure(self):
+        for before_rc, ninja_rc, after_rc, expected in ((0, 0, 0, 0), (7, 0, 0, 1),
+                                                       (0, 13, 0, 13), (0, 0, 8, 8), (0, 13, 8, 13)):
+            with self.subTest(before=before_rc, ninja=ninja_rc, after=after_rc), \
+                    tempfile.TemporaryDirectory(prefix="reuse shell ") as directory:
+                root = Path(directory)
+                src = root / "work/src"
+                src.mkdir(parents=True)
+                (src / ".chromix-upstream-restored.json").touch()
+                (root / "tools").mkdir()
+                calls = root / "calls"
+                (root / "tools/restored_reuse_evidence.py").write_text('''import os, sys
+args=sys.argv[1:]
+phase=args[args.index('--phase')+1]
+with open(os.environ['CALLS'], 'a') as stream:
+    stream.write(phase + (' ' + args[args.index('--exit-code')+1] if phase=='after' else '') + '\\n')
+sys.exit(int(os.environ['BEFORE_RC' if phase=='before' else 'AFTER_RC']))
+''')
+                ninja = root / "selected ninja"
+                ninja.write_text('#!/bin/sh\nprintf "ninja\\n" >> "$CALLS"\nexit "$NINJA_RC"\n')
+                ninja.chmod(0o755)
+                env = {**os.environ, "REPO": str(root), "WORK": str(src.parent), "SRC": str(src),
+                       "OUT": str(src / "out/Default"), "ARCH": "x64", "CHROMIX_NINJA": str(ninja),
+                       "CALLS": str(calls), "BEFORE_RC": str(before_rc), "AFTER_RC": str(after_rc),
+                       "NINJA_RC": str(ninja_rc)}
+                result = subprocess.run([str(BASH32 if BASH32.exists() else shutil.which("bash")),
+                                         "-euo", "pipefail", "-c",
+                                         'source "$1"; chromix_build_restored_target linux 2 chrome', "fixture",
+                                         str(REPO / "build/posix/upstream-cache.sh")],
+                                        env=env, capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                self.assertEqual(calls.read_text().splitlines(), ["before"] if before_rc else
+                                 ["before", "ninja", f"after {ninja_rc}"])
 
     def run_helper(self, bash, enabled):
         with tempfile.TemporaryDirectory(prefix="cache shell ") as directory:

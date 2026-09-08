@@ -71,7 +71,49 @@ class WindowsUpstreamCacheRegressionTest(unittest.TestCase):
         for number in range(2, 13):
             job = workflow_job(self.workflow, f"build-{number}")
             self.assertIn(f"-StageIndex {number} -MaxStages 12 -FromArtifact", job)
-            self.assertNotIn("upstream", job.lower())
+            self.assertNotIn("UPSTREAM_RUN_ID", job)
+            self.assertNotIn("fetch_upstream_cache.py", job)
+            self.assertNotIn("-UseUpstreamCache", job)
+
+    def test_every_build_stage_always_uploads_only_small_reuse_evidence(self):
+        import yaml
+
+        jobs = yaml.safe_load(self.workflow)["jobs"]
+        evidence_paths = {r"C:\c\chromix\upstream-reuse\baseline.json",
+                          r"C:\c\chromix\upstream-reuse\result.json"}
+        for number in range(1, 13):
+            with self.subTest(stage=number):
+                steps = jobs[f"build-{number}"]["steps"]
+                uploads = [step for step in steps if step.get("uses") == "actions/upload-artifact@v4"
+                           and "upstream-reuse" in step["with"]["path"]]
+                self.assertEqual(len(uploads), 1)
+                upload = uploads[0]
+                self.assertEqual(upload["if"], "${{ always() }}")
+                self.assertEqual(upload["with"]["if-no-files-found"], "ignore")
+                self.assertIn("${{ github.run_attempt }}", upload["with"]["name"])
+                paths = set(upload["with"]["path"].splitlines())
+                self.assertTrue(evidence_paths <= paths)
+                if number > 1:
+                    self.assertEqual(paths, evidence_paths)
+                    self.assertIn("${{ github.job }}", upload["with"]["name"])
+                self.assertFalse(any("*" in path or "obj" in path or "parts" in path for path in paths))
+                self.assertLess(steps.index(upload), next(index for index, step in enumerate(steps)
+                                                         if step.get("name") == "Ensure build tree snapshot"))
+        self.assertNotIn("upstream-reuse", self.validate)
+
+    def test_reuse_hooks_wrap_only_actual_chrome_and_precede_packaging_or_throw(self):
+        before = self.stage.index('restored_reuse_evidence.py") --phase before')
+        built = self.stage.index('$rc = Invoke-Tracked -File $Ninja')
+        after = self.stage.index('restored_reuse_evidence.py") --phase after')
+        self.assertLess(self.stage.index('& $Ninja -C $OutDir -n chrome'), before)
+        self.assertLess(self.stage.rindex('if ($ValidateOnly) {'), before)
+        self.assertLess(self.stage.index('if ($ninjaBudget -lt 20)'), before)
+        self.assertLess(before, built)
+        self.assertLess(built, after)
+        self.assertLess(after, self.stage.index('if ($rc -eq 0) {', after))
+        self.assertLess(after, self.stage.index('if ($rc -eq 124) {', after))
+        self.assertIn('--ninja $Ninja --target chrome --exit-code $rc', self.stage)
+        self.assertEqual(self.stage.count('restored_reuse_evidence.py'), 2)
 
     def test_resume_verifies_receipt_and_ready_key_before_migrations(self):
         restore = self.stage.index('& $sevenZip x "C:\\restore\\tree.7z.001"')
@@ -741,11 +783,46 @@ struct.pack_into('<I', header, 60, 64)
 header.extend(b'PE\\0\\0' + struct.pack('<H', 0x8664))
 gn.write_bytes(header)
 ''')
+        self.put(self.repo / "tools/restored_reuse_evidence.py", '''import argparse, json, os
+from pathlib import Path
+parser = argparse.ArgumentParser()
+parser.add_argument('--phase', choices=('before', 'after'), required=True)
+parser.add_argument('--workdir', type=Path, required=True)
+parser.add_argument('--platform', choices=('windows',), required=True)
+parser.add_argument('--arch', choices=('x64',), required=True)
+parser.add_argument('--ninja', required=True)
+parser.add_argument('--target', choices=('chrome',), required=True)
+parser.add_argument('--exit-code', type=int)
+args = parser.parse_args()
+assert args.workdir == Path(os.environ['MOCK_WORK'])
+selection = json.loads((args.workdir / 'upstream-cache-ninja.json').read_text())
+assert args.ninja == selection['selected']['path']
+calls = Path(os.environ['MOCK_CALLS'])
+assert calls.read_text().splitlines()[-1] == ('ninja-plan' if args.phase == 'before' else 'ninja')
+with calls.open('a') as output:
+    output.write('evidence-' + args.phase + '\\n')
+directory = args.workdir / 'upstream-reuse'
+directory.mkdir(exist_ok=True)
+baseline = directory / 'baseline.json'
+if args.phase == 'before':
+    assert args.exit_code is None
+    if not baseline.exists():
+        baseline.write_text(json.dumps({'stage': os.environ['MOCK_STAGE']}))
+else:
+    assert baseline.is_file()
+    assert args.exit_code == int(os.environ['MOCK_NINJA_RC'])
+    (directory / 'result.json').write_text(json.dumps({'exit_code': args.exit_code}))
+print(json.dumps({'phase': args.phase}))
+raise SystemExit(37 if os.environ.get('MOCK_EVIDENCE_FAILURE') == args.phase else 0)
+''')
+        self.put(self.root / "package-win.ps1", r'''
+param($Out, $Dest)
+Add-Content -LiteralPath $env:MOCK_CALLS -Value "package"
+''')
         self.put(self.root / "prepare-ungoogled.ps1", self.script.read_text())
         stage = STAGE.read_text()
         start = stage.index('$domainProgress = Join-Path $Src')
-        end = stage.index('\nif ($ValidateOnly) {', start)
-        body = stage[start:end]
+        body = stage[start:]
         # PE execution is stubbed on Linux; PowerShell control flow and Python helpers are real.
         body = body.replace('& $gn gen $OutDir --fail-on-unused-args',
                             'Invoke-FixtureGn gen $OutDir --fail-on-unused-args')
@@ -754,20 +831,35 @@ gn.write_bytes(header)
         body = body.replace(plan, 'Invoke-FixtureNinja $Ninja -C $OutDir -n chrome')
         self.put(self.wrapper, self.wrapper.read_text().split('& $env:MOCK_SCRIPT', 1)[0] + r'''
 $Repo = $env:MOCK_REPO
+$Root = Split-Path $env:MOCK_WORK
 $WorkDir = $env:MOCK_WORK
 $Src = Join-Path $WorkDir "src"
 $OutDir = Join-Path $Src "out/Chromix"
 $RestoredUpstream = $false
 $StageIndex = [int]$env:MOCK_STAGE
 $FromArtifact = $StageIndex -gt 1
-$ValidateOnly = $false
+$ValidateOnly = $env:MOCK_VALIDATE -eq "1"
 $UseUpstreamCache = $true
 $UpstreamRunId = ""
 $Deadline = (Get-Date).AddMinutes(250)
 $PackReserveMin = 40
 $Revisions = Import-PowerShellDataFile (Join-Path $Repo "build/ungoogled-revisions.psd1")
-function Get-RemainingMin { return 250 }
-function Save-Handoff { throw "unexpected handoff" }
+function Get-RemainingMin { return [int]$env:MOCK_MINUTES }
+function Save-Handoff { param($Mode); Add-Content -LiteralPath $env:MOCK_CALLS -Value "handoff:$Mode" }
+function Write-OutVar($key, $value) { Write-Host "$key=$value" }
+function Verify-FinalBundle { Add-Content -LiteralPath $env:MOCK_CALLS -Value "verify-bundle" }
+function Invoke-Tracked {
+  param($File, $ArgList, $Cwd, $TimeoutSec, [switch]$FullFailureOutput)
+  if ($File -ne $Ninja -or $Cwd -ne $Src) { throw "build did not use selected Ninja/source" }
+  if ($ValidateOnly) {
+    if ($ArgList -notlike "*gen/v8/torque-generated/bit-field-asserts.cc") { throw "unexpected validation target" }
+    Add-Content -LiteralPath $env:MOCK_CALLS -Value "torque"
+  } else {
+    if ($ArgList -ne "-C `"$OutDir`" -j 4 chrome") { throw "unexpected build arguments" }
+    Add-Content -LiteralPath $env:MOCK_CALLS -Value "ninja"
+  }
+  return [int]$env:MOCK_NINJA_RC
+}
 function python {
   if ($args[0] -eq "-c") {
     Add-Content -LiteralPath $env:MOCK_CALLS -Value "normalize"
@@ -794,7 +886,8 @@ function Invoke-FixtureNinja {
   $global:LASTEXITCODE = 0
 }
 ''' + body)
-        self.env["MOCK_STAGE"] = "1"
+        self.env.update(MOCK_STAGE="1", MOCK_VALIDATE="0", MOCK_MINUTES="250", MOCK_NINJA_RC="0",
+                        MOCK_EVIDENCE_FAILURE="")
 
     def phases(self):
         return [line for line in self.calls.read_text().splitlines() if not line.startswith("git ")]
@@ -806,7 +899,13 @@ function Invoke-FixtureNinja {
         first = self.run_prep()
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
         self.assertEqual(self.phases(), ["verify", "verify", "inspect", "ninja-guard", "normalize", "bindgen", "finish",
-                                         "gn-bootstrap", "gn-gen", "ninja-plan"])
+                                         "gn-bootstrap", "gn-gen", "ninja-plan", "evidence-before", "ninja",
+                                         "evidence-after", "package", "verify-bundle"])
+        evidence = self.work / "upstream-reuse"
+        baseline = evidence / "baseline.json"
+        baseline_bytes = baseline.read_bytes()
+        baseline_time = baseline.stat().st_mtime_ns
+        self.assertEqual(json.loads((evidence / "result.json").read_text()), {"exit_code": 0})
         report = self.report()
         self.assertEqual((report["platform"], report["arch"], report["phase"]), ("windows", "x64", "finish"))
         self.assertTrue(report["ready_for_gn"])
@@ -832,10 +931,56 @@ function Invoke-FixtureNinja {
         self.env["MOCK_STAGE"] = "2"
         resumed = self.run_prep()
         self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
-        self.assertEqual(self.phases(), ["verify", "verify", "inspect", "ninja-guard", "finish", "gn-gen", "ninja-plan"])
+        self.assertEqual(self.phases(), ["verify", "verify", "inspect", "ninja-guard", "finish", "gn-gen", "ninja-plan",
+                                         "evidence-before", "ninja", "evidence-after", "package", "verify-bundle"])
         self.assertEqual(self.report()["counters"]["toolchain_invalidated_outputs"], 0)
         self.assertEqual(times, {name: (self.out / name).stat().st_mtime_ns for name in times})
         self.assertEqual((self.out / "args.gn").read_text(), args)
+        self.assertEqual(baseline.read_bytes(), baseline_bytes)
+        self.assertEqual(baseline.stat().st_mtime_ns, baseline_time)
+
+    def test_ninja_failure_and_timeout_record_exit_before_throw_or_handoff(self):
+        for rc in (9, 124):
+            with self.subTest(rc=rc):
+                self.calls.unlink(missing_ok=True)
+                self.env["MOCK_NINJA_RC"] = str(rc)
+                result = self.run_prep()
+                self.assertEqual(result.returncode == 0, rc == 124, result.stdout + result.stderr)
+                expected = ["evidence-before", "ninja", "evidence-after"]
+                if rc == 124:
+                    expected.append("handoff:Synced")
+                else:
+                    self.assertIn("ninja failed (exit 9)", result.stderr)
+                self.assertEqual(self.phases()[-len(expected):], expected)
+                self.assertNotIn("package", self.phases())
+                self.assertEqual(json.loads((self.work / "upstream-reuse/result.json").read_text()), {"exit_code": rc})
+
+    def test_evidence_failure_is_fatal_and_preserves_failed_ninja_exit(self):
+        for phase, rc in (("before", 0), ("after", 0), ("after", 9), ("after", 124)):
+            with self.subTest(phase=phase, rc=rc):
+                self.calls.unlink(missing_ok=True)
+                self.env.update(MOCK_EVIDENCE_FAILURE=phase, MOCK_NINJA_RC=str(rc))
+                result = self.run_prep()
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertRegex(result.stderr, rf"evidence collection failed {phase}[\s|]+Ninja \(exit 37\)")
+                self.assertEqual(self.phases()[-1], "evidence-" + phase)
+                self.assertEqual("ninja" in self.phases(), phase == "after")
+                self.assertNotIn("package", self.phases())
+                self.assertNotIn("handoff:Synced", self.phases())
+                if rc:
+                    self.assertIn(f"ninja failed (exit {rc})", result.stderr)
+
+    def test_torque_and_budget_only_paths_never_collect_evidence(self):
+        for validate, minutes, last in (("1", "250", "torque"), ("0", "59", "handoff:Synced")):
+            with self.subTest(validate=validate, minutes=minutes):
+                self.calls.unlink(missing_ok=True)
+                self.env.update(MOCK_VALIDATE=validate, MOCK_MINUTES=minutes)
+                result = self.run_prep()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.phases()[-1], last)
+                self.assertNotIn("ninja", self.phases())
+                self.assertFalse(any(phase.startswith("evidence-") for phase in self.phases()))
+                self.assertFalse((self.work / "upstream-reuse").exists())
 
     def test_native_tools_keep_internal_objects_but_recheck_external_sdk_on_resume(self):
         rust = self.src / "third_party/rust-toolchain/bin"
@@ -845,7 +990,8 @@ function Invoke-FixtureNinja {
         before = (self.out / "obj/retained.obj").stat().st_mtime_ns
         first = self.run_prep()
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        self.assertEqual(self.phases(), ["verify", "verify", "inspect", "ninja-guard", "finish", "gn-gen", "ninja-plan"])
+        self.assertEqual(self.phases(), ["verify", "verify", "inspect", "ninja-guard", "finish", "gn-gen", "ninja-plan",
+                                         "evidence-before", "ninja", "evidence-after", "package", "verify-bundle"])
         self.assertEqual((self.out / "obj/retained.obj").stat().st_mtime_ns, before)
         self.assertFalse((self.out / "obj/sdk.obj").exists())
         self.assertEqual(self.report()["dependencies"]["external_dependency_outputs"], 1)
@@ -876,7 +1022,12 @@ function Invoke-FixtureNinja {
                 self.assertNotIn("gn-bootstrap", self.phases())
                 self.assertNotIn("gn-gen", self.phases())
                 self.assertNotIn("ninja-plan", self.phases())
-                self.assertFalse((self.work / "upstream-cache-preparation.json").exists())
+                report = self.report()
+                self.assertFalse(report["ready_for_gn"])
+                self.assertEqual(report["phase"], "inspect" if failed_tool == "builder" else "finish")
+                if failed_tool != "builder":
+                    self.assertIn(failed_tool, report["error"])
+                self.assertFalse((self.src / ".chromix-restored-build-prepared.json").exists())
                 self.assertTrue((self.out / "chrome.exe").exists())
                 self.assertTrue((self.src / ".chromix-restored-build-inspection.json").exists())
 
