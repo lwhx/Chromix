@@ -156,6 +156,27 @@ class PosixSnapshotRoundTripTest(unittest.TestCase):
         self.assertIn('CHROMIX_SNAPSHOT_MAX_VOLUMES', parts_source)
         self.assertIn('"$SPLIT" -a 3 -d -b "$VOLUME_BYTES"', parts_source)
 
+    def test_stage_chain_is_macos_bash_3_2_compatible(self):
+        stage_source = CI_STAGE.read_text(encoding="utf-8")
+        # macOS runners execute workflow steps with the system /bin/bash
+        # 3.2. Three first-run failure classes came from treating this like a
+        # modern bash or a GNU-only Linux toolchain:
+        self.assertIn(
+            'REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"',
+            stage_source)
+        # 1. $(( )) cannot nest quoted command substitution on bash 3.2
+        #    (macos stage 1 died at remaining_min); expand to variables.
+        self.assertNotIn('- "$(now_epoch)")', stage_source)
+        self.assertNotIn("- \"$(now_epoch)\")", stage_source)
+        self.assertIn('left=$(( (DEADLINE_EPOCH - now) / 60 ))',
+                      stage_source)
+        # 2. GNU timeout does not exist on macOS; coreutils ships gtimeout,
+        #    so the ninja deadline and smoke checks must resolve it first.
+        self.assertIn('elif command -v gtimeout >/dev/null 2>&1; then',
+                      stage_source)
+        self.assertNotIn(' timeout 30s ', stage_source)
+        self.assertNotIn(' timeout 60s ', stage_source)
+
     def test_linux_build_selects_host_arch_tools_like_upstream_portablelinux(self):
         source = (REPO / "build" / "build.sh").read_text(encoding="utf-8")
         # Upstream setup_toolchain keys Node/Go to the host architecture;
@@ -165,6 +186,72 @@ class PosixSnapshotRoundTripTest(unittest.TestCase):
         self.assertIn('third_party/dawn/tools/golang/linux-$GO_ARCH/bin/go', source)
         self.assertIn('SYSROOT_ARCH=amd64', source)
         self.assertIn('SYSROOT_ARCH=arm64', source)
+
+
+@unittest.skipUnless(
+    Path(os.path.expanduser("~/.local/bash-3.2-for-ci/bash")).is_file(),
+    "locally built bash 3.2 required (matches macOS /bin/bash)")
+class PosixStageBash32ExecutionTest(unittest.TestCase):
+    """Execute the handoff chain under real bash 3.2 like macOS runners do.
+
+    Static checks cannot catch what this class caught in the first real run:
+    quoted command substitution inside $(( )) dies on bash 3.2, GNU timeout
+    does not exist on macOS, and a wrong REPO hop broke every $REPO path.
+    Both stage paths below run with a deadline that forces the prepare
+    budget under its minimum, exercising argument parsing, remaining_min,
+    GITHUB_OUTPUT emission, ci-parts packing, cross-segment restore, and the
+    second handoff - without compiling anything.
+    """
+
+    BASH32 = Path(os.path.expanduser("~/.local/bash-3.2-for-ci/bash"))
+
+    def test_stage1_handoff_then_stage2_restore_and_rehandoff(self):
+        import datetime
+        base = Path(tempfile.mkdtemp(prefix="chromix bash32 "))
+        self.addCleanup(shutil.rmtree, base, ignore_errors=True)
+        work = base / "work"
+        work.mkdir()
+        out_file = base / "github_output"
+        # remaining minutes minus reserve lands below the 25-minute minimum.
+        deadline = int(datetime.datetime.now().timestamp()) + 40 * 60
+
+        def run_stage(args):
+            return subprocess.run(
+                [str(self.BASH32), "--norc", str(CI_STAGE), *args],
+                capture_output=True, text=True,
+                env={**os.environ,
+                     "CHROMIX_RESERVE_MINUTES": "45",
+                     "GITHUB_OUTPUT": str(out_file)})
+
+        stage1 = run_stage(["--platform", "macos", "--arch", "arm64",
+                            "--workdir", str(work),
+                            "--stage-index", "1", "--max-stages", "8",
+                            "--deadline-epoch", str(deadline)])
+        self.assertEqual(stage1.returncode, 0,
+                         stage1.stdout + stage1.stderr)
+        snap = work / ".snapshot-stage-1"
+        volumes = list(snap.rglob("tree.tar.zst.*"))
+        self.assertTrue(volumes)
+        outputs = dict(line.split("=", 1)
+                       for line in out_file.read_text().splitlines())
+        self.assertEqual(outputs["status"], "running")
+        self.assertEqual(outputs["finished"], "false")
+        self.assertEqual(outputs["upload_snapshot"], "true")
+
+        restore = base / "restore"
+        shutil.copytree(snap, restore)
+        out_file.write_text("")
+        stage2 = run_stage(["--platform", "linux", "--arch", "x64",
+                            "--workdir", str(work),
+                            "--stage-index", "2", "--max-stages", "8",
+                            "--from-snapshot", str(restore),
+                            "--deadline-epoch", str(deadline)])
+        self.assertEqual(stage2.returncode, 0,
+                         stage2.stdout + stage2.stderr)
+        # The consuming stage must remove the restore directory after
+        # unpacking so RUNNER_TEMP never reuses stale volumes.
+        self.assertFalse(restore.exists())
+        self.assertTrue((work / ".snapshot-stage-2" / "p1").is_dir())
 
 
 @unittest.skipUnless(shutil.which("zstd"), "zstd required")

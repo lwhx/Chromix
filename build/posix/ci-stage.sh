@@ -14,7 +14,9 @@
 #     [--from-snapshot DIR] [--deadline-epoch EPOCH] [--reserve-minutes N]
 set -euo pipefail
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Resolve to the repository root: this script lives at <repo>/build/posix/,
+# so two parent hops are needed, not one.
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PLATFORM=""
 ARCH=""
 WORK="${CHROMIX_WORKDIR:-$REPO/.chromix-build-posix}"
@@ -60,7 +62,12 @@ now_epoch() { date +%s; }
 
 remaining_min() {
   if [ "${DEADLINE_EPOCH:-0}" -le 0 ]; then echo 300; return; fi
-  local left=$(( (DEADLINE_EPOCH - "$(now_epoch)") / 60 ))
+  # macOS runners execute workflow steps with the system /bin/bash 3.2,
+  # whose $(( )) cannot nest a quoted command substitution; expand to a
+  # variable first (verified against a locally built 3.2.0).
+  local now left
+  now="$(now_epoch)"
+  left=$(( (DEADLINE_EPOCH - now) / 60 ))
   [ "$left" -lt 0 ] && left=0
   echo "$left"
 }
@@ -115,8 +122,19 @@ else
   BUILD_SCRIPT="$REPO/build/macos/build.sh"
 fi
 
+# GNU timeout is not shipped by macOS; Homebrew's coreutils provides it as
+# gtimeout with identical semantics (-k/-s), mirroring the gsplit fallback
+# in ci-parts.sh.
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT=timeout
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT=gtimeout
+else
+  die "neither timeout nor gtimeout is available"
+fi
+
 set +e
-timeout -k 7m -s SIGTERM "${NINJA_BUDGET}m" \
+"$TIMEOUT" -k 7m -s SIGTERM "${NINJA_BUDGET}m" \
   env CHROMIX_SKIP_DEPS=1 CHROMIX_WORKDIR="$WORK" \
     "$BUILD_SCRIPT" "$WORK" "$ARCH"
 RC=$?
@@ -167,14 +185,14 @@ unzip -q "$DEST_DIST/$ASSET" -d "$SMOKE_DIR"
 LAUNCHER="$SMOKE_DIR/chromix/chromix"
 [ -x "$LAUNCHER" ] || die "extracted bundle launcher is missing: $LAUNCHER"
 
-VERSION_OUTPUT="$(timeout 30s "$LAUNCHER" --version)" ||
+VERSION_OUTPUT="$("$TIMEOUT" 30s "$LAUNCHER" --version)" ||
   die "extracted launcher --version check failed"
 echo "$VERSION_OUTPUT"
 CHROMIUM_VERSION_PIN="$(tr -d '\n' < "$REPO/CHROMIUM_VERSION")"
 grep -qF "$CHROMIUM_VERSION_PIN" <<<"$VERSION_OUTPUT" ||
   die "extracted browser version does not match the pinned Chromium version"
 
-DOM_OUTPUT="$(timeout 60s "$LAUNCHER" --headless --disable-gpu --no-first-run \
+DOM_OUTPUT="$("$TIMEOUT" 60s "$LAUNCHER" --headless --disable-gpu --no-first-run \
   --no-default-browser-check "--user-data-dir=$SMOKE_DIR/profile" \
   --dump-dom 'data:text/html,<p>chromix-smoke-ok</p>')" ||
   die "extracted headless smoke test failed"

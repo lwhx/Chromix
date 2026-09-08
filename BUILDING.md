@@ -137,11 +137,17 @@ snapshotting inside GitHub's 355/360-minute limits:
    and resumes.
 
 Compile failures fail the job immediately; only the timeout hands off.
-`tree.tar.zst*` archives over eight volumes (eight ~9 GB slices) abort the
-chain rather than upload a broken handoff, mirroring the Windows multi-volume
-guard; between five and eight volumes the chain continues with an explicit
-warning instead of aborting, because re-packing hundreds of gigabytes buys
-nothing once the per-artifact upload cap is the real constraint. Stage jobs declare
+The POSIX stage scripts stay compatible with the system `/bin/bash` 3.2 that
+runs GitHub's macOS workflow steps (no nested quoted command substitution
+inside `$(( ))`, no bare GNU `timeout`/`split` - both resolve through a
+`gtimeout`/`gsplit` Homebrew fallback like upstream), and the handoff plus
+restore paths are executed end to end under a locally built real bash 3.2 in
+the regression suite. `tree.tar.zst*` archives over eight volumes (eight
+~9 GB slices) abort the chain rather than upload a broken handoff,
+mirroring the Windows multi-volume guard; between five and eight volumes
+the chain continues with an explicit warning instead of aborting, because
+re-packing hundreds of gigabytes buys nothing once the per-artifact upload
+cap is the real constraint. Stage jobs declare
 `if: always() && needs.posix-N.result == 'success' && needs.posix-N.outputs.finished != 'true'`,
 so an early finish skips later stages while hard failures stop the platform.
 
