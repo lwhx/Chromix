@@ -429,6 +429,19 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "GN bootstrap failed" }
   }
   if (-not (Test-Path "third_party\rust-toolchain\bin\bindgen.exe")) {
+    # bindgen's build script hard-requires cargo+rustc that prepare merged
+    # into third_party\rust-toolchain; failing fast here with the directory
+    # state keeps a silent merge regression from dying 45 minutes of ninja
+    # bootstrap output later with only a bare missing-cargo line.
+    foreach ($binary in @("cargo.exe", "rustc.exe")) {
+      if (-not (Test-Path "third_party\rust-toolchain\bin\$binary")) {
+        Get-ChildItem third_party -Directory |
+          Where-Object { $_.Name -like "rust-toolchain*" } | ForEach-Object {
+            Write-Host "    toolchain dir: $($_.Name)"
+          }
+        throw ("bindgen precondition failed: third_party\rust-toolchain\bin\$binary is missing")
+      }
+    }
     python tools\rust\build_bindgen.py --skip-test
     if ($LASTEXITCODE -ne 0) { throw "bindgen build failed" }
   }

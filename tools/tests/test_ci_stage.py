@@ -545,5 +545,132 @@ class RestoredSourceUpdateRegressionTest(unittest.TestCase):
         )
 
 
+class RustToolchainMergeRegressionTest(unittest.TestCase):
+    """The first real CI run died at build_bindgen.py: "Missing cargo".
+
+    Root cause class: prepare ran under Windows PowerShell 5.1 on GitHub, and
+    the Prepare-RustToolchain PowerShell transcription of upstream's merge
+    silently produced a tree without bin/cargo.exe (every pwsh 7 replication
+    of it looked perfect). These tests keep every layer of the fix in place:
+    a Python merge ported verbatim from ungoogled-chromium-windows' field-
+    proven build.py, hard verification that cargo and rustc actually landed,
+    diagnostics printing bundle and merged-entry listings on failure, and a
+    bindgen precondition in ci-stage.ps1 so this failure mode dies loudly
+    before ninja bootstrap burns forty minutes.
+    """
+
+    MERGE_PY = REPO / "build" / "windows" / "prep_rust_toolchain.py"
+
+    def test_wrapper_delegates_to_python_port_and_verifies_result(self):
+        prepare = PREPARE_UNGOOGLED.read_text(encoding="utf-8")
+        wrapper = prepare[
+            prepare.index("function Prepare-RustToolchain {"):
+            prepare.index("function Restore-LiteTarballFiles")
+        ]
+        # The silent PS 5.1 copy loop must stay gone; only the upstream-python
+        # port performs the merge now.
+        self.assertNotIn("Copy-Item", wrapper)
+        self.assertIn('Join-Path $Repo "build\\windows\\prep_rust_toolchain.py"', wrapper)
+        self.assertIn('"--third-party-root", (Join-Path $Src "third_party")', wrapper)
+        # Defense in depth: verify independently of the python exit code and
+        # dump every rust-toolchain directory when verification fails.
+        self.assertIn('if (-not (Test-Path (Join-Path $destination "bin\\$binary")))',
+                      wrapper)
+        self.assertIn('Where-Object { $_.Name -like "rust-toolchain*" }', wrapper)
+        self.assertIn('throw "Rust toolchain merge did not produce bin\\$binary"', wrapper)
+
+    def test_ci_stage_fails_fast_with_diagnostics_when_cargo_is_missing(self):
+        stage = CI_STAGE.read_text(encoding="utf-8")
+        guard_start = stage.index(
+            'if (-not (Test-Path "third_party\\rust-toolchain\\bin\\bindgen.exe")) {')
+        bindgen_call = stage.index("python tools\\rust\\build_bindgen.py", guard_start)
+        guard = stage[guard_start:bindgen_call]
+        self.assertIn('if (-not (Test-Path "third_party\\rust-toolchain\\bin\\$binary"))',
+                      guard)
+        self.assertIn(
+            'throw ("bindgen precondition failed: '
+            'third_party\\rust-toolchain\\bin\\$binary is missing")', guard)
+        # The precondition must gate the bindgen invocation itself.
+        guard_end = stage.index('\\$binary is missing")', guard_start)
+        self.assertLess(guard_end, bindgen_call)
+
+    def test_merge_port_keeps_upstream_semantics_and_verifies_before_stamping(self):
+        source = self.MERGE_PY.read_text(encoding="utf-8")
+        # Upstream merge semantics: bin+lib from component dirs, host-bin from
+        # x64 only on 64-bit hosts, version stamp via rustc --version.
+        self.assertIn('DIRS_TO_COPY = ["bin", "lib"]', source)
+        self.assertIn('(part == "bin") and', source)
+        # The condition spans three lines in the port; match the inner test,
+        # which is what locks the upstream x64-only-bin rule.
+        self.assertIn('host_is_64bit != (source.name == "rust-toolchain-x64")', source)
+        self.assertIn('shutil.copytree(cp_src, cp_dst, dirs_exist_ok=True)', source)
+        self.assertIn('subprocess.run([str(rustc), "--version"], stdout=handle, check=True)', source)
+        # Missing binaries must fail with an inventory even where executing
+        # the bundled rustc.exe is impossible: verify runs before stamping.
+        self.assertIn('BINARIES_THAT_MUST_EXIST = ["cargo.exe", "rustc.exe"]', source)
+        order_verify = source.index("merge_toolchain(sources, destination)")
+        order_stamp = source.index("write_installed_version(destination, sources)")
+        self.assertLess(order_verify, order_stamp)
+        # Absolute-path binding keeps "--third-party-root ." meaningful.
+        self.assertIn('root = Path(args.third_party_root or ".").resolve()', source)
+
+    def test_merge_port_executes_against_a_real_bundle_layout(self):
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+
+        if not os.path.exists("/bin/true"):
+            self.skipTest("/bin/true not available")
+
+        temp = tempfile.TemporaryDirectory(prefix="chromix rust merge ")
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name) / "tp"
+        x64 = root / "rust-toolchain-x64"
+        arm = root / "rust-toolchain-arm"
+        # Component-directory layout of the pinned rust nightly bundles:
+        # executables live under <component>/bin, libraries under
+        # <component>/lib.
+        for base in (x64, arm):
+            for part in ("bin", "lib"):
+                payload = base / f"rustc/{part}"
+                payload.mkdir(parents=True)
+                shutil.copy("/bin/true", payload / "cargo.exe")
+            if base is x64:
+                shutil.copy("/bin/true", base / "rustc/bin/rustc.exe")
+
+        result = subprocess.run(
+            ["python3", str(self.MERGE_PY), "--third-party-root", str(root)],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        merged = root / "rust-toolchain"
+        # Host executables come from the bundles' component dirs...
+        self.assertTrue((merged / "bin/cargo.exe").is_file())
+        self.assertTrue((merged / "bin/rustc.exe").is_file())
+        # ...and lib payloads merged from every available bundle, mirroring
+        # the glob */{bin,lib}/* semantics of upstream's merge.
+        self.assertTrue((merged / "lib/cargo.exe").is_file())
+        self.assertEqual(result.stdout.strip().splitlines()[-1],
+                         f"==> merged Rust toolchain: 2 bundles -> {merged}")
+        self.assertTrue((merged / "INSTALLED_VERSION").exists())
+
+    def test_merge_port_reports_missing_x64_bundle_loudly(self):
+        import subprocess
+        import tempfile
+
+        temp = tempfile.TemporaryDirectory(prefix="chromix rust merge bad ")
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name) / "tp"
+        result = subprocess.run(
+            ["python3", str(self.MERGE_PY), "--third-party-root", str(root)],
+            capture_output=True, text=True)
+        # No x64 bundle present must fail with the inventory rather than an
+        # unhandled traceback or - worse - a silent zero exit like PS 5.1 did.
+        self.assertNotEqual(result.returncode, 0)
+        combined = result.stderr + result.stdout
+        self.assertIn("no downloaded x64 rust bundle", combined)
+
+
 if __name__ == "__main__":
     unittest.main()

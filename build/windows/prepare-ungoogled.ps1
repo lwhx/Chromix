@@ -101,17 +101,23 @@ function Prepare-RustToolchain {
   $destination = Join-Path $Src "third_party\rust-toolchain"
   $rustc = Join-Path $source "rustc\bin\rustc.exe"
   if (-not (Test-Path $rustc)) { throw "downloaded x64 rustc is missing: $rustc" }
-  Remove-Item $destination -Recurse -Force -ErrorAction SilentlyContinue
-  foreach ($part in @("bin", "lib")) {
-    $target = Join-Path $destination $part
-    New-Item -ItemType Directory -Force -Path $target | Out-Null
-    Get-ChildItem $source -Directory | ForEach-Object {
-      $payload = Join-Path $_.FullName $part
-      if (Test-Path $payload) { Copy-Item (Join-Path $payload "*") $target -Recurse -Force }
+  # The merge loop is Python, ported verbatim from upstream ungoogled-chromium
+  # -windows: this prepare script runs under Windows PowerShell 5.1 on GitHub,
+  # and a PowerShell transcription of the copy loop silently dropped
+  # bin\cargo.exe on the first CI run while pwsh replications looked perfect.
+  Invoke-Checked $Python @(
+    (Join-Path $Repo "build\windows\prep_rust_toolchain.py"),
+    "--third-party-root", (Join-Path $Src "third_party")
+  )
+  foreach ($binary in @("cargo.exe", "rustc.exe")) {
+    if (-not (Test-Path (Join-Path $destination "bin\$binary"))) {
+      Get-ChildItem (Join-Path $Src "third_party") -Directory |
+        Where-Object { $_.Name -like "rust-toolchain*" } | ForEach-Object {
+          Write-Host "    toolchain dir: $($_.Name)"
+        }
+      throw "Rust toolchain merge did not produce bin\$binary"
     }
   }
-  & $rustc --version | Set-Content -Encoding ASCII (Join-Path $destination "INSTALLED_VERSION")
-  if ($LASTEXITCODE -ne 0) { throw "rustc version check failed" }
 }
 
 function Restore-LiteTarballFiles {
