@@ -15,6 +15,11 @@ from tools import restore_upstream_cache as restore
 
 NINJAS = [Path(f"/tmp/chromix-ninja-v{version}/ninja") for version in ("1.11.1", "1.12.1", "1.13.2")]
 AVAILABLE = [path for path in NINJAS if path.is_file()]
+UNSUPPORTED_OBJECT_NAMES = (
+    "../escape.o", "/escape.o", "obj/../escape.o", "obj//a.o", "./obj/a.o",
+    "C:/escape.obj", "obj\\escape.obj", "'obj/a.o'", '"obj/a.o"', "'obj/space name.o'", "obj/$a.o",
+    "obj/lib.a:member.o", "obj/lib.a(member.o)", "'obj/lib.a(member.o)'", "obj/é.o",
+)
 
 
 class RestoredReuseEvidenceTest(unittest.TestCase):
@@ -263,18 +268,315 @@ class RestoredReuseEvidenceTest(unittest.TestCase):
         self.assertEqual(first["targets"], ["chrome", "other"])
         self.assertTrue(report["retention_proven"])
 
-    def test_unsafe_object_input_and_log_paths_rejected(self):
-        for name in ("../escape.o", "/escape.o", "obj/../escape.o", "obj//a.o", "./obj/a.o",
-                     "C:/escape.obj", "obj\\escape.obj", "'obj/space name.o'", "obj/$a.o"):
-            with self.subTest(name=name):
-                self.inputs = [name]
-                with self.assertRaises(ValueError):
-                    self.before()
-                self.inputs = ["obj/a.o"]
-                self.log.write_text("# ninja log v5\n1\t2\t3\t" + name + "\tabc\n")
-                with self.assertRaises(ValueError):
-                    self.before()
+    def test_unsupported_inputs_excluded_without_normalization_or_file_access(self):
+        for name in UNSUPPORTED_OBJECT_NAMES:
+            for safe in (False, True):
+                with self.subTest(name=name, safe=safe):
+                    shutil.rmtree(self.work / "upstream-reuse", ignore_errors=True)
+                    self.inputs = [name, "../../source.cc", *(["obj/a.o"] if safe else [])]
+                    with mock.patch.object(evidence, "object_path", wraps=evidence.object_path) as paths:
+                        baseline = self.before()
+                        report = self.after()
+                    self.assertEqual({call.args[1] for call in paths.call_args_list}, {"obj/a.o"} if safe else set())
+                    self.assertEqual([sample["output"] for sample in baseline["samples"]], ["obj/a.o"] if safe else [])
+                    membership = baseline["membership"]
+                    self.assertEqual(membership["input_count"], len(self.inputs))
+                    self.assertEqual(membership["object_count"], int(safe))
+                    self.assertEqual(membership["excluded_object_inputs"], 1)
+                    self.assertEqual(membership["excluded_object_input_examples"], [
+                        {"origin": "ninja -t inputs", "line": 1, "path_escaped": ascii(name)}])
+                    self.assertEqual(membership["sha256"], hashlib.sha256(("\n".join(self.inputs) + "\n").encode()).hexdigest())
+                    self.assertEqual(report["retained_count"], int(safe))
+                    self.assertEqual(report["status"], "retained" if safe else "unproven")
+                    self.assertEqual(report["retention_proven"], safe)
+                    with self.assertRaises(evidence.EvidenceError):
+                        evidence.object_name(name)
+
+    def test_unsupported_sample_and_record_names_still_fail_baseline_validation(self):
+        baseline = self.before()
+        path = self.work / "upstream-reuse/baseline.json"
+        original = path.read_text()
+        for name in UNSUPPORTED_OBJECT_NAMES:
+            for field in ("output", "record", "both"):
+                with self.subTest(name=name, field=field):
+                    data = json.loads(original)
+                    if field != "record":
+                        data["samples"][0]["output"] = name
+                    if field != "output":
+                        data["samples"][0]["record"]["output"] = name
+                    content = json.dumps(data)
+                    path.write_text(content)
+                    with self.assertRaises(evidence.EvidenceError):
+                        evidence.baseline_valid(data, baseline["source"], baseline["targets"])
+                    self.assertEqual(self.cli("before"), 1)
+                    self.assertFalse(self.result()["retention_proven"])
+                    self.assertEqual(path.read_text(), content)
+
+    def test_preexisting_unsupported_log_outputs_are_diagnostic_only_and_prefix_stays_complete(self):
+        for version in (5, 6, 7):
+            with self.subTest(version=version):
+                shutil.rmtree(self.work / "upstream-reuse", ignore_errors=True)
+                self.version = version
                 self.make_log()
+                self.inputs = ["obj/a.o"]
+                with self.log.open("a") as stream:
+                    for name in UNSUPPORTED_OBJECT_NAMES:
+                        line = f"1\t2\t3\t{name}\tabc\n"
+                        self.assertEqual(evidence.parse_record(line, version)["output"], name)
+                        stream.write(line)
+                baseline = self.before()
+                self.assertEqual([sample["output"] for sample in baseline["samples"]], ["obj/a.o"])
+                self.assertEqual(baseline["log"]["unselected_unsupported_object_records"], len(UNSUPPORTED_OBJECT_NAMES))
+                self.assertEqual(len(baseline["log"]["unselected_unsupported_object_examples"]), evidence.MAX_PATH_EXAMPLES)
+                self.assertEqual(baseline["log"]["unselected_unsupported_object_examples"][0],
+                                 {"origin": ".ninja_log", "line": 4, "path_escaped": ascii(UNSUPPORTED_OBJECT_NAMES[0])})
+                self.assertEqual(baseline["log"]["sha256"], hashlib.sha256(self.log.read_bytes()).hexdigest())
+                report = self.after()
+                self.assertEqual(report["retained_count"], 1)
+                self.assertTrue(report["retention_proven"])
+                self.assertEqual(report["log"]["unselected_unsupported_object_records"], len(UNSUPPORTED_OBJECT_NAMES))
+                self.assertEqual(report["log"]["sha256"], hashlib.sha256(self.log.read_bytes()).hexdigest())
+                self.log.write_text(self.log.read_text().replace("../escape.o", "../change.o"))
+                self.before()
+                self.assertEqual(self.result()["disqualified"], {"obj/a.o": "log_prefix_mismatch"})
+                self.log.write_text(self.log.read_text().replace("../change.o", "../escape.o"))
+                self.assertFalse(self.after()["retention_proven"])
+
+    def test_appended_unsupported_outputs_permanently_disqualify_all_samples(self):
+        for version in (5, 6, 7):
+            for phase in ("before", "after"):
+                for name in UNSUPPORTED_OBJECT_NAMES:
+                    with self.subTest(version=version, phase=phase, name=name):
+                        shutil.rmtree(self.work / "upstream-reuse", ignore_errors=True)
+                        self.version = version
+                        self.make_log()
+                        # Even an identical unsupported record is unsafe when appended again.
+                        line = f"1\t2\t0\t{name}\tabc\n"
+                        with self.log.open("a") as stream:
+                            stream.write(line)
+                        baseline = self.before()
+                        self.assertEqual(self.after()["retained_count"], 2)
+                        self.assertEqual(self.before(), baseline)
+                        with self.log.open("a") as stream:
+                            stream.write(line)
+                        with mock.patch.object(evidence, "object_path", side_effect=AssertionError("unexpected path access")):
+                            self.before() if phase == "before" else self.after()
+                        report = self.result()
+                        expected = dict.fromkeys(("obj/a.o", "obj/b.obj"), "unsupported_appended_output")
+                        self.assertEqual(report["disqualified"], expected)
+                        self.assertEqual(report["disqualification_reasons"], {"unsupported_appended_output": 2})
+                        self.assertEqual(report["retained_count"], 0)
+                        self.assertFalse(report["retention_proven"])
+                        self.assertTrue(report["log"]["prefix_matches_previous"])
+                        self.assertEqual(report["log"]["unselected_unsupported_object_records"], 2)
+                        self.assertEqual(self.before(), baseline)
+                        self.assertEqual(self.after()["disqualified"], expected)
+                        self.log.write_text(self.log.read_text()[:-len(line)])
+                        self.before()
+                        self.assertEqual(self.after()["disqualified"], expected)
+
+    def test_unsupported_append_before_previous_observation_still_disqualifies(self):
+        baseline = self.before()
+        with self.log.open("a") as stream:
+            stream.write("1\t2\t3\t../alias.o\tabc\n")
+        pending_path = self.work / "upstream-reuse/result.json"
+        pending = json.loads(pending_path.read_text())
+        # Older collectors could record the suffix without disqualifying its aliases.
+        pending["log"] = evidence.read_log(self.out, set())[1]
+        pending_path.write_bytes(evidence.json_bytes(pending))
+        report = self.after()
+        self.assertGreater(pending["log"]["size_bytes"], baseline["log"]["size_bytes"])
+        self.assertTrue(report["log"]["prefix_matches_previous"])
+        self.assertEqual(report["disqualification_reasons"], {"unsupported_appended_output": 2})
+        self.assertFalse(report["retention_proven"])
+
+    def test_exclusion_diagnostics_are_bounded_and_do_not_affect_sample_cap(self):
+        count = evidence.MAX_PATH_EXAMPLES + 5
+        name = "../" + "é" * 1900 + ".o"
+        self.inputs = [name] * count + ["obj/a.o", "obj/b.obj"]
+        with self.log.open("a") as stream:
+            stream.write(f"1\t2\t3\t{name}\tabc\n" * count)
+        with mock.patch.object(evidence, "MAX_SAMPLES", 1):
+            baseline = self.before()
+            report = self.after()
+        self.assertEqual([sample["output"] for sample in baseline["samples"]], ["obj/a.o"])
+        self.assertEqual(report["retained_count"], 1)
+        self.assertEqual(baseline["object_hash_bytes"], len(b"tiny-object"))
+        self.assertEqual(baseline["membership"]["input_count"], count + 2)
+        self.assertEqual(baseline["membership"]["excluded_object_inputs"], count)
+        self.assertEqual(baseline["log"]["unselected_unsupported_object_records"], count)
+        for examples in (baseline["membership"]["excluded_object_input_examples"],
+                         baseline["log"]["unselected_unsupported_object_examples"]):
+            self.assertEqual(len(examples), evidence.MAX_PATH_EXAMPLES)
+            for example in examples:
+                self.assertLessEqual(len(example["path_escaped"]), evidence.MAX_PATH_EXAMPLE_CHARS)
+                self.assertTrue(example["path_escaped"].isascii())
+                self.assertTrue(example["path_escaped"].endswith("..."))
+        self.assertLess(len(json.dumps(report)), 24 * 1024)
+
+    def test_excluded_input_changes_still_disqualify_changed_target_graph(self):
+        self.inputs.append("../first.o")
+        baseline = self.before()
+        self.inputs[-1] = "../other.o"
+        report = self.after()
+        self.assertNotEqual(report["membership"]["sha256"], baseline["membership"]["sha256"])
+        self.assertEqual(report["disqualification_reasons"], {"target_inputs_changed": 2})
+        self.assertFalse(report["retention_proven"])
+
+    def test_missing_and_nondirectory_candidates_do_not_prevent_safe_sampling(self):
+        (self.out / "archive.a").write_bytes(b"not a directory")
+        self.inputs = ["archive.a/member.o", "missing.o", "obj/a.o"]
+        baseline = self.before()
+        self.assertEqual(baseline["skipped"]["missing_file"], 2)
+        self.assertEqual([sample["output"] for sample in baseline["samples"]], ["obj/a.o"])
+        self.assertEqual(self.after()["retained_count"], 1)
+        shutil.rmtree(self.work / "upstream-reuse")
+        self.inputs = self.inputs[:2]
+        self.assertEqual(self.before()["samples"], [])
+        self.assertFalse(self.after()["retention_proven"])
+
+    def test_nondirectory_parent_after_baseline_is_permanently_missing(self):
+        self.before()
+        (self.out / "obj").rename(self.out / "oldobj")
+        (self.out / "obj").write_bytes(b"not a directory")
+        report = self.after()
+        self.assertEqual(report["disqualification_reasons"], {"missing_file": 2})
+        (self.out / "obj").unlink()
+        (self.out / "oldobj").rename(self.out / "obj")
+        self.before()
+        self.assertFalse(self.after()["retention_proven"])
+
+    def test_crlf_inputs_keep_raw_digest_and_exclude_overlong_object_names(self):
+        long_name = "obj/" + "x" * 2048 + ".o"
+        raw = ("obj/a.o\r\n../escape.o\r\n" + long_name + "\r\nobj/a.o\r\n").encode()
+        original = self.query.side_effect
+        self.query.side_effect = lambda ninja, out, args, limit: (
+            original(ninja, out, args, limit) if args == ["--version"] else raw)
+        baseline = self.before()
+        membership = baseline["membership"]
+        self.assertEqual(membership["input_count"], 4)
+        self.assertEqual(membership["object_count"], 1)
+        self.assertEqual(membership["excluded_object_inputs"], 2)
+        self.assertEqual(membership["sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual([sample["output"] for sample in baseline["samples"]], ["obj/a.o"])
+        self.assertEqual(self.after()["retained_count"], 1)
+
+    def test_malformed_inputs_fail_with_bounded_origin_and_escaped_line(self):
+        invalid = [(b"obj/a.o\nobj/b.obj", "unterminated", "line 2", "obj/b.obj"),
+                   (b"obj/a.o\nobj/\x00bad.o\n", "malformed", "line 2", "\\x00"),
+                   (b"obj/a.o\nobj/\tbad.o\n", "malformed", "line 2", "\\t"),
+                   (b"obj/a.o\n\n", "malformed", "line 2", "''"),
+                   (b"obj/a.o\n\xffbad.o\n", "invalid UTF-8", "byte 8", "\\xff"),
+                   (b"x" * (evidence.MAX_LINE_BYTES + 1) + b".o\n", "malformed", "line 1", "...")]
+        original = self.query.side_effect
+        for raw, reason, location, fragment in invalid:
+            with self.subTest(reason=reason, fragment=fragment):
+                self.query.side_effect = lambda ninja, out, args, limit: (
+                    original(ninja, out, args, limit) if args == ["--version"] else raw)
+                self.assertEqual(self.cli("before"), 1)
+                error = self.result()["reason"]
+                for text in (reason, "ninja -t inputs", location, fragment):
+                    self.assertIn(text, error)
+                self.assertLessEqual(len(error), 512)
+                self.assertNotIn("\x00", error)
+                self.assertFalse(self.result()["retention_proven"])
+
+    def test_malformed_unselected_log_record_keeps_origin_and_escaped_path(self):
+        with self.log.open("a") as stream:
+            stream.write("1\t2\t3\t../bad\x00.o\tabc\n")
+        self.assertEqual(self.cli("before"), 1)
+        self.assertIn("invalid Ninja log record at .ninja_log line 4", self.result()["reason"])
+        self.assertIn("../bad\\x00.o", self.result()["reason"])
+        self.assertFalse(self.result()["retention_proven"])
+
+    def test_old_observations_without_path_diagnostics_can_resume(self):
+        self.before()
+        baseline_path = self.work / "upstream-reuse/baseline.json"
+        pending_path = self.work / "upstream-reuse/result.json"
+        baseline, pending = json.loads(baseline_path.read_text()), json.loads(pending_path.read_text())
+        for data in (baseline, pending):
+            for section, keys in (("membership", ("excluded_object_inputs", "excluded_object_input_examples")),
+                                  ("log", ("unselected_unsupported_object_records", "unselected_unsupported_object_examples"))):
+                for key in keys:
+                    del data[section][key]
+        pending["baseline_sha256"] = hashlib.sha256(evidence.json_bytes(baseline)).hexdigest()
+        baseline_path.write_bytes(evidence.json_bytes(baseline))
+        pending_path.write_bytes(evidence.json_bytes(pending))
+        raw, info = baseline_path.read_bytes(), baseline_path.stat()
+        report = self.after()
+        self.assertEqual(report["retained_count"], 2)
+        self.assertTrue(report["retention_proven"])
+        self.assertEqual(report["disqualified"], {})
+        self.assertEqual(report["before_membership"], pending["membership"])
+        self.assertEqual(baseline_path.read_bytes(), raw)
+        self.assertEqual(baseline_path.stat().st_mtime_ns, info.st_mtime_ns)
+        self.assertEqual(self.before(), baseline)
+        self.assertEqual(self.after()["retained_count"], 2)
+
+    def test_membership_diagnostic_changes_do_not_disqualify_samples(self):
+        self.inputs.append("../escape.o")
+        self.before()
+        pending_path = self.work / "upstream-reuse/result.json"
+        pending = json.loads(pending_path.read_text())
+        pending["membership"]["excluded_object_input_examples"][0]["path_escaped"] = "older excerpt"
+        pending_path.write_bytes(evidence.json_bytes(pending))
+        report = self.after()
+        self.assertNotEqual(report["before_membership"], report["membership"])
+        self.assertEqual(report["retained_count"], 2)
+        self.assertEqual(report["disqualified"], {})
+
+    def test_stable_membership_fields_still_detect_changes_without_diagnostics(self):
+        for key in ("sha256", "input_count", "object_count"):
+            with self.subTest(key=key):
+                shutil.rmtree(self.work / "upstream-reuse", ignore_errors=True)
+                self.before()
+                pending_path = self.work / "upstream-reuse/result.json"
+                pending = json.loads(pending_path.read_text())
+                del pending["membership"]["excluded_object_inputs"]
+                del pending["membership"]["excluded_object_input_examples"]
+                pending["membership"][key] = "f" * 64 if key == "sha256" else pending["membership"][key] + 1
+                pending_path.write_bytes(evidence.json_bytes(pending))
+                report = self.after()
+                self.assertEqual(report["disqualification_reasons"], {"target_inputs_changed": 2})
+                self.assertFalse(report["retention_proven"])
+
+    def test_corrupt_path_diagnostics_fail_closed(self):
+        self.inputs.append("../escape.o")
+        with self.log.open("a") as stream:
+            stream.write("1\t2\t3\t../escape.o\tabc\n")
+        baseline = self.before()
+        pending_path = self.work / "upstream-reuse/result.json"
+        pending = pending_path.read_text()
+        for section, count_key, examples_key, total_key in (
+                ("membership", "excluded_object_inputs", "excluded_object_input_examples", "input_count"),
+                ("log", "unselected_unsupported_object_records", "unselected_unsupported_object_examples", "record_count")):
+            for change in ("negative", "bool", "excess_count", "missing_examples", "excess_examples", "wrong_origin",
+                           "wrong_line", "oversize_path", "unescaped_path"):
+                with self.subTest(section=section, change=change):
+                    data = json.loads(pending)
+                    value = data[section]
+                    if change == "negative":
+                        value[count_key] = -1
+                    elif change == "bool":
+                        value[count_key] = True
+                    elif change == "excess_count":
+                        value[count_key] = value[total_key] + 1
+                    elif change == "missing_examples":
+                        del value[examples_key]
+                    elif change == "excess_examples":
+                        value[examples_key] *= evidence.MAX_PATH_EXAMPLES + 1
+                    elif change == "wrong_origin":
+                        value[examples_key][0]["origin"] = "elsewhere"
+                    elif change == "wrong_line":
+                        value[examples_key][0]["line"] = 0
+                    elif change == "oversize_path":
+                        value[examples_key][0]["path_escaped"] = "x" * (evidence.MAX_PATH_EXAMPLE_CHARS + 1)
+                    else:
+                        value[examples_key][0]["path_escaped"] = "bad\npath"
+                    pending_path.write_text(json.dumps(data))
+                    self.assertEqual(self.cli("after", 0), 1)
+                    self.assertFalse(self.result()["retention_proven"])
+        self.assertEqual(json.loads((self.work / "upstream-reuse/baseline.json").read_text()), baseline)
 
     def test_symlinked_or_hardlinked_objects_and_linked_parents_rejected(self):
         original = self.out / "obj/a.o"
@@ -298,6 +600,35 @@ class RestoredReuseEvidenceTest(unittest.TestCase):
                 else:
                     original.unlink()
                 original.write_bytes(b"tiny-object")
+
+    def test_symlink_and_hardlink_candidates_are_not_hidden_by_exclusions(self):
+        target = self.root / "external"
+        target.write_bytes(b"tiny-object")
+        self.inputs = ["../excluded.o", "obj/a.o"]
+        original = self.out / "obj/a.o"
+        for phase in ("before", "after"):
+            for kind in ("symlink", "hardlink", "dangling", "parent"):
+                with self.subTest(phase=phase, kind=kind):
+                    shutil.rmtree(self.work / "upstream-reuse", ignore_errors=True)
+                    self.make_log()
+                    if phase == "after":
+                        self.before()
+                    original.unlink()
+                    if kind in ("symlink", "dangling"):
+                        original.symlink_to(target if kind == "symlink" else self.root / "missing")
+                    elif kind == "hardlink":
+                        os.link(target, original)
+                    else:
+                        (self.out / "obj").rename(self.out / "oldobj")
+                        (self.out / "obj").symlink_to(self.out / "oldobj", target_is_directory=True)
+                    self.assertEqual(self.cli(phase, 0 if phase == "after" else None), 1)
+                    self.assertFalse(self.result()["retention_proven"])
+                    if kind == "parent":
+                        (self.out / "obj").unlink()
+                        (self.out / "oldobj").rename(self.out / "obj")
+                    else:
+                        original.unlink()
+                    self.assertEqual(target.read_bytes(), b"tiny-object")
 
     def test_linked_report_or_metadata_never_overwrites_external_file(self):
         target = self.root / "external"
@@ -437,6 +768,25 @@ class RestoredReuseEvidenceTest(unittest.TestCase):
                     self.assertEqual(report["disqualified"], rejected)
                     self.before()
                     self.assertEqual(self.after()["disqualified"], rejected)
+
+    def test_identical_selected_record_appended_is_permanently_disqualified(self):
+        for version in (5, 6, 7):
+            for phase in ("before", "after"):
+                with self.subTest(version=version, phase=phase):
+                    shutil.rmtree(self.work / "upstream-reuse", ignore_errors=True)
+                    self.version = version
+                    self.make_log(names=("obj/a.o",))
+                    self.inputs = ["obj/a.o"]
+                    baseline = self.before()
+                    with self.log.open("a") as stream:
+                        stream.write(self.records[0])
+                    self.before() if phase == "before" else self.after()
+                    report = self.result()
+                    self.assertEqual(report["samples"][0]["record"], baseline["samples"][0]["record"])
+                    self.assertEqual(report["disqualified"], {"obj/a.o": "appended_record_repeated"})
+                    self.assertFalse(report["retention_proven"])
+                    self.assertEqual(self.before(), baseline)
+                    self.assertEqual(self.after()["retained_count"], 0)
 
     def test_changed_then_baseline_appended_in_one_interval_is_disqualified(self):
         for phase in ("before", "after"):
@@ -639,6 +989,95 @@ class RealNinjaEvidenceTest(unittest.TestCase):
                 self.assertEqual(report["samples"][0]["status"], "appended_record_changed")
                 baseline_path = work / "upstream-reuse/baseline.json"
                 self.assertEqual(json.loads(baseline_path.read_text()), baseline)
+
+    def test_real_unsupported_closure_and_log_outputs_never_sampled_v5_v6_v7(self):
+        for ninja in AVAILABLE:
+            with self.subTest(ninja=ninja), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                work, out = self.make_work(root, ninja)
+                (out / "obj").mkdir()
+                unsupported = ["../outside.o", str(root / "absolute.obj"), "obj/space name.o",
+                               "obj/lib.a:member.o", "obj/lib.a(member.o)"]
+                escaped = [name.replace(":", "$:").replace(" ", "$ ") for name in unsupported]
+                build = out / "build.ninja"
+                text = build.read_text().replace("| b.obj ||", "| b.obj " + " ".join(escaped) + " ||")
+                text += "".join(f"build {name}: copy source\n" for name in escaped)
+                text += "build unsupported: copy source | " + " ".join(escaped) + "\n"
+                build.write_text(text)
+                subprocess.run([str(ninja), "chrome", "unsupported"], cwd=out, check=True, capture_output=True)
+                names, membership = evidence.target_inputs(ninja, out, ["chrome"])
+                self.assertEqual(names, {"a.o", "b.obj", "ordered.o"})
+                self.assertEqual(membership["excluded_object_inputs"], len(unsupported))
+                raw = evidence.query(ninja, out, ["-t", "inputs", "chrome"], evidence.MAX_INPUT_BYTES)
+                self.assertEqual(membership["sha256"], hashlib.sha256(raw).hexdigest())
+                self.assertEqual(membership["input_count"], len(raw.splitlines()))
+                with mock.patch.object(evidence, "MAX_SAMPLES", 1):
+                    baseline = evidence.before(work, "linux", "x64", ninja)
+                    self.assertEqual([sample["output"] for sample in baseline["samples"]], ["a.o"])
+                    self.assertEqual(baseline["log"]["unselected_unsupported_object_records"], len(unsupported))
+                    result = subprocess.run([str(ninja), "chrome"], cwd=out, check=True, capture_output=True)
+                    self.assertIn(b"no work to do", result.stdout)
+                    report = evidence.after(work, "linux", "x64", ninja, exit_code=result.returncode)
+                    self.assertEqual(report["retained_count"], 1)
+                    evidence.before(work, "linux", "x64", ninja)
+                    (out / "a.o").unlink()
+                    result = subprocess.run([str(ninja), "chrome"], cwd=out, check=True, capture_output=True)
+                    report = evidence.after(work, "linux", "x64", ninja, exit_code=result.returncode)
+                    self.assertEqual(report["disqualified"], {"a.o": "appended_record_changed"})
+                    self.assertFalse(report["retention_proven"])
+                shutil.rmtree(work / "upstream-reuse")
+                baseline = evidence.before(work, "linux", "x64", ninja, targets=["unsupported"])
+                self.assertEqual(baseline["samples"], [])
+                result = subprocess.run([str(ninja), "unsupported"], cwd=out, check=True, capture_output=True)
+                report = evidence.after(work, "linux", "x64", ninja, targets=["unsupported"], exit_code=result.returncode)
+                self.assertEqual(report["retained_count"], 0)
+                self.assertEqual(report["status"], "unproven")
+                self.assertFalse(report["retention_proven"])
+
+    def test_real_absolute_output_alias_cp_p_cannot_prove_retention_v5_v6_v7(self):
+        for ninja in AVAILABLE:
+            with self.subTest(ninja=ninja), tempfile.TemporaryDirectory() as tmp:
+                work, out = self.make_work(Path(tmp), ninja)
+                alias = str(out / "a.o")
+                shutil.copy2(out / "a.o", out / "alias-source")
+                build = out / "build.ninja"
+                text = build.read_text().replace("| b.obj ||", f"| b.obj {alias} ||")
+                text += ("rule preserve\n  command = cp -p $in $out\n"
+                         "build force: phony\n"
+                         f"build {alias}: preserve alias-source || force\n")
+                build.write_text(text)
+                baseline = evidence.before(work, "linux", "x64", ninja)
+                selected = {sample["output"] for sample in baseline["samples"]}
+                self.assertEqual(selected, {"a.o", "b.obj", "ordered.o"})
+                self.assertEqual(baseline["membership"]["excluded_object_inputs"], 1)
+                expected_version = {"chromix-ninja-v1.11.1": 5, "chromix-ninja-v1.12.1": 6, "chromix-ninja-v1.13.2": 7}
+                self.assertEqual(baseline["log"]["version"], expected_version[ninja.parent.name])
+                baseline_path = work / "upstream-reuse/baseline.json"
+                saved = baseline_path.read_bytes()
+                prefix = (out / ".ninja_log").read_bytes()
+                result = subprocess.run([str(ninja), "chrome", "-v"], cwd=out, check=True, capture_output=True)
+                self.assertIn(f"cp -p alias-source {alias}".encode(), result.stdout)
+                raw = (out / ".ninja_log").read_bytes()
+                self.assertEqual(raw[:len(prefix)], prefix)
+                self.assertIn(f"\t{alias}\t".encode(), raw[len(prefix):])
+                records = evidence.read_log(out, selected)[0]
+                for sample in baseline["samples"]:
+                    self.assertEqual(records[sample["output"]], sample["record"])
+                    self.assertEqual(evidence.file_record(out / sample["output"]), sample["file"])
+                report = evidence.after(work, "linux", "x64", ninja, exit_code=result.returncode)
+                expected = dict.fromkeys(selected, "unsupported_appended_output")
+                self.assertEqual(report["disqualified"], expected)
+                self.assertEqual(report["disqualification_reasons"], {"unsupported_appended_output": 3})
+                self.assertEqual(report["retained_count"], 0)
+                self.assertEqual(report["retained_bytes"], 0)
+                self.assertFalse(report["retention_proven"])
+                self.assertTrue(report["log"]["prefix_matches_previous"])
+                self.assertEqual(evidence.before(work, "linux", "x64", ninja), baseline)
+                result = subprocess.run([str(ninja), "chrome"], cwd=out, check=True, capture_output=True)
+                report = evidence.after(work, "linux", "x64", ninja, exit_code=result.returncode)
+                self.assertEqual(report["disqualified"], expected)
+                self.assertFalse(report["retention_proven"])
+                self.assertEqual(baseline_path.read_bytes(), saved)
 
     def test_query_output_cap_and_timeout(self):
         with tempfile.TemporaryDirectory() as tmp:

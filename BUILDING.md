@@ -285,11 +285,17 @@ the Mac bindgen action, after Ninja's system-shell invocation. Unknown wrapper
 contents stop preparation rather than receiving a partial edit.
 Required tool replacement happens only in Actions. A changed compiler/runtime
 invalidates compiled outputs; unknown external or missing Ninja dependencies
-invalidate their dependent outputs. Host generator contents (Node, Go, gperf,
-and clang-format where used) are tracked separately. Initial restoration or a
-changed generator removes logged generated outputs lacking compiler dependency
-records, without clearing unrelated C/C++ objects merely because a host link
-was restored. Runner/SDK identity is rechecked on resume.
+invalidate their dependent outputs. Omitted host links listed in the verified
+restore receipt remain external dependencies even before they are recreated.
+Only the output-root SDK directories are protected from deletion; nested WebRTC
+or DevTools directories named `sdk` are ordinary build outputs. Host generator
+contents (Node, Go, gperf, and clang-format where used) are tracked separately.
+Initial restoration or a changed generator removes logged outputs lacking compiler
+dependency records, including generated headers and archive/link products,
+without clearing unrelated C/C++ objects merely because a host link was restored.
+Readers of removed generated inputs are invalidated separately; this conservative
+step can require substantial recompilation. Runner/SDK identity is rechecked
+on resume.
 The first preparation removes upstream final browser products to force a new
 Chromix link. Chromix GN settings override restored arguments, GN regenerates
 `out/Default` for the current environment, and Ninja compiles incrementally.
@@ -308,7 +314,12 @@ archive unpacking, full source/object extraction, and source verification.
 Disk rejection preserves free/required bytes, the failure phase, and any written
 extraction bytes/member before cleanup; a cleaned-up miss is not reported as a
 zero-byte extraction attempt. The preparation report records invalidated outputs
-and removed final products. A successful restoration is not proof of object hits,
+and removed final products. It includes bounded input-path examples and counts
+of output readers affected by omitted external links, other external inputs,
+missing local inputs, and intentionally removed generated inputs; these categories
+can overlap for one output. Timestamp-repair diagnostics separately retain up to
+32 skipped output/input examples before preparation cleanup.
+A successful restoration is not proof of object hits,
 and a dry-run
 count is not a measured speedup. Native CI must establish actual reuse and
 elapsed time; local regression tests use small fixtures and sparse patch checks,
@@ -319,13 +330,19 @@ selecting the newest upload.
 `upstream-reuse/baseline.json` preserves a bounded sample before the first actual
 Chromix Ninja build, after GN and the plan. It samples at most 128 `.o`/`.obj`
 inputs of the requested targets, hashing at most 64 MiB total and 8 MiB per file.
+Nonlocal or unsupported object-looking closure inputs are excluded from sampling
+and recorded in bounded diagnostics; their bytes remain in the full input digest.
+They are never normalized into local files or counted as retained objects.
 The baseline records full Ninja log entries, hashes, sizes, and nanosecond mtimes;
 resumed stages retain it rather than sampling newly compiled objects. Each actual
 invocation writes `upstream-reuse/result.json` with its exit code and a comparison
 to that original baseline. Both reports must survive handoffs. Each observation
 verifies the previous complete log prefix, and any observed rebuild or lost log
-continuity permanently disqualifies the affected samples. Only unchanged samples
-in the target inputs after a
+continuity permanently disqualifies the affected samples. Any new selected-output
+record disqualifies that sample, even if every recorded field repeats exactly.
+An unsupported object-output spelling appended after the baseline disqualifies every sample,
+because it may name a sampled file through an alias. Such paths are never
+resolved to make them eligible. Only unchanged samples in the target inputs after a
 successful invocation count as observed retention. Failed or timed-out builds,
 changed graphs, truncated logs, and zero retained samples do not establish reuse.
 These small reports are uploaded on every build stage. This measures retention

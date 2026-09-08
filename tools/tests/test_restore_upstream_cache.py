@@ -1308,6 +1308,35 @@ class NinjaTimestampTest(unittest.TestCase):
         os.utime(self.input, ns=(self.floor - 2 * 10**9, self.floor - 2 * 10**9))
         self.assertEqual(restore.ninja_mtime_plan(self.src)["outputs_restored"], 3)
 
+    def test_missing_input_diagnostics_are_bounded_and_do_not_change_repairs(self):
+        records = []
+        for index in range(40):
+            name = f"obj/missing-{index}.o"
+            path = self.out / name
+            path.write_bytes(b"object")
+            os.utime(path, ns=(self.floor, self.floor))
+            records.append((name, self.recorded, self.recorded,
+                            ["sdk/xcode_links/MacOSX26.0.sdk/stddef.h"]))
+        write_ninja_metadata(self.out, records, version=7)
+        plan = restore.ninja_mtime_plan(self.src)
+        self.assertEqual(plan["outputs_restored"], 0)
+        self.assertEqual(plan["skipped"], {"recorded input is missing": 40})
+        self.assertEqual(len(plan["skipped_samples"]), 32)
+        self.assertEqual(plan["skipped_samples"][0], {
+            "output": "obj/missing-0.o", "reason": "recorded input is missing",
+            "input": "sdk/xcode_links/MacOSX26.0.sdk/stddef.h"})
+        self.assertTrue(all((self.out / name).stat().st_mtime_ns == self.floor
+                            for name, *_ in records))
+
+    def test_output_failure_diagnostics_do_not_reuse_previous_input(self):
+        write_ninja_metadata(self.out, [
+            ("obj/a.o", self.recorded, self.recorded, ["../../missing.cc"]),
+            ("../outside.o", self.recorded, self.recorded, ["../../a.cc"])])
+        plan = restore.ninja_mtime_plan(self.src)
+        self.assertEqual(len(plan["skipped_samples"]), 2)
+        self.assertIn("input", plan["skipped_samples"][0])
+        self.assertNotIn("input", plan["skipped_samples"][1])
+
     def test_failed_input_checks_are_not_cached(self):
         self.shared_metadata(["../../a.cc"])
         relative = restore.objects.relative_path

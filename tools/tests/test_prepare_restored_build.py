@@ -126,19 +126,102 @@ class PrepareRestoredBuildTest(unittest.TestCase):
         self.assertEqual(result["removed_outputs"], 2)
         self.assertTrue((self.out / "obj/c.o").exists())
 
+    def test_external_dependency_invalidates_nested_sdk_object(self):
+        name = "obj/third_party/webrtc/sdk/helpers_objc/NSString+StdString.o"
+        output = self.write(self.out / name, "object")
+        for root in (self.out, self.src):
+            for value in (output.relative_to(root).as_posix(), str(output.relative_to(root)).replace("/", "\\")):
+                with self.subTest(root=root, value=value):
+                    self.assertEqual(prepare.inside_path(root, value, output=True), output)
+        self.deps({name: ["/external-sdk/header.h"]})
+        result = prepare.invalidate_external_dependencies(self.src)
+        self.assertEqual(result["external_dependency_outputs"], 1)
+        self.assertEqual(result["removed_outputs"], 1)
+        self.assertEqual(result["unknown_outputs"], [])
+        self.assertFalse(output.exists())
+
+    def test_generated_output_in_nested_devtools_sdk_is_invalidated(self):
+        name = "gen/third_party/devtools-frontend/src/front_end/core/sdk/sdk.js"
+        output = self.write(self.out / name, "generated")
+        self.deps({})
+        self.write(self.out / ".ninja_log", f"# ninja log v5\n0\t1\t1\t{name}\tabc\n")
+        result = prepare.invalidate_generated_outputs(self.src)
+        self.assertEqual(result, {"removed_outputs": 1, "unknown_outputs": []})
+        self.assertFalse(output.exists())
+
+    def test_compiled_walk_includes_nested_sdk_outputs(self):
+        outputs = [self.object(name) for name in (
+            "third_party/webrtc/sdk/helpers_objc/NSString+StdString.o",
+            "third_party/webrtc/sdk/libwebrtc.a", "project/xcode_links/lib.a")]
+        result = prepare.invalidate_compiled_outputs(self.src)
+        self.assertEqual(result["removed_outputs"], len(outputs))
+        self.assertTrue(all(not path.exists() for path in outputs))
+
+    def test_real_sdk_roots_are_protected_from_output_invalidation(self):
+        names = [f"{root}/platform/lib.a" for root in ("sdk", "xcode_links", "SDK", "Xcode_Links")]
+        for name in names:
+            self.write(self.out / name, "SDK library")
+            for root in (self.out, self.src):
+                for path in (self.out / name, self.out / Path(name).parts[0]):
+                    relative = path.relative_to(root).as_posix()
+                    for value in (relative, relative.replace("/", "\\")):
+                        with self.subTest(root=root, value=value):
+                            self.assertIsNone(prepare.inside_path(root, value, output=True))
+        self.deps({})
+        self.write(self.out / ".ninja_log", "# ninja log v5\n" + "".join(
+            f"0\t1\t1\t{name}\tabc\n" for name in names))
+        generated = prepare.invalidate_generated_outputs(self.src)
+        self.assertEqual(generated, {"removed_outputs": 0, "unknown_outputs": names})
+        self.deps({name: ["/external.h"] for name in names})
+        dependencies = prepare.invalidate_external_dependencies(self.src, invalidate_all=True)
+        self.assertEqual(dependencies["removed_outputs"], 0)
+        self.assertEqual(len(dependencies["unknown_outputs"]), len(names))
+        self.assertEqual(prepare.invalidate_compiled_outputs(self.src)["removed_outputs"], 0)
+        for name in names:
+            self.assertEqual((self.out / name).read_text(), "SDK library")
+
+    def test_unrelated_sdk_named_ancestor_does_not_block_preparation(self):
+        self.work = self.work / "out/Default/sdk/work"
+        self.src = self.work / "src"
+        self.out = self.src / "out/Default"
+        self.fixture()
+        with self.native_context():
+            result = prepare.prepare(self.work, "macos", "arm64")
+        self.assertTrue(result["ready_for_gn"])
+        self.assertTrue((self.work / "upstream-cache-preparation.json").is_file())
+        self.assertIsNone(prepare.inside_path(self.out, "sdk/keep.a", output=True))
+        self.assertIsNone(prepare.inside_path(self.src, "out/Default/sdk/keep.a", output=True))
+
     def test_output_traversal_and_symlinks_never_delete_source_or_sdk(self):
         source = self.src / "include/a.h"
         sdk = self.write(self.work / "sdk/lib.a", "SDK")
         (self.out / "sdk").symlink_to(sdk.parent)
         (self.out / "obj/link.o").symlink_to(source)
+        nested = self.out / "obj/third_party/webrtc/sdk"
+        nested.mkdir(parents=True)
+        (nested / "link.o").symlink_to(source)
+        (nested / "linked").symlink_to(sdk.parent)
         self.deps({"../../include/a.h": ["/external.h"], "obj/link.o": ["/external.h"],
-                   "sdk/lib.a": ["/external.h"], str(source): ["/external.h"]})
+                   "sdk/lib.a": ["/external.h"], str(source): ["/external.h"],
+                   "obj/third_party/webrtc/sdk/link.o": ["/external.h"],
+                   "obj/third_party/webrtc/sdk/linked/lib.a": ["/external.h"]})
         result = prepare.invalidate_external_dependencies(self.src, invalidate_all=True)
         prepare.invalidate_compiled_outputs(self.src)
-        self.assertEqual(len(result["unknown_outputs"]), 4)
+        self.assertEqual(len(result["unknown_outputs"]), 6)
         self.assertEqual(source.read_text(), "header")
         self.assertEqual(sdk.read_text(), "SDK")
         self.assertTrue((self.out / "obj/link.o").is_symlink())
+        self.assertTrue((nested / "link.o").is_symlink())
+        self.assertTrue((nested / "linked").is_symlink())
+
+    def test_output_filter_keeps_traversal_and_metadata_protection(self):
+        names = ("", "\0", "../outside.o", "obj/../inside.o", "/outside.o",
+                 "C:\\outside.o", "obj/file:stream", "obj/third_party/webrtc/sdk/../file.o")
+        names += tuple(f"obj/third_party/webrtc/sdk/{name}" for name in (
+            *prepare.METADATA, "target.ninja"))
+        for name in names:
+            with self.subTest(name=name):
+                self.assertIsNone(prepare.inside_path(self.out, name, output=True))
 
     def test_resolved_sdk_link_and_omitted_xcode_link_invalidate_readers(self):
         sdk = self.write(self.work / "sdk/stddef.h", "sdk")
@@ -154,6 +237,75 @@ class PrepareRestoredBuildTest(unittest.TestCase):
         self.assertEqual(result["removed_outputs"], 2)
         self.assertTrue(sdk.exists())
         self.assertTrue((self.out / "obj/internal.o").exists())
+
+    def test_omitted_external_inputs_are_distinct_from_missing_source(self):
+        names = ("omitted.o", "source.o", "prefix.o", "both.o")
+        for name in names:
+            self.object(name)
+        sdk = "sdk/xcode_links/MacOSX26.0.sdk"
+        self.deps({"obj/omitted.o": [sdk + "/stddef.h"],
+                   "obj/source.o": ["../../include/missing.h"],
+                   "obj/prefix.o": [sdk + "-other/stddef.h"],
+                   "obj/both.o": [sdk + "/stddef.h", "../../include/missing.h"]})
+        result = prepare.invalidate_external_dependencies(
+            self.src, external_inputs=["out/Default/" + sdk])
+        self.assertEqual(result["external_dependency_outputs"], 2)
+        self.assertEqual(result["missing_dependency_outputs"], 2)
+        self.assertEqual(result["removed_outputs"], 4)
+        self.assertEqual(result["input_reason_outputs"], {
+            "omitted_external_input": 2, "missing_local_input": 3})
+        self.assertEqual(result["input_samples"][0], {
+            "output": "obj/omitted.o", "input": sdk + "/stddef.h",
+            "reason": "omitted_external_input"})
+
+    def test_recreated_omitted_sdk_links_remain_external_before_resolution(self):
+        receipt = self.fixture()
+        relative = "out/Default/sdk/xcode_links/MacOSX26.0.sdk"
+        receipt["external_symlink_paths"] = [relative]
+        self.write(self.src / restore.MARKER, json.dumps(receipt))
+        link = self.src / relative
+        link.parent.mkdir(parents=True)
+        for target in (self.work / "host-sdk", self.src / "internal-sdk"):
+            with self.subTest(target=target):
+                self.write(target / "stddef.h", "header")
+                link.symlink_to(target, target_is_directory=True)
+                output = self.object("sdk.o")
+                self.deps({"obj/sdk.o": ["sdk/xcode_links/MacOSX26.0.sdk/./stddef.h"]})
+                (self.src / prepare.MARKER).unlink(missing_ok=True)
+                with self.native_context():
+                    result = prepare.prepare(self.work, "macos", "arm64")
+                self.assertEqual(result["dependencies"]["input_reason_outputs"], {"omitted_external_input": 1})
+                self.assertEqual(result["dependencies"]["external_dependency_outputs"], 1)
+                self.assertFalse(output.exists())
+                self.assertTrue((target / "stddef.h").exists())
+                link.unlink()
+
+    def test_removed_generated_readers_are_reported_separately(self):
+        self.fixture()
+        self.object("generated.o")
+        independent = self.object("independent.o")
+        self.write(self.out / "gen/header.h", "generated")
+        self.write(self.out / ".ninja_log", "# ninja log v5\n0\t1\t1\tgen/header.h\tabc\n")
+        self.deps({"obj/generated.o": ["gen/header.h"],
+                   "obj/independent.o": ["../../include/a.h"]})
+        with self.native_context():
+            result = prepare.prepare(self.work, "macos", "arm64")
+        dependencies = result["dependencies"]
+        self.assertEqual(dependencies["input_reason_outputs"], {"removed_generated_input": 1})
+        self.assertEqual(dependencies["removed_outputs"], 1)
+        self.assertTrue(independent.exists())
+
+    def test_dependency_diagnostic_samples_are_bounded_per_reader_reason(self):
+        records = {}
+        for index in range(40):
+            name = f"sample-{index}.o"
+            self.object(name)
+            records["obj/" + name] = ["../../include/missing.h"] * 2
+        self.deps(records)
+        result = prepare.invalidate_external_dependencies(self.src)
+        self.assertEqual(result["input_reason_outputs"], {"missing_local_input": 40})
+        self.assertEqual(result["removed_outputs"], 40)
+        self.assertEqual(len(result["input_samples"]), 32)
 
     def test_mac_nightly_without_chromium_stamp_reuses_native_tools(self):
         self.fixture()

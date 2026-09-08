@@ -242,6 +242,7 @@ def ninja_mtime_plan(src: Path) -> dict:
     deps = objects.ninja_deps(safe_path(out, Path(".ninja_deps")))
     logs = objects.ninja_log(safe_path(out, Path(".ninja_log")))
     skipped = Counter()
+    skipped_samples = []
     repairs = []
     # Cache applies only to this read-only planning pass; revalidate before use.
     input_stats = {}
@@ -258,6 +259,7 @@ def ninja_mtime_plan(src: Path) -> dict:
                 info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
 
     for name, (recorded, inputs) in deps.items():
+        active_input = None
         try:
             if name in {"args.gn", "build.ninja", ".ninja_log", ".ninja_deps"}:
                 raise Miss("build metadata is not a repairable output")
@@ -279,6 +281,7 @@ def ninja_mtime_plan(src: Path) -> dict:
             if not inputs:
                 raise Miss("output has no recorded inputs")
             for value in inputs:
+                active_input = value
                 if value not in input_stats:
                     input_stats[value] = checked_input(value)
                 if not objects.input_is_fresh(input_stats[value].st_mtime_ns, freshness):
@@ -286,6 +289,11 @@ def ninja_mtime_plan(src: Path) -> dict:
             repairs.append({"output": name, "from_ns": info.st_mtime_ns, "to_ns": recorded})
         except (OSError, ValueError, RuntimeError) as error:
             skipped[str(error)] += 1
+            if len(skipped_samples) < 32:
+                sample = {"output": name[:2048], "reason": str(error)[:512]}
+                if active_input is not None:
+                    sample["input"] = active_input[:2048]
+                skipped_samples.append(sample)
     for value, original in input_stats.items():
         try:
             current = checked_input(value)
@@ -293,7 +301,8 @@ def ninja_mtime_plan(src: Path) -> dict:
             raise Miss(f"recorded input changed during timestamp planning: {value}: {error}") from error
         if input_identity(current) != input_identity(original):
             raise Miss(f"recorded input changed during timestamp planning: {value}")
-    return {"outputs_restored": len(repairs), "repairs": repairs, "skipped": dict(skipped)}
+    return {"outputs_restored": len(repairs), "repairs": repairs, "skipped": dict(skipped),
+            "skipped_samples": skipped_samples}
 
 
 def apply_mtime_plan(src: Path, plan: dict, journal: list) -> None:

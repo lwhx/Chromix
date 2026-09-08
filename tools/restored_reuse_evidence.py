@@ -47,13 +47,16 @@ MAX_INPUT_BYTES = 64 * 1024**2
 MAX_LOG_BYTES = 128 * 1024**2
 MAX_LINE_BYTES = 16 * 1024
 MAX_JSON_BYTES = 2 * 1024**2
+MAX_PATH_EXAMPLES = 8
+MAX_PATH_EXAMPLE_CHARS = 256
 NINJA_TIMEOUT = 120
 SCOPE = "retained since first Chromix build, upstream source verified"
 CONTRACT = "Initial before follows GN/plan, precedes all actual object builds, and is preserved across stages."
 SAFE_ENV = ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_SHA", "GITHUB_JOB", "GITHUB_HEAD_REF")
-DISQUALIFICATION_REASONS = {"log_prefix_mismatch", "appended_record_changed", "not_in_target_inputs",
+DISQUALIFICATION_REASONS = {"log_prefix_mismatch", "appended_record_changed", "appended_record_repeated",
+                          "not_in_target_inputs",
                           "target_inputs_changed", "missing_record", "record_changed", "missing_file",
-                          "file_metadata_changed", "content_changed"}
+                          "file_metadata_changed", "content_changed", "unsupported_appended_output"}
 
 
 class EvidenceError(ValueError):
@@ -89,6 +92,21 @@ def object_name(name: str) -> str:
 
 def object_path(out: Path, name: str) -> Path:
     return restore.safe_path(out, Path(object_name(name)))
+
+
+def object_like(name: str) -> bool:
+    # Quotes and archive-member delimiters are recognized, never normalized.
+    return re.search(r"\.(?:o|obj)[\"')]*\Z", name) is not None
+
+
+def escaped_path(value) -> str:
+    text = ascii(value)
+    return text if len(text) <= MAX_PATH_EXAMPLE_CHARS else text[:MAX_PATH_EXAMPLE_CHARS - 3] + "..."
+
+
+def path_example(examples: list, name: str, origin: str, line: int) -> None:
+    if len(examples) < MAX_PATH_EXAMPLES:
+        examples.append({"origin": origin, "line": line, "path_escaped": escaped_path(name)})
 
 
 def json_bytes(value: dict) -> bytes:
@@ -151,20 +169,32 @@ def query(ninja: Path, out: Path, args: list[str], limit: int) -> bytes:
 
 def target_inputs(ninja: Path, out: Path, targets: list[str]) -> tuple[set[str], dict]:
     raw = query(ninja, out, ["-t", "inputs", *targets], MAX_INPUT_BYTES)
-    text = raw.decode("utf-8")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EvidenceError(f"invalid UTF-8 in ninja -t inputs at byte {error.start}: "
+                            f"{escaped_path(raw[error.start:error.start + MAX_PATH_EXAMPLE_CHARS])}") from error
     if text and not text.endswith("\n"):
-        raise EvidenceError("unterminated Ninja inputs output")
-    names = set()
-    count = 0
-    for line in text.splitlines():
+        line_number = text.count("\n") + 1
+        fragment = text.rsplit("\n", 1)[-1]
+        raise EvidenceError(f"unterminated Ninja inputs output at ninja -t inputs line {line_number}: {escaped_path(fragment)}")
+    names, examples = set(), []
+    count = excluded = 0
+    for count, line in enumerate(text[:-1].split("\n") if text else [], 1):
+        line = line.removesuffix("\r")
         if not line or len(line) > MAX_LINE_BYTES or any(ord(char) < 32 for char in line):
-            raise EvidenceError("malformed Ninja inputs output")
-        count += 1
-        # Cross-version shell escaping is intentionally unsupported for objects.
-        if line.rstrip("\"'").endswith((".o", ".obj")):
-            names.add(object_name(line))
+            raise EvidenceError(f"malformed Ninja inputs output at ninja -t inputs line {count}: {escaped_path(line)}")
+        if object_like(line):
+            try:
+                name = object_name(line)
+            except EvidenceError:
+                excluded += 1
+                path_example(examples, line, "ninja -t inputs", count)
+            else:
+                names.add(name)
     return names, {"sha256": hashlib.sha256(raw).hexdigest(), "input_count": count,
                    "object_count": len(names), "tool": "ninja -t inputs",
+                   "excluded_object_inputs": excluded, "excluded_object_input_examples": examples,
                    "validation_inputs_included": False}
 
 
@@ -208,8 +238,6 @@ def parse_record(line: str, version: int) -> dict:
             or not output or len(output) > 2048 or any(ord(char) < 32 for char in output)
             or not re.fullmatch(r"[0-9a-fA-F]{1,16}", command_hash)):
         raise EvidenceError("invalid Ninja log record")
-    if output.rstrip("\"'").endswith((".o", ".obj")):
-        object_name(output)
     return {"start": int(start), "end": int(end), "mtime": int(mtime),
             "output": output, "hash": command_hash, "version": version}
 
@@ -220,6 +248,8 @@ def read_log(out: Path, selected: set[str], *, baseline=None, previous=None) -> 
     if info.st_size > MAX_LOG_BYTES:
         raise EvidenceError("Ninja log exceeds byte cap")
     records, changed, count, total = {}, {}, 0, 0
+    excluded, examples = 0, []
+    unsupported_appended = False
     digest, prefix = hashlib.sha256(), hashlib.sha256()
     prefix_size = previous["size_bytes"] if previous is not None else 0
     originals = {sample["output"]: sample["record"] for sample in baseline["samples"]} if baseline else {}
@@ -245,23 +275,40 @@ def read_log(out: Path, selected: set[str], *, baseline=None, previous=None) -> 
             offset = total
             consume(line)
             if len(line) > MAX_LINE_BYTES or total > MAX_LOG_BYTES:
-                raise EvidenceError("Ninja log exceeds byte cap")
-            record = parse_record(line.decode("utf-8"), version)
+                raise EvidenceError(f"Ninja log exceeds byte cap at .ninja_log line {count + 2}: {escaped_path(line)}")
+            try:
+                record = parse_record(line.decode("utf-8"), version)
+            except (EvidenceError, UnicodeDecodeError) as error:
+                reason = "invalid UTF-8" if isinstance(error, UnicodeDecodeError) else str(error)
+                raise EvidenceError(f"{reason} at .ninja_log line {count + 2}: {escaped_path(line)}") from error
             count += 1
             name = record["output"]
             if name in selected:
                 records[name] = record
-                if baseline and offset >= baseline["log"]["size_bytes"] and record != originals[name]:
-                    changed[name] = "appended_record_changed"
+                if baseline and offset >= baseline["log"]["size_bytes"]:
+                    changed.setdefault(name, "appended_record_changed" if record != originals[name]
+                                       else "appended_record_repeated")
+            elif object_like(name):
+                try:
+                    object_name(name)
+                except EvidenceError:
+                    excluded += 1
+                    path_example(examples, name, ".ninja_log", count + 1)
+                    if baseline and offset >= baseline["log"]["size_bytes"]:
+                        unsupported_appended = True
     if stamp(regular(path)) != stamp(info):
         raise EvidenceError("Ninja log changed during observation")
     continuity = previous is None or (version == previous["version"] and total >= prefix_size
                                      and prefix.hexdigest() == previous["sha256"])
+    if unsupported_appended:
+        # An unsupported output may alias any sample, even with unchanged bytes and mtime.
+        changed = dict.fromkeys(selected, "unsupported_appended_output")
     if not continuity:
         changed = dict.fromkeys(selected, "log_prefix_mismatch")
     log = {"version": version, "size_bytes": total, "record_count": count,
            "sha256": digest.hexdigest(), "prefix_size_bytes": prefix_size,
-           "prefix_sha256": prefix.hexdigest(), "prefix_matches_previous": continuity}
+           "prefix_sha256": prefix.hexdigest(), "prefix_matches_previous": continuity,
+           "unselected_unsupported_object_records": excluded, "unselected_unsupported_object_examples": examples}
     return records, log, stamp(info), changed
 
 
@@ -286,12 +333,33 @@ def file_record(path: Path, budget: int = MAX_HASH_BYTES, expected=None) -> dict
     return {"sha256": digest.hexdigest(), "size": info.st_size, "mtime_ns": info.st_mtime_ns}
 
 
+def path_diagnostics_valid(data: dict, count_key: str, examples_key: str, origin: str, total: int) -> None:
+    # Older observations did not include these diagnostic-only fields.
+    if count_key not in data and examples_key not in data:
+        return
+    count, examples = data.get(count_key), data.get(examples_key)
+    if (type(count) is not int or not 0 <= count <= total
+            or not isinstance(examples, list) or len(examples) != min(count, MAX_PATH_EXAMPLES)):
+        raise EvidenceError("invalid path exclusion diagnostics")
+    first_line = 2 if origin == ".ninja_log" else 1
+    for example in examples:
+        if (not isinstance(example, dict) or set(example) != {"origin", "line", "path_escaped"}
+                or example["origin"] != origin or type(example["line"]) is not int
+                or not first_line <= example["line"] < total + first_line
+                or not isinstance(example["path_escaped"], str)
+                or not 0 < len(example["path_escaped"]) <= MAX_PATH_EXAMPLE_CHARS
+                or any(not 32 <= ord(char) < 127 for char in example["path_escaped"])):
+            raise EvidenceError("invalid path exclusion example")
+
+
 def log_valid(log) -> None:
     if (not isinstance(log, dict) or type(log.get("version")) is not int or log["version"] not in (5, 6, 7)
             or any(type(log.get(key)) is not int or not 0 <= log[key] <= MAX_LOG_BYTES
                    for key in ("size_bytes", "record_count"))
             or not isinstance(log.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", log["sha256"])):
         raise EvidenceError("invalid log metadata")
+    path_diagnostics_valid(log, "unselected_unsupported_object_records", "unselected_unsupported_object_examples",
+                           ".ninja_log", log["record_count"])
 
 
 def membership_valid(membership) -> None:
@@ -302,6 +370,8 @@ def membership_valid(membership) -> None:
             or not isinstance(membership.get("sha256"), str)
             or not re.fullmatch(r"[0-9a-f]{64}", membership["sha256"])):
         raise EvidenceError("invalid target membership metadata")
+    path_diagnostics_valid(membership, "excluded_object_inputs", "excluded_object_input_examples",
+                           "ninja -t inputs", membership["input_count"])
 
 
 def baseline_valid(data: dict, source: dict, targets: list[str]) -> None:
@@ -375,7 +445,8 @@ def observe(out: Path, baseline: dict, previous: dict, names: set[str], membersh
     records, log, log_stamp, changed = read_log(out, selected, baseline=baseline, previous=previous["log"])
     for name, reason in changed.items():
         disqualified.setdefault(name, reason)
-    graph_changed = after_build and membership != previous["membership"]
+    graph_changed = after_build and any(membership[key] != previous["membership"][key] for key in
+                                        ("sha256", "input_count", "object_count", "tool", "validation_inputs_included"))
     observations, hashed = [], 0
     for sample in baseline["samples"]:
         name = sample["output"]
@@ -391,10 +462,10 @@ def observe(out: Path, baseline: dict, previous: dict, names: set[str], membersh
         elif records[name] != sample["record"]:
             status = "record_changed"
         else:
-            path = object_path(out, name)
             try:
+                path = object_path(out, name)
                 info = regular(path)
-            except FileNotFoundError:
+            except (FileNotFoundError, NotADirectoryError):
                 status = "missing_file"
             else:
                 if info.st_size != sample["file"]["size"] or info.st_mtime_ns != sample["file"]["mtime_ns"]:
@@ -434,10 +505,10 @@ def before(workdir: Path, platform: str, arch: str, ninja: Path, targets=("chrom
         skipped = {"missing_file": 0, "file_byte_cap": 0, "total_byte_cap": 0,
                    "missing_record": 0, "nonpositive_log_mtime": 0}
         for name in sorted(names):
-            candidate = object_path(out, name)
             try:
+                candidate = object_path(out, name)
                 info = regular(candidate)
-            except FileNotFoundError:
+            except (FileNotFoundError, NotADirectoryError):
                 skipped["missing_file"] += 1
                 continue
             if not 0 < info.st_size <= MAX_FILE_BYTES:

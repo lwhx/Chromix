@@ -38,20 +38,24 @@ COMPILED_SUFFIXES = {".o", ".obj", ".a", ".lib", ".rlib", ".rmeta", ".pch", ".gc
 METADATA = {"args.gn", "build.ninja", ".ninja_deps", ".ninja_log"}
 
 
+def _sdk_root(path: Path, root: Path) -> bool:
+    out = root if tuple(part.lower() for part in root.parts[-2:]) == ("out", "default") else root / "out/Default"
+    return path.parent == out and path.name.lower() in ("sdk", "xcode_links")
+
+
 def inside_path(root: Path, relative: str, *, output=False) -> Path | None:
     value = relative.replace("\\", "/")
     if (not value or "\0" in value or Path(value).is_absolute()
             or PureWindowsPath(value).drive or ":" in value):
         return None
     parts = Path(value).parts
-    if output and (".." in parts or {part.lower() for part in parts} & {"sdk", "xcode_links"}
-                   or Path(value).name in METADATA or value.endswith(".ninja")):
+    if output and (".." in parts or Path(value).name in METADATA or value.endswith(".ninja")):
         return None
     path = root / value
     try:
         if not path.resolve().is_relative_to(root.resolve()):
             return None
-        if output and any(linked(parent) for parent in (path, *path.parents)):
+        if output and any(_sdk_root(parent, root) or linked(parent) for parent in (path, *path.parents)):
             return None
     except (OSError, RuntimeError, ValueError):
         return None
@@ -262,8 +266,8 @@ def generator_fingerprint(src: Path, platform: str, arch: str) -> dict:
     return result
 
 
-def invalidate_generated_outputs(src: Path) -> dict:
-    """Regenerate logged actions without compiler deps when host generators change."""
+def invalidate_generated_outputs(src: Path, *, removed_paths: set[str] | None = None) -> dict:
+    """Invalidate logged outputs without compiler deps when generators are unverified."""
     out = src / "out/Default"
     dependencies = ninja_deps(out / ".ninja_deps")
     result = {"removed_outputs": 0, "unknown_outputs": []}
@@ -275,6 +279,8 @@ def invalidate_generated_outputs(src: Path) -> dict:
             result["unknown_outputs"].append(name)
         elif _remove_output(output):
             result["removed_outputs"] += 1
+            if removed_paths is not None:
+                removed_paths.add(output.resolve().as_posix())
     return result
 
 
@@ -285,36 +291,54 @@ def _remove_output(path: Path | None) -> bool:
     return False
 
 
-def invalidate_external_dependencies(src: Path, *, invalidate_all=False, recheck_external=True) -> dict:
+def invalidate_external_dependencies(src: Path, *, invalidate_all=False, recheck_external=True,
+                                     external_inputs=(), removed_generated=()) -> dict:
     out = src / "out/Default"
     if any(linked(parent) for parent in (out, *out.parents)):
         raise ValueError("linked output root")
     records = ninja_deps(out / ".ninja_deps")
     result = {"dependency_records": len(records), "external_dependency_outputs": 0,
               "missing_dependency_outputs": 0, "removed_outputs": 0,
-              "toolchain_invalidated_outputs": 0, "unknown_outputs": []}
+              "toolchain_invalidated_outputs": 0, "unknown_outputs": [],
+              "input_reason_outputs": {}, "input_samples": []}
     inputs = {}
     source_root = src.resolve()
+    external_roots = tuple(source_root / value for value in external_inputs)
+    removed_generated = set(removed_generated)
     for name, (_, dependencies) in records.items():
         output = inside_path(out, name, output=True)
         if output is None:
             result["unknown_outputs"].append({"output": name, "reason": "unsafe or nonlocal output"})
             continue
         external = missing = False
+        reasons = set()
         if recheck_external:
             for dependency in dependencies:
                 if dependency not in inputs:
                     value = dependency.replace("\\", "/")
                     try:
+                        lexical = Path(os.path.abspath(out / value))
+                        omitted = any(lexical == root or lexical.is_relative_to(root) for root in external_roots)
                         path = (out / value).resolve()
                         outside = bool(Path(value).is_absolute() or PureWindowsPath(value).drive
-                                       or ":" in value or not path.is_relative_to(source_root))
-                        inputs[dependency] = (outside, not outside and not path.is_file())
+                                       or ":" in value or not path.is_relative_to(source_root) or omitted)
+                        absent = not outside and not path.is_file()
+                        reason = ("omitted_external_input" if omitted else "external_input" if outside else
+                                  "removed_generated_input" if absent and path.as_posix() in removed_generated else
+                                  "missing_local_input" if absent else None)
+                        inputs[dependency] = (outside, absent, reason)
                     except (OSError, ValueError, RuntimeError):
-                        inputs[dependency] = (True, False)
-                outside, absent = inputs[dependency]
+                        inputs[dependency] = (True, False, "unresolved_input")
+                outside, absent, reason = inputs[dependency]
                 external |= outside
                 missing |= absent
+                if reason is not None and reason not in reasons:
+                    reasons.add(reason)
+                    counts = result["input_reason_outputs"]
+                    counts[reason] = counts.get(reason, 0) + 1
+                    if len(result["input_samples"]) < 32:
+                        result["input_samples"].append({"output": name[:2048],
+                                                        "input": dependency[:2048], "reason": reason})
         if external or missing:
             result["external_dependency_outputs" if external else "missing_dependency_outputs"] += 1
         if invalidate_all or external or missing:
@@ -335,7 +359,7 @@ def invalidate_compiled_outputs(src: Path) -> dict:
         raise error
 
     for directory, dirs, files in os.walk(out, followlinks=False, onerror=walk_error):
-        dirs[:] = [name for name in dirs if name.lower() not in ("sdk", "xcode_links")
+        dirs[:] = [name for name in dirs if not _sdk_root(Path(directory) / name, out)
                    and not linked(Path(directory) / name)]
         for name in files:
             relative = (Path(directory) / name).relative_to(out).as_posix()
@@ -554,10 +578,13 @@ def _prepare(workdir: Path, platform: str, arch: str, *, phase: str, repo: Path,
     first_finish = old is None
     data["operation"] = "invalidate_outputs"
     products = remove_final_products(src, platform) if first_finish else []
-    generated = (invalidate_generated_outputs(src) if first_finish or generators_changed
-                 else {"removed_outputs": 0, "unknown_outputs": []})
-    dependencies = invalidate_external_dependencies(src, invalidate_all=tool_changed,
-                                                   recheck_external=environment_changed or generators_changed or bool(generated["removed_outputs"]))
+    removed_generated = set()
+    generated = (invalidate_generated_outputs(src, removed_paths=removed_generated)
+                 if first_finish or generators_changed else {"removed_outputs": 0, "unknown_outputs": []})
+    dependencies = invalidate_external_dependencies(
+        src, invalidate_all=tool_changed,
+        recheck_external=environment_changed or generators_changed or bool(generated["removed_outputs"]),
+        external_inputs=receipt["external_symlink_paths"], removed_generated=removed_generated)
     compiled = invalidate_compiled_outputs(src) if tool_changed else {"removed_outputs": 0, "unknown_outputs": []}
     gn = inspection["tools"]["gn"]
     gn_path = _safe_file(src / "out/Default", Path(gn["path"]).name)
