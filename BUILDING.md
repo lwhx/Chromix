@@ -101,6 +101,14 @@ Before source preparation, `build/macos/select-xcode.sh` preserves a supported
 for an actual macOS SDK >=26. It records the Xcode version and SDK path and
 exports the selected `DEVELOPER_DIR` through `GITHUB_ENV` for every CI stage.
 The native macOS build invokes the same helper. Missing SDK 26 fails early.
+On GitHub-hosted macOS runners, each stage then runs
+`build/macos/free-disk-space.py` before downloading a handoff or upstream tree.
+It preserves the selected Xcode, macOS SDK, runner/work directories, and tool
+paths while removing only confined unused Xcode bundles, then mobile SDKs and
+simulator runtimes if necessary. It requires 120 GiB free after cleanup and fails
+before restoration if that reserve cannot be reached. The reserve is a capacity
+budget, not proof that a particular expanded tree and subsequent link will fit;
+before/after space and each deletion are recorded in `disk-cleanup.log`.
 
 The September 2026 `macos-15` and `macos-15-intel` runner inventories include
 Xcode 26 while their default Xcode 16.4 supplies SDK 15.5. The pinned upstream
@@ -130,7 +138,14 @@ stage uploads multi-volume 7-Zip snapshots with modification times preserved so
 Ninja can continue incrementally. Manual dispatch of
 `.github/workflows/build-win-x64-github.yml` remains available for explicit
 Windows-only retries or cross-run resume; the normal release path uses the
-Windows job nested in `build-cross-platform`.
+Windows job nested in `build-cross-platform`. Windows validation also requires
+restoration when requested. Its internal deadline is 140 minutes within the
+150-minute job, with 15 minutes reserved for diagnostics; normal build stages
+retain a 300-minute internal deadline and 40-minute handoff reserve. Full-cache
+fetching is capped at 60 minutes and further limited by the actual remaining
+budget. V8 Torque validation uses only the remaining non-reserved time. The
+validation runner currently uploads diagnostics rather than its build tree, so
+stage 1 repeats restoration on its own runner.
 
 The POSIX reusable workflow follows the upstream ungoogled-chromium CI model:
 portablelinux's `prep` + `build_part_01..10` chain and macOS'
@@ -178,15 +193,18 @@ explicit tar/zstd stage snapshots — never a cache guess.
 
 ### Pinned upstream build-directory restoration
 
-Fresh unified builds try the five upstream Actions artifacts pinned in
-`build/upstream-cache.json`. The manifest records the repository, source commit,
-run, artifact ID, size, and SHA256 digest for each native target. This is explicit
-cross-repository artifact download, not shared `actions/cache` access. A manual
-unified dispatch can set `use_upstream_cache` to false for a full source build.
-An optional `UPSTREAM_ACTIONS_TOKEN` secret can grant access to public upstream
-Actions artifacts; otherwise the workflow tries its own `github.token`. A 403,
-404, expired artifact, checksum failure, or rejected source identity records a
-cache miss and follows the normal source-preparation path.
+Fresh unified builds require the five upstream Actions artifacts pinned in
+`build/upstream-cache.json` when `use_upstream_cache` is enabled. The manifest
+records the repository, source commit, run, artifact ID, size, and SHA256 digest
+for each native target. This is explicit cross-repository artifact download,
+not shared `actions/cache` access. A manual unified dispatch can set
+`use_upstream_cache` to false for a full source build. An optional
+`UPSTREAM_ACTIONS_TOKEN` secret can grant access to public upstream Actions
+artifacts; otherwise the workflow tries its own `github.token`. A 403, 404,
+expired artifact, checksum failure, insufficient disk or time budget, or rejected
+source identity stops a required-restoration build before cold preparation or
+Ninja. Existing and resumed trees must carry a valid restoration receipt in this
+mode, including Windows validation; a cold snapshot cannot satisfy the request.
 
 Restoration runs **before fresh source preparation**, only when `WORK/src` is
 absent. All five targets restore the complete upstream source tree and its
@@ -197,9 +215,13 @@ not duplicated or renamed to `out/Chromix`. Ordinary fresh builds still use
 the commands above. Own-stage snapshots take precedence and never refetch the
 upstream artifact.
 
-Download and extraction occur in a separate, owned directory. Signed blob
-redirects receive no GitHub authorization header; the outer ZIP is hashed before
-its inner archive is extracted. Unsafe archive members are rejected. Internal
+Download and extraction occur in a separate, owned directory. POSIX full-tree
+fetches have a 60-minute total deadline, configurable with
+`CHROMIX_CACHE_TIMEOUT_SECONDS`; the old 20-minute toolchain-oriented limit
+expired on the complete macOS Intel archive. Network attempts remain separately
+bounded, and a total deadline expiry stops required-restoration builds.
+Signed blob redirects receive no GitHub authorization header; the outer ZIP is
+hashed before its inner archive is extracted. Unsafe archive members are rejected. Internal
 absolute symlinks are remapped only from the pinned platform's known source
 root to an existing internal target. Known external host-tool and Xcode SDK
 links are omitted and recorded for recreation on the current runner. Source
@@ -232,8 +254,13 @@ flags, host tools, SDKs, or dependency paths can require substantial recompilati
 Diagnostics include `upstream-cache-restore.json`,
 `upstream-cache-preparation.json`, the source's `.chromix-upstream-restored.json`
 receipt, the downloader's `result.json`, and `upstream-cache-plan.log` from
-`ninja -n`. The preparation report records invalidated outputs and removed final
-products. A successful restoration is not proof of object hits, and a dry-run
+`ninja -n`. Downloader phase logs distinguish metadata checks, download, outer
+archive unpacking, full source/object extraction, and source verification.
+Disk rejection preserves free/required bytes, the failure phase, and any written
+extraction bytes/member before cleanup; a cleaned-up miss is not reported as a
+zero-byte extraction attempt. The preparation report records invalidated outputs
+and removed final products. A successful restoration is not proof of object hits,
+and a dry-run
 count is not a measured speedup. Native CI must establish actual reuse and
 elapsed time; local regression tests use small fixtures and sparse patch checks,
 without downloading full build artifacts or compiling Chromium. Artifact expiry

@@ -88,18 +88,34 @@ if [ -n "$FROM_SNAPSHOT" ] && [ -d "$FROM_SNAPSHOT" ]; then
   rm -rf "$FROM_SNAPSHOT"
 fi
 
-# Own snapshots take precedence over a fresh upstream restore.
-if [ "$STAGE_INDEX" -eq 1 ] && [ -z "$FROM_SNAPSHOT" ] &&
-   [ ! -e "$SRC" ] && [ "${CHROMIX_USE_UPSTREAM_CACHE:-0}" = 1 ] &&
-   [ "$(remaining_min)" -ge 90 ]; then
-  UPSTREAM_CACHE_DIR="${RUNNER_TEMP:-$(dirname "$WORK")}/chromix-upstream"
-  bash "$REPO/build/posix/fetch-upstream-cache.sh" \
-    --platform "$PLATFORM" --arch "$ARCH" --destination "$UPSTREAM_CACHE_DIR"
-  python3 "$REPO/tools/restore_upstream_cache.py" --phase restore \
-    --platform "$PLATFORM" --arch "$ARCH" --workdir "$WORK" \
-    --cache-dir "$UPSTREAM_CACHE_DIR"
+# Cache opt-in is mandatory in CI; helper APIs still report optional misses.
+if [ "${CHROMIX_USE_UPSTREAM_CACHE:-0}" = 1 ]; then
+  # Own snapshots take precedence, but cold snapshots cannot satisfy this mode.
+  if [ "$STAGE_INDEX" -eq 1 ] && [ -z "$FROM_SNAPSHOT" ] && [ ! -e "$SRC" ]; then
+    CACHE_TIMEOUT_SECONDS="${CHROMIX_CACHE_TIMEOUT_SECONDS-3600}"
+    [[ "$CACHE_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] ||
+      die "CHROMIX_CACHE_TIMEOUT_SECONDS must be a positive integer"
+    # Python integers avoid wrapping a large configured timeout in shell arithmetic.
+    CACHE_REQUIRED_MINUTES="$(python3 -c \
+      'import sys; print((int(sys.argv[1]) + 59) // 60 + int(sys.argv[2]) + 30)' \
+      "$CACHE_TIMEOUT_SECONDS" "$RESERVE_MINUTES")"
+    [ "$(remaining_min)" -ge "$CACHE_REQUIRED_MINUTES" ] ||
+      die "required upstream cache: insufficient stage budget for restore (need ${CACHE_REQUIRED_MINUTES}m)"
+    UPSTREAM_CACHE_DIR="${RUNNER_TEMP:-$(dirname "$WORK")}/chromix-upstream"
+    CHROMIX_CACHE_TIMEOUT_SECONDS="$CACHE_TIMEOUT_SECONDS" bash "$REPO/build/posix/fetch-upstream-cache.sh" \
+      --platform "$PLATFORM" --arch "$ARCH" --destination "$UPSTREAM_CACHE_DIR" ||
+      die "required upstream cache fetch failed"
+    python3 "$REPO/tools/restore_upstream_cache.py" --phase restore \
+      --platform "$PLATFORM" --arch "$ARCH" --workdir "$WORK" \
+      --cache-dir "$UPSTREAM_CACHE_DIR" || die "required upstream cache restore helper failed"
+  fi
+  [ -f "$SRC/.chromix-upstream-restored.json" ] ||
+    die "required upstream cache: restore receipt missing; refusing cold preparation or compilation"
 fi
 if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
+  python3 "$REPO/tools/restore_upstream_cache.py" --phase verify \
+    --platform "$PLATFORM" --arch "$ARCH" --workdir "$WORK" ||
+    die "restored upstream source verification failed"
   OUT="$SRC/out/Default"
 fi
 

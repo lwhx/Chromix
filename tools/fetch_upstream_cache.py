@@ -72,7 +72,11 @@ ORIGINAL_SOURCE_ROOTS = {
 
 
 class CacheMiss(Exception):
-    """An unavailable, untrusted, or incompatible cache; use a source build."""
+    """An unavailable, untrusted, or incompatible cache."""
+
+    def __init__(self, reason, *, details=None):
+        super().__init__(reason)
+        self.details = details or {}
 
 
 class LocalError(Exception):
@@ -321,7 +325,21 @@ def zip_mtime(info):
 
 
 def require_space(path, additional=0):
-    require(shutil.disk_usage(path).free >= DISK_HEADROOM + additional, "insufficient_disk_space")
+    free = shutil.disk_usage(path).free
+    required = DISK_HEADROOM + additional
+    if free < required:
+        raise CacheMiss("insufficient_disk_space", details={
+            "disk_free_bytes": free, "disk_required_bytes": required,
+            "disk_headroom_bytes": DISK_HEADROOM, "disk_path": str(path),
+        })
+
+
+def report_progress(destination, result, phase):
+    result["phase"] = phase
+    result["disk_free_bytes"] = shutil.disk_usage(destination).free
+    write_result(destination, result)
+    print(f"upstream cache: phase={phase}; free_bytes={result['disk_free_bytes']}",
+          file=sys.stderr, flush=True)
 
 
 class SourceSelection:
@@ -415,6 +433,7 @@ class Extractor:
         self.directories = {}
         self.links = []
         self.bytes = 0
+        self.written_bytes = 0
         self.archive_bytes = 0
         self.skipped = 0
         self.external_symlinks = []
@@ -484,8 +503,14 @@ class Extractor:
                     chunk = stream.read(min(CHUNK, remaining))
                     require(chunk, "truncated_archive_member")
                     if self.selection:
-                        require_space(self.root, len(chunk))
+                        try:
+                            require_space(self.root, len(chunk))
+                        except CacheMiss as exc:
+                            exc.details.update(extracted_bytes=self.written_bytes,
+                                               extraction_member=name, members=len(self.names))
+                            raise
                     output.write(chunk)
+                    self.written_bytes += len(chunk)
                     remaining -= len(chunk)
             self.metadata(path, mode, mtime_ns)
 
@@ -778,6 +803,7 @@ def fetch(platform, arch, destination, run_id=None, root=ROOT, client=None):
                 zstd = str(Path(zstd).resolve())
                 require(not Path(zstd).is_relative_to(destination), "unsafe_decompressor")
             client = client or GitHub()
+            report_progress(destination, result, "metadata")
             base = f"/repos/{pin['repository']}/actions"
             run = client.json(f"{base}/runs/{pin['run_id']}")
             artifact = client.json(f"{base}/artifacts/{pin['artifact']['id']}")
@@ -785,16 +811,22 @@ def fetch(platform, arch, destination, run_id=None, root=ROOT, client=None):
             require_space(destination, 2 * pin["artifact"]["size_in_bytes"])
             outer, inner = destination / ".download.zip", destination / ".inner"
             # Download verifies the pinned outer ZIP digest before opening either archive.
+            report_progress(destination, result, "download")
             result["download_bytes"] = client.download(pin, outer)
+            report_progress(destination, result, "unpack_outer")
             result["inner_bytes"] = unpack_outer(outer, inner, pin["artifact"]["inner_archive"])
             outer.unlink()
+            report_progress(destination, result, "extract_source_and_objects")
             result.update(extract_inner(inner, destination / "tree", zstd,
                                         SourceSelection(pin["source_roots"], platform=platform)))
             inner.unlink()
+            report_progress(destination, result, "verify_source")
             result["source"] = str(source_path(destination / "tree", pin))
             result["status"] = "hit"
+            result["phase"] = "complete"
         except CacheMiss as exc:
             result["reason"] = str(exc)
+            result.update(exc.details)
         except (OSError, tarfile.TarError, zipfile.BadZipFile, zipfile.LargeZipFile,
                 EOFError, UnicodeError, ValueError, OverflowError, InvalidOperation, zlib.error,
                 NotImplementedError, subprocess.SubprocessError) as exc:

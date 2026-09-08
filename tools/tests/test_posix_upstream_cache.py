@@ -29,7 +29,7 @@ class PosixUpstreamCacheTest(unittest.TestCase):
         self.assertLess(stage.index('"$REPO/tools/restore_upstream_cache.py"'),
                         stage.index('"$REPO/build/prepare-ungoogled.sh"'))
         self.assertIn('[ "$STAGE_INDEX" -eq 1 ] && [ -z "$FROM_SNAPSHOT" ]', stage)
-        self.assertIn('[ "$(remaining_min)" -ge 90 ]', stage)
+        self.assertIn('[ "$(remaining_min)" -ge "$CACHE_REQUIRED_MINUTES" ]', stage)
         self.assertIn('[ ! -e "$SRC" ]', stage)
         self.assertNotIn('export CHROMIX_UPSTREAM_CACHE_DIR=', stage)
 

@@ -113,6 +113,12 @@ jobs:
         if: runner.os == 'macOS'
         run: bash build/macos/select-xcode.sh
 
+      - name: Free macOS disk space
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          python3 build/macos/free-disk-space.py 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/disk-cleanup.log"
+
       - name: Inspect macOS toolchain
         if: runner.os == 'macOS'
         run: |
@@ -258,14 +264,6 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/chromix-logs"
           { uname -a; df -h; } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/runner.log"
 
-      - name: Download tree from previous stage
-        if: always()
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ${{ inputs.artifact }}-tree-s1-attempt-*-part*
-          merge-multiple: true
-          path: ${{ runner.temp }}/chromix-restore
-
       - name: Free Linux disk space
         if: runner.os == 'Linux'
         run: |
@@ -316,6 +314,12 @@ jobs:
         if: runner.os == 'macOS'
         run: bash build/macos/select-xcode.sh
 
+      - name: Free macOS disk space
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          python3 build/macos/free-disk-space.py 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/disk-cleanup.log"
+
       - name: Inspect macOS toolchain
         if: runner.os == 'macOS'
         run: |
@@ -345,6 +349,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+      - name: Download tree from previous stage
+        if: success()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.artifact }}-tree-s1-attempt-*-part*
+          merge-multiple: true
+          path: ${{ runner.temp }}/chromix-restore
+
       # The pinned download cache is deliberately outside the tree snapshot;
       # re-warm it first so a resumed preparation does not redownload archives.
       - name: Restore pinned source downloads
@@ -462,14 +474,6 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/chromix-logs"
           { uname -a; df -h; } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/runner.log"
 
-      - name: Download tree from previous stage
-        if: always()
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ${{ inputs.artifact }}-tree-s2-attempt-*-part*
-          merge-multiple: true
-          path: ${{ runner.temp }}/chromix-restore
-
       - name: Free Linux disk space
         if: runner.os == 'Linux'
         run: |
@@ -520,6 +524,12 @@ jobs:
         if: runner.os == 'macOS'
         run: bash build/macos/select-xcode.sh
 
+      - name: Free macOS disk space
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          python3 build/macos/free-disk-space.py 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/disk-cleanup.log"
+
       - name: Inspect macOS toolchain
         if: runner.os == 'macOS'
         run: |
@@ -549,6 +559,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+      - name: Download tree from previous stage
+        if: success()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.artifact }}-tree-s2-attempt-*-part*
+          merge-multiple: true
+          path: ${{ runner.temp }}/chromix-restore
+
       # The pinned download cache is deliberately outside the tree snapshot;
       # re-warm it first so a resumed preparation does not redownload archives.
       - name: Restore pinned source downloads
@@ -666,14 +684,6 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/chromix-logs"
           { uname -a; df -h; } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/runner.log"
 
-      - name: Download tree from previous stage
-        if: always()
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ${{ inputs.artifact }}-tree-s3-attempt-*-part*
-          merge-multiple: true
-          path: ${{ runner.temp }}/chromix-restore
-
       - name: Free Linux disk space
         if: runner.os == 'Linux'
         run: |
@@ -724,6 +734,12 @@ jobs:
         if: runner.os == 'macOS'
         run: bash build/macos/select-xcode.sh
 
+      - name: Free macOS disk space
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          python3 build/macos/free-disk-space.py 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/disk-cleanup.log"
+
       - name: Inspect macOS toolchain
         if: runner.os == 'macOS'
         run: |
@@ -753,6 +769,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+      - name: Download tree from previous stage
+        if: success()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.artifact }}-tree-s3-attempt-*-part*
+          merge-multiple: true
+          path: ${{ runner.temp }}/chromix-restore
+
       # The pinned download cache is deliberately outside the tree snapshot;
       # re-warm it first so a resumed preparation does not redownload archives.
       - name: Restore pinned source downloads
@@ -870,14 +894,6 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/chromix-logs"
           { uname -a; df -h; } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/runner.log"
 
-      - name: Download tree from previous stage
-        if: always()
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ${{ inputs.artifact }}-tree-s4-attempt-*-part*
-          merge-multiple: true
-          path: ${{ runner.temp }}/chromix-restore
-
       - name: Free Linux disk space
         if: runner.os == 'Linux'
         run: |
@@ -928,6 +944,12 @@ jobs:
         if: runner.os == 'macOS'
         run: bash build/macos/select-xcode.sh
 
+      - name: Free macOS disk space
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          python3 build/macos/free-disk-space.py 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/disk-cleanup.log"
+
       - name: Inspect macOS toolchain
         if: runner.os == 'macOS'
         run: |
@@ -957,6 +979,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+      - name: Download tree from previous stage
+        if: success()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.artifact }}-tree-s4-attempt-*-part*
+          merge-multiple: true
+          path: ${{ runner.temp }}/chromix-restore
+
       # The pinned download cache is deliberately outside the tree snapshot;
       # re-warm it first so a resumed preparation does not redownload archives.
       - name: Restore pinned source downloads
@@ -1074,14 +1104,6 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/chromix-logs"
           { uname -a; df -h; } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/runner.log"
 
-      - name: Download tree from previous stage
-        if: always()
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ${{ inputs.artifact }}-tree-s5-attempt-*-part*
-          merge-multiple: true
-          path: ${{ runner.temp }}/chromix-restore
-
       - name: Free Linux disk space
         if: runner.os == 'Linux'
         run: |
@@ -1132,6 +1154,12 @@ jobs:
         if: runner.os == 'macOS'
         run: bash build/macos/select-xcode.sh
 
+      - name: Free macOS disk space
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          python3 build/macos/free-disk-space.py 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/disk-cleanup.log"
+
       - name: Inspect macOS toolchain
         if: runner.os == 'macOS'
         run: |
@@ -1161,6 +1189,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+      - name: Download tree from previous stage
+        if: success()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.artifact }}-tree-s5-attempt-*-part*
+          merge-multiple: true
+          path: ${{ runner.temp }}/chromix-restore
+
       # The pinned download cache is deliberately outside the tree snapshot;
       # re-warm it first so a resumed preparation does not redownload archives.
       - name: Restore pinned source downloads
@@ -1278,14 +1314,6 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/chromix-logs"
           { uname -a; df -h; } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/runner.log"
 
-      - name: Download tree from previous stage
-        if: always()
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ${{ inputs.artifact }}-tree-s6-attempt-*-part*
-          merge-multiple: true
-          path: ${{ runner.temp }}/chromix-restore
-
       - name: Free Linux disk space
         if: runner.os == 'Linux'
         run: |
@@ -1336,6 +1364,12 @@ jobs:
         if: runner.os == 'macOS'
         run: bash build/macos/select-xcode.sh
 
+      - name: Free macOS disk space
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          python3 build/macos/free-disk-space.py 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/disk-cleanup.log"
+
       - name: Inspect macOS toolchain
         if: runner.os == 'macOS'
         run: |
@@ -1365,6 +1399,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+      - name: Download tree from previous stage
+        if: success()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.artifact }}-tree-s6-attempt-*-part*
+          merge-multiple: true
+          path: ${{ runner.temp }}/chromix-restore
+
       # The pinned download cache is deliberately outside the tree snapshot;
       # re-warm it first so a resumed preparation does not redownload archives.
       - name: Restore pinned source downloads
@@ -1482,14 +1524,6 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/chromix-logs"
           { uname -a; df -h; } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/runner.log"
 
-      - name: Download tree from previous stage
-        if: always()
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ${{ inputs.artifact }}-tree-s7-attempt-*-part*
-          merge-multiple: true
-          path: ${{ runner.temp }}/chromix-restore
-
       - name: Free Linux disk space
         if: runner.os == 'Linux'
         run: |
@@ -1540,6 +1574,12 @@ jobs:
         if: runner.os == 'macOS'
         run: bash build/macos/select-xcode.sh
 
+      - name: Free macOS disk space
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          python3 build/macos/free-disk-space.py 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/disk-cleanup.log"
+
       - name: Inspect macOS toolchain
         if: runner.os == 'macOS'
         run: |
@@ -1569,6 +1609,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+      - name: Download tree from previous stage
+        if: success()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.artifact }}-tree-s7-attempt-*-part*
+          merge-multiple: true
+          path: ${{ runner.temp }}/chromix-restore
+
       # The pinned download cache is deliberately outside the tree snapshot;
       # re-warm it first so a resumed preparation does not redownload archives.
       - name: Restore pinned source downloads

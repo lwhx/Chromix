@@ -554,6 +554,54 @@ class FetchUpstreamCacheTest(unittest.TestCase):
             with self.assertRaises((cache.CacheMiss, tarfile.TarError)):
                 cache.extract_inner(inner, self.root / "bad-zstd", shutil.which("zstd"))
 
+    def test_disk_failure_records_phase_and_required_space(self):
+        client = self.fixture_client()
+        self.disk_usage.return_value = mock.Mock(free=cache.DISK_HEADROOM - 1)
+        result = cache.fetch("windows", "x64", self.destination, root=self.root, client=client)
+        self.assertEqual(result["reason"], "insufficient_disk_space")
+        self.assertEqual(result["phase"], "metadata")
+        self.assertEqual(result["disk_free_bytes"], cache.DISK_HEADROOM - 1)
+        self.assertGreater(result["disk_required_bytes"], cache.DISK_HEADROOM)
+        self.assertEqual(result["disk_headroom_bytes"], cache.DISK_HEADROOM)
+        self.assertEqual(result["disk_path"], str(self.destination))
+        client.open.assert_not_called()
+        self.assertEqual({p.name for p in self.destination.iterdir()}, {"result.json"})
+
+    def test_extraction_disk_failure_records_partial_bytes_and_member(self):
+        client = self.fixture_client()
+        original = cache.require_space
+
+        def fail_second_file(path, additional=0):
+            first = Path(path) / "src/BUILD.gn"
+            if Path(path).name == "tree" and additional and first.exists() and first.stat().st_size:
+                original_disk = self.disk_usage.return_value
+                self.disk_usage.return_value = mock.Mock(free=cache.DISK_HEADROOM - 1)
+                try:
+                    return original(path, additional)
+                finally:
+                    self.disk_usage.return_value = original_disk
+            return original(path, additional)
+
+        with mock.patch.object(cache, "require_space", side_effect=fail_second_file):
+            result = cache.fetch("windows", "x64", self.destination, root=self.root, client=client)
+        self.assertEqual(result["reason"], "insufficient_disk_space")
+        self.assertEqual(result["phase"], "extract_source_and_objects")
+        self.assertEqual(result["extracted_bytes"], len(b"build"))
+        self.assertEqual(result["extraction_member"], "src/chrome/VERSION")
+        self.assertEqual(result["disk_free_bytes"], cache.DISK_HEADROOM - 1)
+        self.assertEqual({p.name for p in self.destination.iterdir()}, {"result.json"})
+
+    def test_progress_reports_phase_without_credentials(self):
+        client = self.fixture_client()
+        with mock.patch("sys.stderr", new=io.StringIO()) as output:
+            result = cache.fetch("windows", "x64", self.destination, root=self.root, client=client)
+        self.assertEqual(result["status"], "hit")
+        self.assertEqual(result["phase"], "complete")
+        for phase in ("metadata", "download", "unpack_outer", "extract_source_and_objects", "verify_source"):
+            self.assertIn("phase=" + phase, output.getvalue())
+        self.assertNotIn("fixture-token", output.getvalue())
+        self.assertEqual(json.loads((self.destination / "result.json").read_text())["phase"], "complete")
+
     def test_result_owned_stale_tree_cleanup_and_lock(self):
         client = self.fixture_client()
         result = cache.fetch("windows", "x64", self.destination, root=self.root, client=client)

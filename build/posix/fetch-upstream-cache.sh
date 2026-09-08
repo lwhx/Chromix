@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Bound optional downloads without turning local errors into cache misses.
+# Bound full-tree downloads and extraction without hiding local errors.
 set -euo pipefail
 set +m
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 die() { printf 'upstream cache: %s\n' "$*" >&2; exit 2; }
-SECONDS_LIMIT="${CHROMIX_CACHE_TIMEOUT_SECONDS-1200}"
+SECONDS_LIMIT="${CHROMIX_CACHE_TIMEOUT_SECONDS-3600}"
 [[ "$SECONDS_LIMIT" =~ ^[1-9][0-9]*$ ]] || die "CHROMIX_CACHE_TIMEOUT_SECONDS must be a positive integer"
 TIMEOUT="$(type -P timeout || type -P gtimeout || true)"
 [ -n "$TIMEOUT" ] && [ -x "$TIMEOUT" ] || die "timeout or gtimeout executable is required"

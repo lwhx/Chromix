@@ -224,7 +224,7 @@ class PosixCacheBudgetTest(unittest.TestCase):
         tools = Path(self.host_path())
         timeout = tools / "timeout"
         timeout.write_text(f"#!{shutil.which('python3')}\nimport os, sys\n"
-                           "assert sys.argv[1:4] == ['-k', '30s', '1200s'], sys.argv\n"
+                           "assert sys.argv[1:4] == ['-k', '30s', '3600s'], sys.argv\n"
                            "os.execv(sys.argv[4], sys.argv[4:])\n")
         timeout.chmod(0o755)
         self.env.pop("CHROMIX_CACHE_TIMEOUT_SECONDS")

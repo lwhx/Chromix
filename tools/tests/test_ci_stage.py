@@ -38,7 +38,7 @@ def invoke_tracked_source() -> str:
 
 def validate_only_source() -> str:
     script = CI_STAGE.read_text(encoding="utf-8")
-    start = script.index("if ($ValidateOnly) {")
+    start = script.rindex("\nif ($ValidateOnly) {")
     end = script.index("$ninjaBudget =", start)
     return script[start:end]
 
@@ -377,13 +377,15 @@ class ResumeWorkflowRegressionTest(unittest.TestCase):
             12,
         )
 
-    def test_upstream_cache_keeps_validation_and_imports_only_stage_one(self):
+    def test_upstream_cache_is_required_for_validation_and_all_resumes(self):
         self.assertIn("upstream_run_id:", self.source)
         self.assertIn("use_upstream_cache:", self.source)
         self.assertIn("inputs.resume_run_id == '' && needs.validate.result == 'success'", self.source)
         self.assertIn("GH_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_TOKEN || github.token }}", self.source)
         self.assertIn("UPSTREAM_RUN_ID: ${{ inputs.upstream_run_id }}", self.source)
         self.assertEqual(self.source.count("UseUpstreamCache ="), 1)
+        self.assertIn("CHROMIX_USE_UPSTREAM_CACHE: ${{ (inputs.use_upstream_cache || inputs.upstream_run_id != '') && '1' || '0' }}", self.source)
+        self.assertIn("-ValidateOnly -UpstreamRunId $env:UPSTREAM_RUN_ID", self.source)
         self.assertNotIn("-UpstreamArtifactPath", self.source)
 
     def test_resume_uses_official_cross_run_artifact_download(self):

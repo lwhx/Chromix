@@ -17,6 +17,11 @@ WORKFLOW = REPO / ".github/workflows/build-win-x64-github.yml"
 PREPARE = REPO / "build/windows/prepare-ungoogled.ps1"
 
 
+def stage_budget_source() -> str:
+    stage = STAGE.read_text()
+    return stage[stage.index('$StageMinutes ='):stage.index('\nfunction Write-OutVar')]
+
+
 def workflow_job(source: str, name: str) -> str:
     match = re.search(rf"(?ms)^  {re.escape(name)}:\n.*?(?=^  [\w-]+:|\Z)", source)
     if match is None:
@@ -37,7 +42,7 @@ class WindowsUpstreamCacheRegressionTest(unittest.TestCase):
         cls.workflow = WORKFLOW.read_text(encoding="utf-8")
         cls.validate = workflow_job(cls.workflow, "validate")
         cls.build_one = workflow_job(cls.workflow, "build-1")
-        start = cls.stage.index("if ($StageIndex -eq 1 -and -not $ValidateOnly")
+        start = cls.stage.index("if ($StageIndex -eq 1 -and -not $FromArtifact")
         end = cls.stage.index('\nif (-not (Test-Path (Join-Path $Src ".chromix-source-ready"))', start)
         cls.cache = cls.stage[start:end]
         start = cls.prepare.index('if ($RestoredUpstream) {\n  Invoke-Checked $Python @(\n'
@@ -47,14 +52,16 @@ class WindowsUpstreamCacheRegressionTest(unittest.TestCase):
 
     def test_clean_validation_still_gates_fresh_build(self):
         self.assertIn("if: ${{ inputs.resume_run_id == '' }}", self.validate)
-        self.assertNotIn("upstream", self.validate.lower())
+        self.assertIn("GH_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_TOKEN || github.token }}", self.validate)
+        self.assertIn("-UpstreamRunId $env:UPSTREAM_RUN_ID", self.validate)
         self.assertIn("-StageIndex 1 -MaxStages 12 -ValidateOnly", self.validate)
         self.assertIn("needs: validate", self.build_one)
         self.assertIn("inputs.resume_run_id == '' && needs.validate.result == 'success'", self.build_one)
 
     def test_fetch_and_restore_only_fresh_opted_in_stage_one_before_preparation(self):
-        self.assertRegex(self.cache, r"^if \(\$StageIndex -eq 1 -and -not \$ValidateOnly -and -not \$FromArtifact -and\s+"
-                         r"-not \(Test-Path \$Src\) -and \(\$UseUpstreamCache -or \$UpstreamRunId\)\) \{")
+        self.assertRegex(self.cache, r"^if \(\$StageIndex -eq 1 -and -not \$FromArtifact -and\s+"
+                         r"-not \(Test-Path \$Src\) -and \$RequireUpstreamCache\) \{")
+        self.assertNotIn("$ValidateOnly", self.cache)
         self.assertEqual(self.stage.count("fetch_upstream_cache.py"), 1)
         self.assertEqual(self.stage.count("--phase restore"), 1)
         self.assertLess(self.stage.index("\nFree-Disk\n"), self.stage.index(self.cache))
@@ -127,16 +134,32 @@ class WindowsUpstreamCacheRegressionTest(unittest.TestCase):
         self.assertLess(packaged, self.stage.index('\n  Verify-FinalBundle\n', packaged))
         self.assertNotRegex(self.cache, r'Set-Content|Set-Marker|Copy-Item|Move-Item|Expand-Archive')
 
-    def test_optional_miss_timeout_and_budget_keep_normal_path(self):
-        self.assertIn('if ($fetchRc -eq 124)', self.cache)
-        self.assertIn('continuing with normal source preparation', self.cache)
-        self.assertIn('upstream restore missed', self.cache)
-        self.assertIn('throw "upstream restore created source without a receipt"', self.cache)
+    def test_required_miss_timeout_and_budget_fail_before_preparation(self):
+        self.assertIn('throw "required upstream cache fetch timed out"', self.cache)
+        self.assertNotIn('continuing with normal source preparation', self.cache)
+        self.assertIn('restore receipt missing after restore', self.cache)
         self.assertIn('throw "upstream restore helper failed (exit $LASTEXITCODE)"', self.cache)
-        self.assertIn('if ((Get-RemainingMin) -lt ($PackReserveMin + 60))', self.cache)
-        self.assertIn('-ArgList $fetchCommandLine -Cwd $Repo -TimeoutSec 1200', self.cache)
-        self.assertIn('$Deadline = (Get-Date).AddMinutes(300)', self.stage)
-        self.assertIn('$PackReserveMin = 40', self.stage)
+        self.assertIn('throw "required upstream cache: insufficient stage budget for restore"', self.cache)
+        self.assertIn('$fetchTimeoutSec = [Math]::Min(3600, ((Get-RemainingMin) - $PackReserveMin - 30) * 60)', self.cache)
+        self.assertIn('if ($fetchTimeoutSec -lt 60)', self.cache)
+        self.assertIn('-ArgList $fetchCommandLine -Cwd $Repo -TimeoutSec $fetchTimeoutSec', self.cache)
+        self.assertIn('$StageMinutes = if ($ValidateOnly) { 140 } else { 300 }', self.stage)
+        self.assertIn('$PackReserveMin = if ($ValidateOnly) { 15 } else { 40 }', self.stage)
+
+    def test_workflow_requires_cache_in_validation_and_every_resume(self):
+        import yaml
+
+        workflow = yaml.safe_load(self.workflow)
+        required = "${{ (inputs.use_upstream_cache || inputs.upstream_run_id != '') && '1' || '0' }}"
+        self.assertEqual(workflow['env']['CHROMIX_USE_UPSTREAM_CACHE'], required)
+        for job in workflow['jobs'].values():
+            self.assertNotIn('CHROMIX_USE_UPSTREAM_CACHE', job.get('env', {}))
+            for step in job['steps']:
+                self.assertNotIn('CHROMIX_USE_UPSTREAM_CACHE', step.get('env', {}))
+        self.assertIn('$UseUpstreamCache -or $UpstreamRunId -or ($env:CHROMIX_USE_UPSTREAM_CACHE -eq "1")',
+                      self.stage)
+        self.assertLess(self.stage.index('($FromArtifact -or $StageIndex -ne 1 -or (Test-Path $Src))'),
+                        self.stage.index('$MigrateRestoredSource = $false'))
 
     def test_missing_bindgen_uses_normal_builder_with_known_endpoint_normalization(self):
         start = self.stage.index('if (-not (Test-Path "third_party\\rust-toolchain\\bin\\bindgen.exe"))')
@@ -192,6 +215,224 @@ if ($errors.Count) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1
             result = subprocess.run([shutil.which("pwsh"), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", parser],
                                     env={**os.environ, "PS_INPUT": code}, capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class WindowsStageBudgetTest(unittest.TestCase):
+    def setUp(self):
+        self.powershell = shutil.which("pwsh") or "/opt/pwsh/pwsh"
+        if not Path(self.powershell).is_file():
+            self.skipTest("pwsh is unavailable")
+        self.stage = STAGE.read_text()
+
+    def run_ps(self, code):
+        return subprocess.run([self.powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+                               '$ErrorActionPreference = "Stop"\n' + code],
+                              capture_output=True, text=True, timeout=20)
+
+    def test_actual_deadlines_and_reserves_fit_workflow_jobs(self):
+        import yaml
+
+        result = self.run_ps(r'''
+function Get-Date { return [datetime]"2026-09-09T00:00:00Z" }
+$rows = foreach ($ValidateOnly in @($true, $false)) {
+''' + stage_budget_source() + r'''
+  @{ validate = $ValidateOnly; minutes = ($Deadline - (Get-Date)).TotalMinutes; reserve = $PackReserveMin }
+}
+ConvertTo-Json -Compress -InputObject @($rows)
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = json.loads(result.stdout)
+        self.assertEqual(rows, [{"validate": True, "minutes": 140, "reserve": 15},
+                                {"validate": False, "minutes": 300, "reserve": 40}])
+        jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+        self.assertLessEqual(rows[0]["minutes"], jobs["validate"]["timeout-minutes"] - 10)
+        self.assertLess(rows[1]["minutes"], jobs["build-1"]["timeout-minutes"])
+
+    def test_remaining_minutes_floors_instead_of_rounding_up(self):
+        start = self.stage.index("function Get-RemainingMin {")
+        end = self.stage.index("function Test-LastStage", start)
+        result = self.run_ps(r'''
+function Get-Date { return [datetime]"2026-09-09T00:00:00Z" }
+''' + self.stage[start:end] + r'''
+$values = foreach ($seconds in @(119, 120, 59, -1)) {
+  $Deadline = (Get-Date).AddSeconds($seconds)
+  Get-RemainingMin
+}
+ConvertTo-Json -Compress -InputObject @($values)
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [1, 2, 0, -1])
+
+    def test_actual_fetch_formula_preserves_reserve_and_preparation_margin(self):
+        start = self.stage.index("  $fetchTimeoutSec =")
+        end = self.stage.index("  $fetchArgs =", start)
+        result = self.run_ps(r'''
+function Get-RemainingMin { return $left }
+$rows = foreach ($ValidateOnly in @($true, $false)) {
+''' + stage_budget_source() + r'''
+  foreach ($left in @(140, 130, 100, 75, 71, 70, 46, 45, 0)) {
+    try {
+''' + self.stage[start:end] + r'''
+      @{ validate = $ValidateOnly; left = $left; reserve = $PackReserveMin; seconds = $fetchTimeoutSec }
+    } catch {
+      @{ validate = $ValidateOnly; left = $left; reserve = $PackReserveMin; error = $_.Exception.Message }
+    }
+  }
+}
+ConvertTo-Json -Compress -InputObject @($rows)
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for row in json.loads(result.stdout):
+            expected = min(3600, (row["left"] - row["reserve"] - 30) * 60)
+            if expected < 60:
+                self.assertIn("insufficient stage budget", row["error"])
+            else:
+                self.assertEqual(row["seconds"], expected)
+                self.assertLessEqual(row["seconds"] / 60 + row["reserve"] + 30, row["left"])
+
+    def test_actual_torque_call_is_bounded_and_insufficient_time_fails(self):
+        start = self.stage.rindex("\nif ($ValidateOnly) {")
+        end = self.stage.index("\n$ninjaBudget =", start)
+        for left, rc in ((15, 0), (14, 0), (0, 0), (16, 0), (35, 0), (139, 0), (35, 124)):
+            with self.subTest(left=left, rc=rc):
+                result = self.run_ps(f'$left = {left}\n$rc = {rc}\n' + r'''
+$ValidateOnly = $true
+$Src = "/fixture/src"
+$OutDir = "/fixture/src/out/Default"
+function Get-RemainingMin { return $left }
+function Invoke-Tracked {
+  param($File, $ArgList, $Cwd, $TimeoutSec, [switch]$FullFailureOutput)
+  Write-Host "timeout:$TimeoutSec"
+  return $rc
+}
+function Write-OutVar($key, $value) { Write-Host "$key=$value" }
+''' + stage_budget_source() + self.stage[start:end])
+                if left <= 15:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("insufficient V8 Torque budget", result.stderr)
+                    self.assertNotIn("timeout:", result.stdout)
+                else:
+                    self.assertIn(f"timeout:{(left - 15) * 60}", result.stdout)
+                    self.assertEqual(result.returncode == 0, rc == 0, result.stderr)
+                self.assertEqual("finished=true" in result.stdout, left > 15 and rc == 0)
+
+
+class WindowsRequiredCacheTest(unittest.TestCase):
+    def setUp(self):
+        from tools.tests.test_posix_ci_stage import FullCacheFixture
+
+        self.fixture = FullCacheFixture()
+        self.fixture.addCleanup = self.addCleanup
+        self.fixture.setUp()
+        self.powershell = shutil.which("pwsh") or "/opt/pwsh/pwsh"
+        if not Path(self.powershell).is_file():
+            self.skipTest("pwsh is unavailable")
+        stage = STAGE.read_text()
+        policy = next(line for line in stage.splitlines() if line.startswith("$RequireUpstreamCache ="))
+        start = stage.index('$domainProgress = Join-Path $Src')
+        end = stage.index('\nif (-not (Test-Path (Join-Path $Src ".chromix-source-ready"))', start)
+        self.script = self.fixture.root / "stage.ps1"
+        self.script.write_text(r'''
+$ErrorActionPreference = "Stop"
+$Repo = $env:TEST_REPO
+$WorkDir = $env:TEST_WORK
+$Src = Join-Path $WorkDir "src"
+$OutDir = Join-Path $Src "out/Chromix"
+$UpstreamCacheDir = $env:TEST_CACHE
+$Revisions = Import-PowerShellDataFile (Join-Path $Repo "build/ungoogled-revisions.psd1")
+$RestoredUpstream = $false
+$StageIndex = [int]$env:TEST_STAGE
+$FromArtifact = $env:TEST_RESUME -eq "1"
+$UseUpstreamCache = $env:TEST_SWITCH -eq "1"
+$UpstreamRunId = $env:TEST_RUN_ID
+$ValidateOnly = $env:TEST_VALIDATE -eq "1"
+function Get-RemainingMin { return [int]$env:TEST_MINUTES }
+function Invoke-Tracked {
+  param($File, $ArgList, $Cwd, $TimeoutSec)
+  Add-Content $env:CALL_LOG "fetch"
+  if ($TimeoutSec -gt 3600 -or $TimeoutSec -lt 60 -or
+      $TimeoutSec -gt ((Get-RemainingMin) - $PackReserveMin - 30) * 60) { throw "unbounded fetch" }
+  return [int]$env:FETCH_RC
+}
+function python {
+  Add-Content $env:CALL_LOG $args[2]
+  & $env:TEST_PYTHON @args
+  $global:LASTEXITCODE = $LASTEXITCODE
+}
+''' + stage_budget_source() + policy + "\n" + stage[start:end] + r'''
+Add-Content $env:CALL_LOG "prepare"
+Add-Content $env:CALL_LOG ("ninja:" + $OutDir.Replace('\', '/'))
+''')
+
+    def run_stage(self, *, enabled=True, validate=False, resume=False, stage=1,
+                  minutes=300, fetch_rc=0, switch=False, run_id=""):
+        fixture = self.fixture
+        env = {**fixture.env, "TEST_REPO": str(REPO), "TEST_WORK": str(fixture.work),
+               "TEST_CACHE": str(fixture.cache), "TEST_PYTHON": sys.executable,
+               "TEST_STAGE": str(stage), "TEST_RESUME": str(int(resume)),
+               "TEST_SWITCH": str(int(switch)), "TEST_RUN_ID": run_id,
+               "TEST_VALIDATE": str(int(validate)), "TEST_MINUTES": str(minutes),
+               "FETCH_RC": str(fetch_rc), "CHROMIX_USE_UPSTREAM_CACHE": str(int(enabled))}
+        return subprocess.run([self.powershell, "-NoLogo", "-NoProfile", "-NonInteractive",
+                               "-File", str(self.script)], env=env, capture_output=True, text=True, timeout=20)
+
+    def test_required_miss_disk_shortage_and_timeout_fail_in_validation_too(self):
+        for validate in (False, True):
+            for reason in ("unavailable", "insufficient_disk_space", "cache_timeout"):
+                with self.subTest(validate=validate, reason=reason):
+                    self.fixture.seed("windows", "x64", reason=reason)
+                    result = self.run_stage(validate=validate)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("restore receipt missing", result.stderr)
+                    self.assertEqual(json.loads((self.fixture.cache / "result.json").read_text())["reason"], reason)
+                    self.assertEqual(self.fixture.called(), ["fetch", "restore"])
+                    self.fixture.calls.unlink()
+
+    def test_required_budget_and_fetch_errors_do_not_reach_prepare(self):
+        for minutes, rc, calls in ((45, 0, []), (140, 124, ["fetch"]), (140, 7, ["fetch"])):
+            with self.subTest(minutes=minutes, rc=rc):
+                result = self.run_stage(minutes=minutes, fetch_rc=rc, validate=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.fixture.called(), calls)
+                if self.fixture.calls.exists():
+                    self.fixture.calls.unlink()
+
+    def test_validate_hit_and_low_budget_resume_verify_and_keep_default_out(self):
+        self.fixture.seed("windows", "x64")
+        result = self.run_stage(validate=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        expected = ["prepare", f"ninja:{self.fixture.work}/src/out/Default"]
+        self.assertEqual(self.fixture.called(), ["fetch", "restore", "verify"] + expected)
+        self.fixture.calls.unlink()
+        result = self.run_stage(stage=2, resume=True, minutes=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.fixture.called(), ["verify"] + expected)
+        self.assertEqual((self.fixture.work / "src/out/Default/obj/retained.o").read_bytes(), b"tiny cached object")
+
+    def test_cold_and_forged_resume_receipts_fail_before_migration(self):
+        src = self.fixture.work / "src"
+        self.fixture.put(src / ".chromix-source-ready", "old-version|ready")
+        for receipt in (None, "{}"):
+            with self.subTest(receipt=receipt):
+                if receipt is not None:
+                    self.fixture.put(src / ".chromix-upstream-restored.json", receipt)
+                result = self.run_stage(stage=2, resume=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.fixture.called(), [] if receipt is None else ["verify"])
+                self.assertTrue((src / ".chromix-source-ready").is_file())
+
+    def test_fresh_no_cache_is_normal_but_switch_or_run_id_requires_it(self):
+        result = self.run_stage(enabled=False, validate=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.fixture.called(), ["prepare", f"ninja:{self.fixture.work}/src/out/Chromix"])
+        self.fixture.calls.unlink()
+        for option in ({"switch": True}, {"run_id": "123"}):
+            with self.subTest(option=option):
+                self.fixture.seed("windows", "x64", reason="unavailable")
+                result = self.run_stage(enabled=False, **option)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.fixture.called(), ["fetch", "restore"])
+                self.fixture.calls.unlink()
 
 
 class WindowsRestoredPreparationFixture:
@@ -611,7 +852,8 @@ class WindowsRestoreStageMockTest(unittest.TestCase):
         self.calls = self.root / "calls"
         self.env = {**os.environ, "MOCK_ROOT": str(self.root), "MOCK_CALLS": str(self.calls),
                     "MOCK_STAGE": "1", "MOCK_USE": "1", "MOCK_ARTIFACT": "0", "MOCK_VALIDATE": "0",
-                    "MOCK_FETCH_RC": "0", "MOCK_RESTORE": "hit", "MOCK_MINUTES": "250"}
+                    "MOCK_FETCH_RC": "0", "MOCK_RESTORE": "hit", "MOCK_MINUTES": "250",
+                    "MOCK_PREPARE_EXHAUSTED": "0", "CHROMIX_USE_UPSTREAM_CACHE": "0"}
         stage = STAGE.read_text()
         start = stage.index('$domainProgress = Join-Path $Src')
         end = stage.index('\n$UngoogledTooling =', start)
@@ -629,8 +871,6 @@ $FromArtifact = $env:MOCK_ARTIFACT -eq "1"
 $UseUpstreamCache = $env:MOCK_USE -eq "1"
 $UpstreamRunId = ""
 $UpstreamCacheDir = Join-Path $Repo "cache"
-$Deadline = (Get-Date).AddMinutes(250)
-$PackReserveMin = 40
 $Revisions = @{ ChromiumVersion = "fixture"; UngoogledCommit = "core" }
 function Get-RemainingMin { return [int]$env:MOCK_MINUTES }
 function Save-Handoff { param($Mode); Add-Content -LiteralPath $env:MOCK_CALLS -Value "handoff:$Mode" }
@@ -658,12 +898,16 @@ function python {
   } else { throw "unexpected Python invocation" }
   $global:LASTEXITCODE = 0
 }
-''' + stage[start:end] + r'''
+''' + stage_budget_source() + next(line for line in stage.splitlines() if line.startswith('$RequireUpstreamCache =')) + '\n' + stage[start:end] + r'''
 Set-Content -LiteralPath (Join-Path $Repo "out-dir") -Value $OutDir
 ''', encoding="utf-8")
         (self.root / "prepare-ungoogled.ps1").write_text(r'''
 param($Root, $Repo, $DeadlineEpoch, $ReserveMinutes)
 Add-Content -LiteralPath $env:MOCK_CALLS -Value "prepare"
+if ($ReserveMinutes -ne $PackReserveMin -or $DeadlineEpoch -ne [DateTimeOffset]::new($Deadline).ToUnixTimeSeconds()) {
+  throw "preparation did not receive the stage budget"
+}
+if ($env:MOCK_PREPARE_EXHAUSTED -eq "1") { throw "PREPARE_BUDGET_EXHAUSTED: fixture" }
 $Src = Join-Path $Root "src"
 New-Item -ItemType Directory -Force -Path $Src | Out-Null
 if (Test-Path (Join-Path $Src ".chromix-upstream-restored.json")) {
@@ -691,7 +935,7 @@ Add-Content -LiteralPath $env:MOCK_CALLS -Value "migrate"
     def test_fresh_hit_then_stage_two_uses_default_and_revalidates_without_fetch(self):
         first = self.run_stage()
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        self.assertEqual(self.logged(), ["fetch", "restore", "prepare", "verify"])
+        self.assertEqual(self.logged(), ["fetch", "restore", "verify", "prepare", "verify"])
         self.assertTrue((self.root / "out-dir").read_text().strip().replace('\\', '/').endswith('/src/out/Default'))
         self.assertFalse((self.work / "upstream-cache-preparation.json").exists())
         self.calls.unlink()
@@ -700,21 +944,21 @@ Add-Content -LiteralPath $env:MOCK_CALLS -Value "migrate"
         self.assertEqual(self.logged(), ["verify", "prepare", "verify"])
         self.assertTrue((self.root / "out-dir").read_text().strip().replace('\\', '/').endswith('/src/out/Default'))
 
-    def test_miss_and_timeout_use_normal_source_and_chromix_out(self):
+    def test_miss_and_timeout_fail_without_preparation_or_chromix_out(self):
         missed = self.run_stage(MOCK_RESTORE="miss")
-        self.assertEqual(missed.returncode, 0, missed.stdout + missed.stderr)
-        self.assertEqual(self.logged(), ["fetch", "restore", "prepare"])
-        self.assertTrue((self.root / "out-dir").read_text().strip().replace('\\', '/').endswith('/src/out/Chromix'))
-        shutil.rmtree(self.src)
+        self.assertNotEqual(missed.returncode, 0)
+        self.assertEqual(self.logged(), ["fetch", "restore"])
+        self.assertFalse(self.src.exists())
+        self.assertFalse((self.root / "out-dir").exists())
         self.calls.unlink()
         timed = self.run_stage(MOCK_FETCH_RC="124")
-        self.assertEqual(timed.returncode, 0, timed.stdout + timed.stderr)
-        self.assertEqual(self.logged(), ["fetch", "prepare"])
+        self.assertNotEqual(timed.returncode, 0)
+        self.assertEqual(self.logged(), ["fetch"])
 
-    def test_validate_no_opt_in_and_existing_source_never_fetch(self):
-        for values in ({"MOCK_VALIDATE": "1"}, {"MOCK_USE": "0"}, {}):
+    def test_no_opt_in_allows_validation_and_existing_cold_source(self):
+        for values in ({"MOCK_VALIDATE": "1"}, {}):
             with self.subTest(values=values):
-                result = self.run_stage(**values)
+                result = self.run_stage(MOCK_USE="0", **values)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.logged(), ["prepare"])
                 self.calls.unlink()
@@ -729,14 +973,31 @@ Add-Content -LiteralPath $env:MOCK_CALLS -Value "migrate"
         self.assertNotEqual(failed.returncode, 0)
         self.assertEqual(self.logged(), ["verify"])
 
+    def test_validation_preparation_requires_margin_and_never_hands_off(self):
+        for minutes, exhausted, calls, succeeds in ((44, "0", [], False), (45, "0", ["prepare"], True),
+                                                   (60, "1", ["prepare"], False)):
+            with self.subTest(minutes=minutes, exhausted=exhausted):
+                result = self.run_stage(MOCK_VALIDATE="1", MOCK_USE="0", MOCK_MINUTES=str(minutes),
+                                        MOCK_PREPARE_EXHAUSTED=exhausted)
+                self.assertEqual(result.returncode == 0, succeeds, result.stdout + result.stderr)
+                self.assertEqual(self.logged(), calls)
+                if self.calls.exists():
+                    self.calls.unlink()
+
     def test_stage_budget_and_ready_mismatch_cannot_bypass_preparation_checks(self):
         low = self.run_stage(MOCK_MINUTES="60")
+        self.assertNotEqual(low.returncode, 0)
+        self.assertEqual(self.logged(), [])
+        low = self.run_stage(MOCK_MINUTES="60", MOCK_USE="0")
         self.assertEqual(low.returncode, 0, low.stdout + low.stderr)
         self.assertEqual(self.logged(), ["handoff:Unsynced"])
         self.calls.unlink()
         self.src.mkdir()
         (self.src / ".chromix-source-ready").write_text("fixture|wrong-pins")
         failed = self.run_stage(MOCK_STAGE="2", MOCK_ARTIFACT="1")
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual(self.logged(), [])
+        failed = self.run_stage(MOCK_STAGE="2", MOCK_ARTIFACT="1", MOCK_USE="0")
         self.assertNotEqual(failed.returncode, 0)
         self.assertEqual(self.logged(), ["prepare"])
 

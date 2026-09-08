@@ -1,4 +1,6 @@
 import errno
+import hashlib
+import io
 import json
 import os
 import shlex
@@ -7,14 +9,39 @@ import stat
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
 from tools import fetch_upstream_cache as fetcher
 from tools import restore_upstream_cache as restore
+
+
+def archive_bytes(entries, zipped=False):
+    output = io.BytesIO()
+    if zipped:
+        with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for name, kind, data in entries:
+                info = zipfile.ZipInfo(name)
+                info.create_system = 3
+                info.external_attr = ((stat.S_IFLNK | 0o777) if kind == "sym"
+                                      else (stat.S_IFREG | 0o644)) << 16
+                archive.writestr(info, data)
+    else:
+        with tarfile.open(fileobj=output, mode="w") as archive:
+            for name, kind, data in entries:
+                info = tarfile.TarInfo(name)
+                info.mode = 0o777 if kind == "sym" else 0o644
+                if kind == "sym":
+                    info.type, info.linkname = tarfile.SYMTYPE, data
+                else:
+                    info.size = len(data)
+                archive.addfile(info, io.BytesIO(data) if kind == "file" else None)
+    return output.getvalue()
 
 
 class RestoreUpstreamCacheTest(unittest.TestCase):
@@ -67,6 +94,44 @@ class RestoreUpstreamCacheTest(unittest.TestCase):
         self.write(self.cache / "result.json", json.dumps(result))
         self.result = result
 
+    def fetch_cache(self, platform="linux", arch="x64", source=None, extra=()):
+        if platform != "windows" and not shutil.which("zstd"):
+            self.skipTest("host zstd is unavailable")
+        self.make_cache(platform, arch)
+        source = source or self.donor.relative_to(self.cache / "tree").as_posix()
+        entries = [(f"{source}/{path.relative_to(self.donor).as_posix()}", "file", path.read_bytes())
+                   for path in sorted(self.donor.rglob("*")) if path.is_file()]
+        entries += list(extra)
+        inner = archive_bytes(entries, zipped=platform == "windows")
+        if platform != "windows":
+            inner = subprocess.check_output([shutil.which("zstd"), "-q", "-c"], input=inner)
+        manifest_path = self.repo / "build/upstream-cache.json"
+        manifest = json.loads(manifest_path.read_text())
+        artifact = manifest["sources"][platform]["artifacts"][arch]
+        outer = archive_bytes([(artifact["inner_archive"], "file", inner)], zipped=True)
+        artifact.update(digest="sha256:" + hashlib.sha256(outer).hexdigest(), size_in_bytes=len(outer))
+        self.write(manifest_path, json.dumps(manifest))
+        pin, _ = fetcher.load_manifest(platform, arch, root=self.repo)
+        repository = {"full_name": pin["repository"], "id": pin["repository_id"], "private": False}
+        run = {key: pin[key] for key in ("head_sha", "head_branch", "event")}
+        run.update(id=pin["run_id"], path=pin["workflow_path"], status="completed", conclusion="success",
+                   repository=repository, head_repository=repository)
+        metadata = dict(artifact, expired=False, expires_at="2099-01-01T00:00:00Z", workflow_run={
+            "id": pin["run_id"], "head_sha": pin["head_sha"], "head_branch": pin["head_branch"],
+            "repository_id": pin["repository_id"], "head_repository_id": pin["repository_id"]})
+        client = fetcher.GitHub("fixture-token")
+        client.open = mock.Mock(side_effect=[io.BytesIO(json.dumps(run).encode()),
+                                            io.BytesIO(json.dumps(metadata).encode()), io.BytesIO(outer)])
+        shutil.rmtree(self.cache)
+        with mock.patch.object(fetcher, "require_space"), \
+                mock.patch("sys.stderr", new=io.StringIO()), \
+                mock.patch.object(client.opener, "open", side_effect=AssertionError("no network")):
+            self.result = fetcher.fetch(platform, arch, self.cache, root=self.repo, client=client)
+        self.assertEqual(client.open.call_count, 3)
+        self.assertEqual(json.loads((self.cache / "result.json").read_text()), self.result)
+        self.donor = self.cache / "tree" / source
+        return self.result
+
     def invoke(self, phase="restore", cache=True):
         return restore.run_restore(phase, self.platform, self.arch, self.work,
                                    self.cache if cache else None, repo=self.repo)
@@ -95,6 +160,121 @@ class RestoreUpstreamCacheTest(unittest.TestCase):
                 self.work = Path(self.tmp.name) / f"work-{platform}-{arch}"
                 self.assertEqual(self.invoke()["status"], "hit")
 
+    def test_fetch_then_restore_all_five_targets_with_archive_relative_omissions(self):
+        linux_links = ["buildtools/linux64-format/clang-format",
+                       "third_party/dawn/tools/golang/linux-amd64/bin/go",
+                       "third_party/node/linux/node-linux-x64/bin/node",
+                       "third_party/gperf/cipd/bin/gperf"]
+        for platform, arch, source in (("linux", "x64", "build/src"), ("linux", "arm64", "build/src"),
+                                       ("macos", "x64", "src"), ("macos", "arm64", "src"),
+                                       ("windows", "x64", "src"), ("windows", "x64", "build/src")):
+            with self.subTest(platform=platform, arch=arch, source=source):
+                if platform == "linux":
+                    relative = linux_links
+                elif platform == "macos":
+                    cpu = "amd64" if arch == "x64" else "arm64"
+                    relative = [f"third_party/dawn/tools/golang/mac-{cpu}/bin/go",
+                                "out/Default/sdk/xcode_links/MacOSX26.0.sdk",
+                                "out/Default/sdk/xcode_links/MacOSX.platform",
+                                "out/Default/sdk/xcode_links/XcodeDefault.xctoolchain"]
+                else:
+                    relative = ["third_party/gperf/cipd/bin/gperf"]
+                archive_paths = [f"{source}/{name}" for name in relative]
+                extra = [(name, "sym", "/unavailable-host/tool") for name in archive_paths]
+                result = self.fetch_cache(platform, arch, source, extra)
+                self.assertEqual(result["status"], "hit", result)
+                self.assertEqual(result["source"], str(self.donor))
+                self.assertEqual(result["external_symlink_paths"], archive_paths)
+                self.assertEqual(result["skipped_external_symlinks"], len(archive_paths))
+                self.work = Path(self.tmp.name) / f"work-{platform}-{arch}-{source.replace('/', '-')}"
+                entry = self.invoke()
+                self.assertEqual(entry["status"], "hit", entry)
+                receipt = entry["receipt"]
+                self.assertEqual(receipt["external_symlink_paths"], sorted(relative))
+                self.assertEqual(receipt["archive_external_symlink_paths"], archive_paths)
+                for name in relative:
+                    path = self.work / "src" / name
+                    self.assertFalse(path.exists() or restore.linked(path), name)
+                self.assertEqual((self.work / "src/chrome/source.cc").read_bytes(), b"upstream\n")
+                self.assertEqual((self.work / "src/out/Default/obj/output.o").read_bytes(), b"object")
+                self.assertFalse(self.donor.exists())
+                self.assertEqual(self.invoke("verify", cache=False)["receipt"], receipt)
+                self.assertEqual(json.loads((self.cache / "result.json").read_text())["status"], "consumed")
+
+    def test_fetch_then_restore_rejects_unknown_and_outside_donor_omissions(self):
+        known = "third_party/gperf/cipd/bin/gperf"
+        for platform, source in (("linux", "build/src"), ("macos", "src"), ("windows", "src")):
+            names = [f"{source}/unknown/tool"]
+            if platform == "windows":
+                names.append("build/src/" + known)
+            if platform != "macos":
+                names.append(f"{source}/third_party/dawn/tools/golang/mac-arm64/bin/go")
+            for name in names:
+                with self.subTest(platform=platform, name=name):
+                    outside = Path(self.tmp.name) / "outside/keep"
+                    self.write(outside, "unowned")
+                    result = self.fetch_cache(platform, source=source, extra=[(name, "sym", str(outside))])
+                    self.assertEqual(result["status"], "hit", result)
+                    self.assertEqual(result["external_symlink_paths"], [name])
+                    entry = self.invoke()
+                    self.assertEqual(entry["status"], "miss", entry)
+                    self.assertIn("unknown external symlink", entry["reasons"][0])
+                    self.assertEqual(entry["cleanup"]["status"], "removed", entry)
+                    self.assertFalse((self.cache / "tree").exists())
+                    self.assertFalse((self.work / "src").exists())
+                    self.assertEqual(outside.read_text(), "unowned")
+
+    def test_fetch_then_restore_rejects_corrupt_omission_receipts(self):
+        name = "src/third_party/gperf/cipd/bin/gperf"
+        cases = [(1, []), (0, [name]), (2, [name, name]), (True, [name]), (-1, []),
+                 ("1", [name]), (1, None), (1, name), (1, [42]), (1, [""]),
+                 (1, ["../" + name]), (1, ["/" + name]), (1, ["C:/" + name]),
+                 (1, [name.replace("/", "\\")]), (1, ["./" + name]), (1, ["tree/" + name]),
+                 (1, [name.replace("src/", "src/../src/")]),
+                 (1, [name.replace("src/", "src//")]), (1, [name + "/"]),
+                 (1, ["src-backup/" + name[4:]]), (1, ["foreign/" + name]),
+                 (1, ["build/download_cache/" + name[4:]]), (1, ["build/" + name])]
+        for count, paths in cases:
+            with self.subTest(count=count, paths=paths):
+                result = self.fetch_cache("windows", extra=[(name, "sym", "/unavailable-host/gperf")])
+                self.assertEqual(result["status"], "hit", result)
+                self.result.update(skipped_external_symlinks=count, external_symlink_paths=paths)
+                self.write(self.cache / "result.json", json.dumps(self.result))
+                entry = self.invoke()
+                self.assertEqual(entry["status"], "miss", entry)
+                self.assertEqual(entry["cleanup"]["status"], "removed", entry)
+                self.assertFalse((self.cache / "tree").exists())
+                self.assertFalse((self.work / "src").exists())
+
+    def test_fetch_then_restore_rejects_existing_omissions_and_linked_parents(self):
+        relative = "third_party/gperf/cipd/bin/gperf"
+        name = "src/" + relative
+        for kind in ("file", "directory", "symlink", "dangling_symlink", "internal_parent", "external_parent"):
+            with self.subTest(kind=kind):
+                outside = Path(self.tmp.name) / "outside/keep"
+                self.write(outside, "unowned")
+                result = self.fetch_cache("windows", extra=[(name, "sym", str(outside))])
+                self.assertEqual(result["status"], "hit", result)
+                path = self.donor / relative
+                path.parent.mkdir(parents=True)
+                if kind == "file":
+                    path.write_text("not omitted")
+                elif kind == "directory":
+                    path.mkdir()
+                elif kind in ("symlink", "dangling_symlink"):
+                    path.symlink_to(outside if kind == "symlink" else outside.with_name("missing"))
+                else:
+                    path.parent.rmdir()
+                    target = self.donor / "chrome" if kind == "internal_parent" else outside.parent
+                    path.parent.symlink_to(target, target_is_directory=True)
+                entry = self.invoke()
+                self.assertEqual(entry["status"], "miss", entry)
+                self.assertRegex(entry["reasons"][0], "unexpectedly exists|symlinked directory or input")
+                self.assertEqual(entry["cleanup"]["status"], "removed", entry)
+                self.assertFalse((self.cache / "tree").exists())
+                self.assertFalse((self.work / "src").exists())
+                self.assertEqual(outside.read_text(), "unowned")
+
     def test_missing_cache_is_normal_miss_and_does_not_create_source(self):
         shutil.rmtree(self.cache)
         entry = self.invoke()
@@ -117,7 +297,7 @@ class RestoreUpstreamCacheTest(unittest.TestCase):
         self.assertFalse(self.donor.exists())
         self.make_cache()
         self.result["skipped_external_symlinks"] = 1
-        self.result["external_symlink_paths"] = ["tree/build/src/unknown/tool"]
+        self.result["external_symlink_paths"] = ["build/src/unknown/tool"]
         self.write(self.cache / "result.json", json.dumps(self.result))
         self.assertEqual(self.invoke()["status"], "miss")
         self.assertFalse(self.donor.exists())
@@ -135,7 +315,7 @@ class RestoreUpstreamCacheTest(unittest.TestCase):
             "out/Default/sdk/xcode_links/MacOSX.platform",
             "out/Default/sdk/xcode_links/XcodeDefault.xctoolchain",
         ]
-        archive_paths = [f"tree/src/{name}" for name in relative]
+        archive_paths = [f"src/{name}" for name in relative]
         self.result.update(skipped_external_symlinks=len(archive_paths),
                            external_symlink_paths=archive_paths)
         self.write(self.cache / "result.json", json.dumps(self.result))
@@ -162,7 +342,7 @@ class RestoreUpstreamCacheTest(unittest.TestCase):
                      "out/Default/sdk/xcode_links/XcodeDefault.xctoolchain/bin/clang"):
             with self.subTest(name=name):
                 self.make_cache("macos", "x64")
-                archive_name = "tree/src/" + name
+                archive_name = "src/" + name
                 self.result.update(skipped_external_symlinks=1,
                                    external_symlink_paths=[archive_name])
                 self.write(self.cache / "result.json", json.dumps(self.result))
@@ -170,7 +350,7 @@ class RestoreUpstreamCacheTest(unittest.TestCase):
                 self.assertFalse(self.donor.exists())
 
     def test_non_macos_cannot_use_macos_external_omissions(self):
-        name = "tree/build/src/third_party/dawn/tools/golang/mac-arm64/bin/go"
+        name = "build/src/third_party/dawn/tools/golang/mac-arm64/bin/go"
         self.result.update(skipped_external_symlinks=1, external_symlink_paths=[name])
         self.write(self.cache / "result.json", json.dumps(self.result))
         self.assertEqual(self.invoke()["status"], "miss")
@@ -314,7 +494,7 @@ class RestoreUpstreamCacheTest(unittest.TestCase):
             self.assertEqual(self.invoke()["status"], "miss")
 
     def test_known_host_links_are_recorded_without_recreating_them(self):
-        paths = ["tree/build/src/" + name for name in sorted(restore.HOST_LINKS)]
+        paths = ["build/src/" + name for name in sorted(restore.HOST_LINKS)]
         self.result.update(skipped_external_symlinks=len(paths), external_symlink_paths=paths)
         self.write(self.cache / "result.json", json.dumps(self.result))
         entry = self.invoke()
@@ -327,12 +507,14 @@ class RestoreUpstreamCacheTest(unittest.TestCase):
             cache = Path(temporary)
             donor = cache / "tree/build/src"
             donor.mkdir(parents=True)
-            restore.importer.preserve_external_tool_lookups(cache, donor, self.result)
+            # The legacy importer uses cache-relative names.
+            importer_result = dict(self.result, external_symlink_paths=["tree/" + name for name in paths])
+            restore.importer.preserve_external_tool_lookups(cache, donor, importer_result)
             created = {path.relative_to(donor).as_posix() for path in donor.rglob("*") if path.is_file()}
             self.assertEqual(created, restore.HOST_LINKS)
 
     def test_incomplete_duplicate_or_traversing_omission_lists_miss(self):
-        name = "tree/build/src/" + sorted(restore.HOST_LINKS)[0]
+        name = "build/src/" + sorted(restore.HOST_LINKS)[0]
         for count, paths in ((1, []), (0, [name]), (2, [name, name]), (True, [name]),
                              (1, ["../escape"]), (1, ["/absolute"]), (1, [42])):
             with self.subTest(count=count, paths=paths):

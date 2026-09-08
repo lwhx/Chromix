@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       use_upstream_cache:
-        description: 'Restore pinned upstream build trees, apply Chromix patches, and resume compilation'
+        description: 'Require pinned full upstream source + out/Default reuse; fail on cache miss (false permits cold builds)'
         type: boolean
         default: true
   push:

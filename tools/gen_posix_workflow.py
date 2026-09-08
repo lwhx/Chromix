@@ -116,6 +116,12 @@ MAC_STEPS = """      - name: Select compatible Xcode
         if: runner.os == 'macOS'
         run: bash build/macos/select-xcode.sh
 
+      - name: Free macOS disk space
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          python3 build/macos/free-disk-space.py 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/disk-cleanup.log"
+
       - name: Inspect macOS toolchain
         if: runner.os == 'macOS'
         run: |
@@ -191,7 +197,7 @@ def run_step(stage: int) -> str:
     ).replace("__STAGE__", str(stage)).replace("__RESTORE_ARGS__", restore_args)
 
 DOWNLOAD_STEP = """      - name: Download tree from previous stage
-        if: always()
+        if: success()
         uses: actions/download-artifact@v4
         with:
           pattern: ${{ inputs.artifact }}-tree-s%(prev)d-attempt-*-part*
@@ -310,12 +316,12 @@ def job(stage: int) -> str:
           { uname -a; df -h; } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/runner.log"
 
 """)
-    if stage > 1:
-        parts.append(DOWNLOAD_STEP % {"prev": stage - 1})
-        parts.append("\n")
     parts.append(LINUX_CLEAN)
     parts.append(MAC_STEPS)
     parts.append(NODE_PY)
+    if stage > 1:
+        parts.append(DOWNLOAD_STEP % {"prev": stage - 1})
+        parts.append("\n")
     parts.append(CACHE_RESTORE)
     parts.append(run_step(stage))
     parts.append(SNAPSHOT_ENSURE % {"stage": stage})

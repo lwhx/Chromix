@@ -173,7 +173,8 @@ def missing_host_links(cache: Path, donor: Path, result: dict, platform: str) ->
     for name in omitted:
         if not isinstance(name, str) or fetcher.safe_name(name) != name:
             raise Miss("incomplete donor source: invalid omitted link path")
-        path = safe_path(cache, Path(name))
+        # Fetcher records archive-relative names, extracted beneath cache/tree.
+        path = safe_path(cache, Path("tree") / name)
         if not importer.contained(path, donor) or not is_known_external_link(path.relative_to(donor).as_posix(), platform):
             raise Miss("incomplete donor source: unknown external symlink")
         if path.exists() or linked(path):

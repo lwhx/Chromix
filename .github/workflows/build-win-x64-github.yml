@@ -62,7 +62,7 @@ on:
         default: ''
         type: string
       use_upstream_cache:
-        description: 'Use the pinned shared upstream cache when available'
+        description: 'Require pinned full upstream source + out/Default reuse; false permits cold builds'
         required: false
         default: true
         type: boolean
@@ -82,6 +82,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  CHROMIX_USE_UPSTREAM_CACHE: ${{ (inputs.use_upstream_cache || inputs.upstream_run_id != '') && '1' || '0' }}
   DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
   DEPOT_TOOLS_METRICS: '0'
   DEPOT_TOOLS_COLLECT_METRICS: '0'
@@ -97,7 +98,21 @@ jobs:
       - name: Run validation
         id: stage
         shell: powershell
-        run: build\windows\ci-stage.ps1 -StageIndex 1 -MaxStages 12 -ValidateOnly
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_TOKEN || github.token }}
+          UPSTREAM_RUN_ID: ${{ inputs.upstream_run_id }}
+        run: build\windows\ci-stage.ps1 -StageIndex 1 -MaxStages 12 -ValidateOnly -UpstreamRunId $env:UPSTREAM_RUN_ID
+      - name: Upload upstream cache diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-cache-win-x64-validate-attempt-${{ github.run_attempt }}
+          path: |
+            C:\u\result.json
+            C:\c\chromix\upstream-cache-restore.json
+            C:\c\chromix\src\.chromix-upstream-restored.json
+          if-no-files-found: ignore
+          retention-days: 3
   build-1:
     name: stage 1 (fetch + sync + first compile)
     needs: validate

@@ -23,10 +23,14 @@ $WorkDir = "$Root\chromix"
 $Src = "$WorkDir\src"
 $OutDir = "$Src\out\Chromix"
 $RestoredUpstream = $false
+# CI opt-in requires a full restore, including validation and artifact resumes.
+$RequireUpstreamCache = $UseUpstreamCache -or $UpstreamRunId -or ($env:CHROMIX_USE_UPSTREAM_CACHE -eq "1")
 $PartsDir = "C:\parts"
 $UpstreamCacheDir = "C:\u"
-$Deadline = (Get-Date).AddMinutes(300)
-$PackReserveMin = 40
+# Validation runs in a 150-minute job and does not upload a build-tree snapshot.
+$StageMinutes = if ($ValidateOnly) { 140 } else { 300 }
+$Deadline = (Get-Date).AddMinutes($StageMinutes)
+$PackReserveMin = if ($ValidateOnly) { 15 } else { 40 }
 
 function Write-OutVar($key, $value) {
   if ($env:GITHUB_OUTPUT) { Add-Content -Path $env:GITHUB_OUTPUT -Value "$key=$value" }
@@ -34,7 +38,7 @@ function Write-OutVar($key, $value) {
 }
 
 function Get-RemainingMin {
-  return [int]((New-TimeSpan -Start (Get-Date) -End $Deadline).TotalMinutes)
+  return [int][Math]::Floor((New-TimeSpan -Start (Get-Date) -End $Deadline).TotalMinutes)
 }
 
 function Test-LastStage { return $StageIndex -ge $MaxStages }
@@ -345,6 +349,10 @@ if (Test-Path $restoreReceipt) {
 if (Test-Path $domainProgress) {
   throw "domain substitution was interrupted; use a clean work directory"
 }
+if ($RequireUpstreamCache -and -not $RestoredUpstream -and
+    ($FromArtifact -or $StageIndex -ne 1 -or (Test-Path $Src))) {
+  throw "required upstream cache: restore receipt missing; refusing cold preparation or compilation"
+}
 
 $MigrateRestoredSource = $false
 if ($FromArtifact -and -not $RestoredUpstream) {
@@ -366,45 +374,44 @@ if ($FromArtifact -and -not $RestoredUpstream) {
   }
 }
 
-if ($StageIndex -eq 1 -and -not $ValidateOnly -and -not $FromArtifact -and
-    -not (Test-Path $Src) -and ($UseUpstreamCache -or $UpstreamRunId)) {
-  # Leave time for bootstrap/compile and the normal snapshot reserve.
-  if ((Get-RemainingMin) -lt ($PackReserveMin + 60)) {
-    Write-Host "==> skipping optional upstream cache: insufficient stage budget"
-  } else {
-    $fetchArgs = @(
-      (Join-Path $Repo "tools\fetch_upstream_cache.py"),
-      "--platform", "windows", "--arch", "x64", "--destination", $UpstreamCacheDir
-    )
-    if ($UpstreamRunId) { $fetchArgs += @("--run-id", $UpstreamRunId) }
-    # Bound the optional download/extraction within the five-hour stage budget.
-    $fetchCommandLine = ($fetchArgs | ForEach-Object { "`"$_`"" }) -join " "
-    $fetchRc = Invoke-Tracked -File (Get-Command python -ErrorAction Stop).Source `
-      -ArgList $fetchCommandLine -Cwd $Repo -TimeoutSec 1200
-    if ($fetchRc -eq 124) {
-      Write-Host "==> optional upstream cache timed out; continuing with normal source preparation"
-    } elseif ($fetchRc -ne 0) {
-      throw "upstream cache fetch helper failed (exit $fetchRc)"
-    } else {
-      python (Join-Path $Repo "tools\restore_upstream_cache.py") --phase restore `
-        --platform windows --arch x64 --workdir $WorkDir --cache-dir $UpstreamCacheDir
-      if ($LASTEXITCODE -ne 0) { throw "upstream restore helper failed (exit $LASTEXITCODE)" }
-      if (Test-Path $Src) {
-        if (-not (Test-Path -LiteralPath $restoreReceipt -PathType Leaf)) {
-          throw "upstream restore created source without a receipt"
-        }
-        $RestoredUpstream = $true
-        $OutDir = "$Src\out\Default"
-        Write-Host "==> restored upstream source/out/Default; appending Chromix patches before incremental Ninja"
-      } else {
-        Write-Host "==> upstream restore missed; continuing with normal source preparation"
-      }
-    }
+if ($StageIndex -eq 1 -and -not $FromArtifact -and
+    -not (Test-Path $Src) -and $RequireUpstreamCache) {
+  # Leave the stage reserve and at least 30 minutes for restore/preparation.
+  $fetchTimeoutSec = [Math]::Min(3600, ((Get-RemainingMin) - $PackReserveMin - 30) * 60)
+  if ($fetchTimeoutSec -lt 60) {
+    throw "required upstream cache: insufficient stage budget for restore"
   }
+  $fetchArgs = @(
+    (Join-Path $Repo "tools\fetch_upstream_cache.py"),
+    "--platform", "windows", "--arch", "x64", "--destination", $UpstreamCacheDir
+  )
+  if ($UpstreamRunId) { $fetchArgs += @("--run-id", $UpstreamRunId) }
+  # Bound download/extraction by both the cap and this job's remaining deadline.
+  $fetchCommandLine = ($fetchArgs | ForEach-Object { "`"$_`"" }) -join " "
+  $fetchRc = Invoke-Tracked -File (Get-Command python -ErrorAction Stop).Source `
+    -ArgList $fetchCommandLine -Cwd $Repo -TimeoutSec $fetchTimeoutSec
+  if ($fetchRc -eq 124) {
+    throw "required upstream cache fetch timed out"
+  } elseif ($fetchRc -ne 0) {
+    throw "upstream cache fetch helper failed (exit $fetchRc)"
+  }
+  python (Join-Path $Repo "tools\restore_upstream_cache.py") --phase restore `
+    --platform windows --arch x64 --workdir $WorkDir --cache-dir $UpstreamCacheDir
+  if ($LASTEXITCODE -ne 0) { throw "upstream restore helper failed (exit $LASTEXITCODE)" }
+  if (-not (Test-Path -LiteralPath $restoreReceipt -PathType Leaf)) {
+    throw "required upstream cache: restore receipt missing after restore; refusing cold preparation or compilation"
+  }
+  & python (Join-Path $Repo "tools\restore_upstream_cache.py") --phase verify `
+    --platform windows --arch x64 --workdir $WorkDir
+  if ($LASTEXITCODE -ne 0) { throw "restored upstream source verification failed (exit $LASTEXITCODE)" }
+  $RestoredUpstream = $true
+  $OutDir = "$Src\out\Default"
+  Write-Host "==> restored upstream source/out/Default; appending Chromix patches before incremental Ninja"
 }
 
 if (-not (Test-Path (Join-Path $Src ".chromix-source-ready")) -and
     (Get-RemainingMin) -lt ($PackReserveMin + 30)) {
+  if ($ValidateOnly) { throw "validate-only: insufficient preparation budget" }
   Save-Handoff -Mode Unsynced
   return
 }
@@ -415,6 +422,7 @@ try {
     -DeadlineEpoch $prepareDeadline -ReserveMinutes $PackReserveMin
 } catch {
   if ($_.Exception.Message -like "PREPARE_BUDGET_EXHAUSTED:*") {
+    if ($ValidateOnly) { throw }
     Save-Handoff -Mode Unsynced
     return
   }
@@ -519,7 +527,8 @@ for relative, keys in RESTORED.items():
 
 if ($ValidateOnly) {
   Write-Host "==> validate-only: building V8 Torque generation target"
-  $validationBudget = [Math]::Max(60, (Get-RemainingMin) - 10)
+  $validationBudget = (Get-RemainingMin) - $PackReserveMin
+  if ($validationBudget -lt 1) { throw "validate-only: insufficient V8 Torque budget" }
   $validationRc = Invoke-Tracked -File (Join-Path $Src "third_party\ninja\ninja.exe") `
     -ArgList "-C `"$OutDir`" -j 1 -v gen/v8/torque-generated/bit-field-asserts.cc" `
     -Cwd $Src -TimeoutSec ($validationBudget * 60) -FullFailureOutput
