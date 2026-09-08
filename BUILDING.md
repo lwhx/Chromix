@@ -1,11 +1,8 @@
 # Building Chromix for Windows x64, Linux x64/arm64, and macOS x64/arm64
 
 The build scripts target Windows x64, Linux x64/arm64, and macOS x64/arm64 using
-pinned `ungoogled-chromium` sources. **Current Releases are Windows x64 only.**
-Linux/macOS preparation, packaging, and CI wiring still need real native builds
-and runtime validation; configured targets and fixture tests are not evidence of
-a successful Chromium compile. POSIX candidates belong in Actions artifacts,
-not Releases, until verified.
+pinned `ungoogled-chromium` sources. Releases are published only when the unified
+cross-platform workflow produces and verifies all five ZIP bundles.
 
 Every platform uses this source-layer order:
 **Chromium archive → ungoogled core patches → matching platform patches →
@@ -101,8 +98,9 @@ private Apple toolchain nor changes SDK pins/GN requirements to hide a mismatch.
 
 ## GitHub Actions cross-platform build
 
-`.github/workflows/build-cross-platform.yml` attempts four native jobs in
-parallel, retaining these exact runner/architecture/ZIP mappings:
+`.github/workflows/build-cross-platform.yml` runs five native targets. Linux and
+macOS remain parallel matrix jobs; Windows is called as a reusable job from this
+same workflow, so one successful run owns all five ZIP artifacts.
 
 | Runner | Target | Archive |
 |---|---|---|
@@ -110,12 +108,21 @@ parallel, retaining these exact runner/architecture/ZIP mappings:
 | `ubuntu-24.04-arm` | Linux arm64 | `chromix-linux-arm64.zip` |
 | `macos-15-intel` | macOS x64 | `chromix-mac-x64.zip` |
 | `macos-15` | macOS arm64 | `chromix-mac-arm64.zip` |
+| `windows-2022` | Windows x64 | `chromix-win-x64.zip` |
 
-Windows x64 remains in the separate staged
-`.github/workflows/build-win-x64-github.yml` workflow and keeps
-`chromix-win-x64.zip`. All five package formats are ZIP. Each POSIX job checks
-out the exact `build/ungoogled-revisions.psd1` pins and follows archive → core →
-platform → prune → Chromix; there is no fallback to a vanilla Chromium checkout.
+The Windows reusable workflow retains its 12-stage snapshot/resume chain. Each
+stage uploads multi-volume 7-Zip snapshots with modification times preserved so
+Ninja can continue incrementally. Manual dispatch of
+`.github/workflows/build-win-x64-github.yml` remains available for explicit
+Windows-only retries or cross-run resume; the normal release path uses the
+Windows job nested in `build-cross-platform`.
+Each POSIX job caches only the pinned source and resource downloads at
+`${{ runner.temp }}/chromix-build/download_cache`. The cache key includes the
+runner OS, platform, architecture, Chromium version, revisions, and preparation
+script. Mutable Chromium `src/` and `out/` trees are intentionally not placed in
+`actions/cache`: their size, runner/toolchain coupling, and file metadata make a
+blind restore unreliable. A POSIX retry therefore reuses downloads but prepares
+and compiles on one native runner from a clean mutable tree.
 
 The POSIX workflow verifies `SHA256SUMS`, extracts the ZIP into a fresh directory,
 and runs the extracted launcher with `--version` and a bounded headless
@@ -136,20 +143,23 @@ the 355-minute job limit for packaging and diagnostics, but are not promises
 that a Chromium build fits.
 
 **CI cost and capacity:** filtered pushes to `main` and manual dispatches start
-four independent cold builds; no POSIX object cache, staged resume, or remote
-compiler is configured. At the job limit that is up to 1,420 runner-minutes per
-run before billing multipliers/quota rules; macOS is typically more expensive
-where usage is billed. `cancel-in-progress: false` does not cancel an active run
-when newer work arrives. Hosted disk/RAM may be insufficient even after Linux
-cleanup, especially for the arm64 LLVM/Rust bootstrap, link steps, and duplicate
+four POSIX jobs plus the Windows 12-stage chain. POSIX jobs reuse only their
+pinned download cache; they do not transfer large object trees between jobs.
+Windows uses bounded multi-volume snapshots because its Chromium tree already
+has a tested staged-resume implementation. A full run can still consume up to
+1,420 POSIX runner-minutes plus the Windows stage budgets before billing
+multipliers/quota rules; macOS is typically more expensive where usage is billed.
+`cancel-in-progress: false` does not cancel an active run when newer work
+arrives. Hosted disk/RAM may be insufficient even after Linux cleanup, especially
+for the arm64 LLVM/Rust bootstrap, link steps, and duplicate
 packaging/extraction trees. Do not treat cleanup or a 100 GB estimate as proof
-of capacity. Use a suitably provisioned native host or separately scoped
-caching/staging work if these limits are hit.
+of capacity.
 
-Successful candidates are Actions artifacts retained for 14 days, **not
-Releases**. Current Releases remain Windows-only. A POSIX job definition or a
-fixture test passing is not evidence that any POSIX Chromium build has succeeded.
-SDK package versions and release-channel pins are unchanged.
+A successful unified run uploads all five browser ZIPs as Actions artifacts
+retained for 14 days. `release-browser.yml` consumes only a successful
+`build-cross-platform` run and refuses to publish until all five artifacts pass
+checksum, ZIP-layout, and corruption checks. SDK package versions and
+release-channel pins are unchanged.
 
 ### Verify and run a POSIX candidate
 

@@ -57,6 +57,11 @@ class CrossPlatformBuildRegressionTest(unittest.TestCase):
         self.assertIn("macos-15-intel", source)
         self.assertIn("macos-15", source)
         self.assertNotIn("macos-14", source)
+        self.assertIn("actions/cache@v4", source)
+        self.assertIn("download_cache", source)
+        self.assertIn("./.github/workflows/build-win-x64-github.yml", source)
+        self.assertIn("12-stage snapshot/resume", source)
+        self.assertIn(".github/workflows/build-win-x64-github.yml", source)
 
     def test_build_arguments_cover_host_toolchain_compatibility(self):
         linux = (REPO / "build" / "build.sh").read_text(encoding="utf-8")

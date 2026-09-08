@@ -220,6 +220,81 @@ function Install-Debuggers {
   if (-not (Test-Path $dbghelp)) { throw "dbghelp.dll is missing after Debugging Tools install" }
 }
 
+function Invoke-BoundedBrowser {
+  param(
+    [Parameter(Mandatory)] [string]$Launcher,
+    [Parameter(Mandatory)] [string[]]$Arguments,
+    [Parameter(Mandatory)] [string]$WorkingDirectory,
+    [int]$TimeoutSec = 60
+  )
+  $id = [Guid]::NewGuid().ToString('N')
+  $stdout = Join-Path $env:TEMP "chromix-browser-$id.out"
+  $stderr = Join-Path $env:TEMP "chromix-browser-$id.err"
+  try {
+    $process = Start-Process -FilePath $Launcher -ArgumentList $Arguments `
+      -WorkingDirectory $WorkingDirectory -PassThru -WindowStyle Hidden `
+      -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    while (-not $process.HasExited) {
+      if ($stopwatch.Elapsed.TotalSeconds -gt $TimeoutSec) {
+        try { & taskkill.exe /PID $process.Id /T /F 2>&1 | Out-Null } catch {}
+        $process.WaitForExit()
+        throw "browser smoke command timed out after $TimeoutSec seconds"
+      }
+      Start-Sleep -Milliseconds 250
+    }
+    $output = if (Test-Path $stdout) { Get-Content $stdout -Raw } else { "" }
+    $errors = if (Test-Path $stderr) { Get-Content $stderr -Raw } else { "" }
+    Write-Host $output
+    if ($errors) { Write-Host $errors }
+    if ($process.ExitCode -ne 0) {
+      throw "browser smoke command failed with exit $($process.ExitCode)"
+    }
+    return $output
+  } finally {
+    Remove-Item $stdout, $stderr -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Verify-FinalBundle {
+  $asset = Join-Path $Root "dist\chromix-win-x64.zip"
+  $manifest = Join-Path $Root "dist\SHA256SUMS"
+  if (-not (Test-Path $asset) -or -not (Test-Path $manifest)) {
+    throw "final Windows bundle or SHA256SUMS is missing"
+  }
+  $entry = Get-Content $manifest | Where-Object { $_ -match '^([0-9a-fA-F]{64})\s+chromix-win-x64\.zip$' }
+  if ($entry.Count -ne 1) { throw "SHA256SUMS has no unique Windows ZIP entry" }
+  $expected = [regex]::Match($entry[0], '^([0-9a-fA-F]{64})').Groups[1].Value.ToLowerInvariant()
+  $actual = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+  if ($actual -ne $expected) { throw "Windows ZIP checksum mismatch" }
+  Write-Host "==> Windows ZIP checksum verified: $actual"
+
+  $smokeRoot = Join-Path $Root "smoke"
+  Remove-Item $smokeRoot -Recurse -Force -ErrorAction SilentlyContinue
+  New-Item -ItemType Directory -Force -Path $smokeRoot | Out-Null
+  Expand-Archive -LiteralPath $asset -DestinationPath $smokeRoot -Force
+  $bundle = Join-Path $smokeRoot "chromix"
+  $launcher = Join-Path $bundle "chromix.cmd"
+  $chrome = Join-Path $bundle "chrome.exe"
+  if (-not (Test-Path $launcher) -or -not (Test-Path $chrome)) {
+    throw "extracted Windows bundle is missing chromix.cmd or chrome.exe"
+  }
+  $version = Invoke-BoundedBrowser -Launcher $launcher -Arguments @("--version") `
+    -WorkingDirectory $bundle -TimeoutSec 30
+  if ($version -notmatch [regex]::Escape($Revisions.ChromiumVersion)) {
+    throw "extracted Windows browser version does not match the pinned Chromium version"
+  }
+  $profile = Join-Path $smokeRoot "profile"
+  $dom = Invoke-BoundedBrowser -Launcher $launcher -Arguments @(
+    "--headless", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+    "--user-data-dir=$profile", "--dump-dom", "data:text/html,<p>chromix-smoke-ok</p>"
+  ) -WorkingDirectory $bundle -TimeoutSec 60
+  if ($dom -notmatch '<p>chromix-smoke-ok</p>') {
+    throw "extracted Windows browser did not render the smoke page"
+  }
+  Write-Host "==> Windows ZIP extraction, version, and headless smoke checks passed"
+}
+
 Write-Host "==> Chromix CI stage $StageIndex | Chromium $($Revisions.ChromiumVersion) | remaining $(Get-RemainingMin) min"
 Write-OutVar finished false
 Write-OutVar upload_parts false
@@ -386,6 +461,7 @@ $rc = Invoke-Tracked -File (Join-Path $Src "third_party\ninja\ninja.exe") `
 if ($rc -eq 0) {
   New-Item -ItemType Directory -Force -Path "$Root\dist" | Out-Null
   & "$PSScriptRoot\package-win.ps1" -Out $OutDir -Dest "$Root\dist"
+  Verify-FinalBundle
   Write-OutVar finished true
   return
 }

@@ -9,11 +9,13 @@ on:
       - 'patches/**'
       - 'assets/fonts/**'
       - '.github/workflows/build-cross-platform.yml'
+      - '.github/workflows/build-win-x64-github.yml'
       - 'CHROMIUM_VERSION'
       - 'UNGOOGLED_VERSION'
       - 'UNGOOGLED_WINDOWS_VERSION'
 
 permissions:
+  actions: read
   contents: read
 
 defaults:
@@ -114,6 +116,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+
+      - name: Cache pinned source downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/chromix-build/download_cache
+          key: ${{ runner.os }}-${{ matrix.platform }}-${{ matrix.arch }}-downloads-${{ env.CHROMIUM_VERSION }}-${{ hashFiles('build/ungoogled-revisions.psd1', 'build/prepare-ungoogled.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.platform }}-${{ matrix.arch }}-downloads-${{ env.CHROMIUM_VERSION }}-
 
       - name: Prepare pinned ungoogled source
         timeout-minutes: 90
@@ -252,3 +262,8 @@ jobs:
             ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
           if-no-files-found: warn
           retention-days: 14
+
+  windows-x64:
+    name: Windows x64 (12-stage snapshot/resume)
+    uses: ./.github/workflows/build-win-x64-github.yml
+    secrets: inherit

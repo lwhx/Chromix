@@ -13,9 +13,8 @@ from pathlib import Path, PurePosixPath
 
 WORKFLOWS = {
     "build-cross-platform": (
-        "chromix-linux-x64", "chromix-linux-arm64", "chromix-mac-x64", "chromix-mac-arm64",
+        "chromix-linux-x64", "chromix-linux-arm64", "chromix-win-x64", "chromix-mac-x64", "chromix-mac-arm64",
     ),
-    "build-win-x64-github": ("chromix-win-x64",),
 }
 ASSETS = {name + ".zip" for names in WORKFLOWS.values() for name in names}
 
@@ -109,9 +108,8 @@ def collect(repo: str, run: dict, root: Path) -> dict[str, Path]:
             sums = parse_manifest(files["SHA256SUMS"].read_text(encoding="ascii"))
             if sums.get(asset) != checksum:
                 raise ValueError(f"Checksum mismatch: {asset}")
-        elif name != "chromix-win-x64":
+        else:
             raise ValueError(f"Missing checksum: {asset}")
-        # Older successful Windows jobs uploaded only the inner ZIP.
         validate_bundle(files[asset])
         result[asset] = files[asset]
     return result
@@ -178,14 +176,15 @@ def main() -> None:
         raise ValueError("Invalid Chromium version in the built commit")
     runs = successful_runs(repo, run["head_sha"])
     if set(runs) != set(WORKFLOWS):
-        raise ValueError("Both successful browser workflows are required for the same commit")
-    # Use the triggering workflow only for provenance; collect both workflow artifacts.
+        raise ValueError("A successful unified cross-platform browser workflow is required for this commit")
+    cross_run = runs["build-cross-platform"]
+    if set(validate_run(cross_run, repo)) != {name.removesuffix('.zip') for name in ASSETS}:
+        raise ValueError("The unified cross-platform workflow did not provide all five browser artifacts")
+    # Collect all five ZIPs from the one unified run; no separate Windows run is accepted.
     with tempfile.TemporaryDirectory(prefix="chromix-release-") as directory:
         root = Path(directory)
-        bundles = {}
-        for successful in runs.values():
-            bundles.update(collect(repo, successful, root))
-        publish(repo, runs["build-cross-platform"], "v" + version, bundles, root)
+        bundles = collect(repo, cross_run, root)
+        publish(repo, cross_run, "v" + version, bundles, root)
 
 
 if __name__ == "__main__":

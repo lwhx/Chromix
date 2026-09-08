@@ -3,7 +3,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
-from tools.release_browser import parse_manifest, validate_bundle
+from tools.release_browser import ASSETS, WORKFLOWS, parse_manifest, validate_bundle
 
 
 class ReleaseBrowserTest(unittest.TestCase):
@@ -18,7 +18,14 @@ class ReleaseBrowserTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_manifest(f"{'a' * 64}  chromix-linux-x64.zip\n{'b' * 64}  chromix-linux-x64.zip\n")
 
-    def test_validate_bundle_checks_layout_and_rejects_traversal(self):
+    def test_release_requires_one_unified_run_with_all_five_assets(self):
+        self.assertEqual(tuple(WORKFLOWS), ("build-cross-platform",))
+        self.assertEqual(
+            set(WORKFLOWS["build-cross-platform"]),
+            {name.removesuffix(".zip") for name in ASSETS},
+        )
+        self.assertEqual(len(ASSETS), 5)
+
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "chromix-linux-x64.zip"
             with zipfile.ZipFile(path, "w") as archive:

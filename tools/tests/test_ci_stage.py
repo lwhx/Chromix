@@ -512,6 +512,22 @@ class RestoredSourceUpdateRegressionTest(unittest.TestCase):
         self.assertIn("Preserve the native query path", fingerprint)
         self.assertIn("GetGLRendererStringForFingerprint", fingerprint)
 
+    def test_final_windows_bundle_is_verified_before_upload(self):
+        stage = CI_STAGE.read_text(encoding="utf-8")
+        self.assertIn("function Verify-FinalBundle", stage)
+        self.assertIn("Get-FileHash $asset -Algorithm SHA256", stage)
+        self.assertIn("Expand-Archive -LiteralPath $asset", stage)
+        self.assertIn('"chromix.cmd"', stage)
+        self.assertIn('"chrome.exe"', stage)
+        self.assertIn('data:text/html,<p>chromix-smoke-ok</p>', stage)
+        self.assertIn("Invoke-BoundedBrowser", stage)
+        self.assertLess(stage.index("Verify-FinalBundle"), stage.index("Write-OutVar finished true"))
+
+    def test_windows_reusable_workflow_is_available(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("workflow_call:", workflow)
+        self.assertIn("name: chromix-win-x64", workflow)
+
     def test_resume_passes_output_directory_and_invalidates_webgl_objects(self):
         stage = CI_STAGE.read_text(encoding="utf-8")
         update = RESTORED_SOURCE_UPDATE.read_text(encoding="utf-8")

@@ -7,6 +7,27 @@
 name: build-win-x64-github
 
 on:
+  workflow_call:
+    inputs:
+      resume_run_id:
+        required: false
+        type: string
+        default: ''
+      resume_stage:
+        required: false
+        type: string
+        default: '4'
+      resume_tree_stage:
+        required: false
+        type: string
+        default: ''
+      upstream_run_id:
+        required: false
+        type: string
+        default: ''
+    secrets:
+      UPSTREAM_ACTIONS_TOKEN:
+        required: false
   workflow_dispatch:
     inputs:
       resume_run_id:
@@ -47,7 +68,8 @@ permissions:
   actions: read
 
 concurrency:
-  group: build-win-x64-github
+  # Keep direct Windows retries separate from the nested job in the unified run.
+  group: build-win-x64-github-${{ github.workflow }}
   cancel-in-progress: false
 
 env:
@@ -137,7 +159,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: chromix-win-x64
-          path: C:\c\dist\chromix-win-x64.zip
+          path: |
+            C:\c\dist\chromix-win-x64.zip
+            C:\c\dist\SHA256SUMS
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
@@ -218,7 +242,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: chromix-win-x64
-          path: C:\c\dist\chromix-win-x64.zip
+          path: |
+            C:\c\dist\chromix-win-x64.zip
+            C:\c\dist\SHA256SUMS
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
@@ -299,7 +325,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: chromix-win-x64
-          path: C:\c\dist\chromix-win-x64.zip
+          path: |
+            C:\c\dist\chromix-win-x64.zip
+            C:\c\dist\SHA256SUMS
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
@@ -380,7 +408,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: chromix-win-x64
-          path: C:\c\dist\chromix-win-x64.zip
+          path: |
+            C:\c\dist\chromix-win-x64.zip
+            C:\c\dist\SHA256SUMS
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
@@ -461,7 +491,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: chromix-win-x64
-          path: C:\c\dist\chromix-win-x64.zip
+          path: |
+            C:\c\dist\chromix-win-x64.zip
+            C:\c\dist\SHA256SUMS
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
@@ -542,7 +574,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: chromix-win-x64
-          path: C:\c\dist\chromix-win-x64.zip
+          path: |
+            C:\c\dist\chromix-win-x64.zip
+            C:\c\dist\SHA256SUMS
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
@@ -623,7 +657,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: chromix-win-x64
-          path: C:\c\dist\chromix-win-x64.zip
+          path: |
+            C:\c\dist\chromix-win-x64.zip
+            C:\c\dist\SHA256SUMS
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
@@ -704,7 +740,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: chromix-win-x64
-          path: C:\c\dist\chromix-win-x64.zip
+          path: |
+            C:\c\dist\chromix-win-x64.zip
+            C:\c\dist\SHA256SUMS
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
@@ -785,7 +823,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: chromix-win-x64
-          path: C:\c\dist\chromix-win-x64.zip
+          path: |
+            C:\c\dist\chromix-win-x64.zip
+            C:\c\dist\SHA256SUMS
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
@@ -866,7 +906,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: chromix-win-x64
-          path: C:\c\dist\chromix-win-x64.zip
+          path: |
+            C:\c\dist\chromix-win-x64.zip
+            C:\c\dist\SHA256SUMS
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
@@ -947,7 +989,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: chromix-win-x64
-          path: C:\c\dist\chromix-win-x64.zip
+          path: |
+            C:\c\dist\chromix-win-x64.zip
+            C:\c\dist\SHA256SUMS
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
@@ -1028,7 +1072,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: chromix-win-x64
-          path: C:\c\dist\chromix-win-x64.zip
+          path: |
+            C:\c\dist\chromix-win-x64.zip
+            C:\c\dist\SHA256SUMS
           if-no-files-found: error
           retention-days: 7
           compression-level: 0

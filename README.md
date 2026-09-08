@@ -1,14 +1,16 @@
 # Chromix
 
 [![Windows x64 build](https://github.com/xiaozhou26/Chromix/actions/workflows/build-win-x64-github.yml/badge.svg)](https://github.com/xiaozhou26/Chromix/actions/workflows/build-win-x64-github.yml)
+[![Cross-platform build](https://github.com/xiaozhou26/Chromix/actions/workflows/build-cross-platform.yml/badge.svg)](https://github.com/xiaozhou26/Chromix/actions/workflows/build-cross-platform.yml)
 [![GitHub release](https://img.shields.io/github/v/release/xiaozhou26/Chromix?display_name=tag)](https://github.com/xiaozhou26/Chromix/releases)
 
 Chromix is a Chromium-based browser build focused on presenting a coherent,
 per-launch browser persona across JavaScript-visible surfaces. It is built on
 pinned `ungoogled-chromium` sources and the matching Windows/Linux/macOS platform
 layer, then adds a reviewed Chromium 152 patch series and lightweight Python and
-Node SDKs. Current Releases are Windows x64 only; Linux/macOS builds remain
-experimental and need real native build and runtime verification.
+Node SDKs. The unified cross-platform workflow builds Windows x64, Linux
+x64/arm64, and macOS x64/arm64; Releases are published only after all five ZIP
+bundles pass checksum, extraction, version, and headless smoke checks.
 
 > Chromix is intended for browser automation, compatibility testing, privacy
 > research, and controlled fingerprinting experiments. A custom browser does
@@ -26,9 +28,9 @@ experimental and need real native build and runtime verification.
   Node scripts can usually migrate by changing the import.
 - **Proxy-aware setup:** optional GeoIP resolution can align locale, timezone,
   and the declared WebRTC address with the proxy exit.
-- **Portable packages:** Windows x64 Releases include runtime files, locales,
-  fonts, and a launcher. Linux/macOS ZIP packaging and CI targets are available
-  for validation, not yet verified Releases.
+- **Portable packages:** Windows, Linux, and macOS bundles are ZIP archives with
+  runtime files, locales, fonts, and Chromium/Chromix license files. macOS
+  bundles are unsigned and not notarized.
 - **Reproducible source layers:** the Chromium source archive, ungoogled core,
   and Windows/Linux/macOS platform revisions are pinned in the repository.
 - **Integrity checks:** releases include `SHA256SUMS`; the SDK verifies a bundle
@@ -36,11 +38,12 @@ experimental and need real native build and runtime verification.
 
 ## Downloads
 
-Prebuilt **Windows x64 only** packages are published on the
-[GitHub Releases page](https://github.com/xiaozhou26/Chromix/releases).
-Linux x64/arm64 and macOS x64/arm64 still require real build/runtime validation;
-successful CI candidates go to Actions artifacts, not Releases. The SDK asset
-mapping does not mean a POSIX asset exists on a current release tag.
+Prebuilt **Windows x64, Linux x64/arm64, and macOS x64/arm64** packages are
+published on the [GitHub Releases page](https://github.com/xiaozhou26/Chromix/releases)
+after the unified `build-cross-platform` workflow succeeds for all five targets.
+Every browser bundle is a ZIP accompanied by `SHA256SUMS`. macOS bundles remain
+unsigned and are not notarized because Apple signing credentials are not part of
+this build.
 
 | Browser version | Platform | Release |
 |---|---|---|
@@ -226,9 +229,8 @@ Other useful environment variables:
 | `CHROMIX_DOWNLOAD_HOST` | Override the release asset host |
 
 Configured native bundle targets are Windows x64, Linux x64/arm64, and macOS
-x64/arm64. All use ZIP archives, but only Windows has current Releases. POSIX
-Actions artifacts still need real build/runtime validation; macOS candidates
-are unsigned for distribution and not notarized.
+x64/arm64. All use ZIP archives. macOS candidates are unsigned for distribution
+and not notarized.
 
 ## Persona options
 

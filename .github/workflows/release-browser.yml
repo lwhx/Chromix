@@ -2,7 +2,7 @@ name: release-browser
 
 on:
   workflow_run:
-    workflows: [build-cross-platform, build-win-x64-github]
+    workflows: [build-cross-platform]
     types: [completed]
     branches: [main]
 
