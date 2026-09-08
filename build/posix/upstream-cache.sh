@@ -50,7 +50,7 @@ PY
 }
 
 chromix_report_upstream_plan() {
-  if [ -n "${CHROMIX_UPSTREAM_CACHE_DIR:-}" ]; then
+  if [ -n "${CHROMIX_UPSTREAM_CACHE_DIR:-}" ] || [ -f "$WORK/src/.chromix-upstream-restored.json" ]; then
     # A dry run records planned work; it cannot establish elapsed-time savings.
     ninja -C "$OUT" -n "$@" > "$WORK/upstream-cache-plan.log" 2>&1
   fi

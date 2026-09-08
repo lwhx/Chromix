@@ -30,6 +30,9 @@ export TMPDIR="${TMPDIR:-$WORK/tmp}"
 mkdir -p "$TMPDIR"
 TMPDIR="$(cd "$TMPDIR" && pwd)"
 "$REPO/build/prepare-ungoogled.sh" "$WORK" linux "$ARCH"
+if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
+  OUT="$SRC/out/Default"
+fi
 if [ "${CHROMIX_SKIP_DEPS:-0}" != 1 ]; then
   "$SRC/build/install-build-deps.sh" --no-prompt
 fi
@@ -56,6 +59,9 @@ ln -sfn "$(command -v clang-format)" buildtools/linux64-format/clang-format
 mkdir -p "third_party/dawn/tools/golang/linux-$GO_ARCH/bin"
 ln -sfn "$(command -v go)" "third_party/dawn/tools/golang/linux-$GO_ARCH/bin/go"
 "third_party/dawn/tools/golang/linux-$GO_ARCH/bin/go" version
+if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
+  bash "$REPO/build/posix/prepare-restored-tools.sh" "$WORK" linux "$ARCH"
+fi
 if [ ! -f "$SRC/.chromix-toolchain-ready" ]; then
   if [ -f "$SRC/.chromix-domain-substituted" ]; then
     echo "toolchain is incomplete in a domain-substituted source tree; use a clean work directory" >&2; exit 1
@@ -96,18 +102,19 @@ if [ "${CHROMIX_APPLY_DOMAIN_SUBSTITUTION:-1}" = 1 ] && [ ! -f "$SRC/.chromix-do
 fi
 mkdir -p "$OUT"
 printf 'target_cpu = "%s"\nv8_target_cpu = "%s"\n' "$ARCH" "$ARCH" > "$WORK/target.gn"
-python3 "$REPO/tools/merge_gn_args.py" "$OUT/args.gn" \
-  "$WORK/tooling/ungoogled-chromium/flags.gn" \
-  "$WORK/tooling/ungoogled-chromium-portablelinux/flags.linux.gn" \
-  "$REPO/build/args.gn" "$WORK/target.gn"
+GN_INPUTS=("$WORK/tooling/ungoogled-chromium/flags.gn"
+  "$WORK/tooling/ungoogled-chromium-portablelinux/flags.linux.gn"
+  "$REPO/build/args.gn" "$WORK/target.gn")
+if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
+  GN_INPUTS=("$OUT/args.gn" "${GN_INPUTS[@]}")
+fi
+python3 "$REPO/tools/merge_gn_args.py" "$OUT/args.gn" "${GN_INPUTS[@]}"
 if [ ! -x "$OUT/gn" ]; then
   # GN's standalone bootstrap still treats this libstdc++ warning as an error.
   CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }-Wno-deprecated-declarations" \
     python3 tools/gn/bootstrap/bootstrap.py -o "$OUT/gn" --skip-generate-buildfiles
 fi
-chromix_configure_upstream_objects
 "$OUT/gn" gen "$OUT" --fail-on-unused-args
-chromix_import_upstream_cache objects linux
 chromix_report_upstream_plan chrome chrome_crashpad_handler chrome_sandbox
 ninja -C "$OUT" -j "${CHROMIX_JOBS:-$(getconf _NPROCESSORS_ONLN)}" chrome chrome_crashpad_handler chrome_sandbox
 "$OUT/chrome" --version

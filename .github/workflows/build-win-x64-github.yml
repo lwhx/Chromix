@@ -130,6 +130,11 @@ jobs:
           name: upstream-cache-win-x64-s1-attempt-${{ github.run_attempt }}
           path: |
             C:\u\result.json
+            C:\c\chromix\upstream-cache-restore.json
+            C:\c\chromix\upstream-cache-preparation.json
+            C:\c\chromix\src\.chromix-upstream-restored.json
+            C:\c\chromix\src\.chromix-restored-patches.json
+            C:\c\chromix\src\out\Default\args.gn
             C:\c\chromix\upstream-cache-import.json
             C:\c\chromix\upstream-cache-plan.log
           if-no-files-found: ignore

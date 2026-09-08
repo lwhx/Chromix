@@ -97,9 +97,14 @@ class FetchUpstreamCacheTest(unittest.TestCase):
     def fixture_client(self, platform="windows", arch="x64", source="src", extra=()):
         entries = [(source, "dir", b""), (source + "/BUILD.gn", "file", b"build"),
                    (source + "/chrome/VERSION", "file", VERSION),
+                   (source + "/chrome/browser/file.cc", "file", b"source"),
                    (source + "/out/Default/args.gn", "file", b"target_cpu=\"x64\""),
+                   (source + "/out/Default/build.ninja", "file", b"build-ninja"),
                    (source + "/out/Default/.ninja_log", "file", b"ninja-log"),
-                   (source + "/out/Default/.ninja_deps", "file", b"ninja-deps"), *extra]
+                   (source + "/out/Default/.ninja_deps", "file", b"ninja-deps"),
+                   (source + "/out/Default/obj/file.o", "file", b"object"),
+                   (source + "/out/Default/gen/generated.h", "file", b"generated"),
+                   ("build/download_cache/package.tar.xz", "file", b"excluded"), *extra]
         if platform == "windows":
             inner = zip_bytes(entries)
         else:
@@ -362,9 +367,16 @@ class FetchUpstreamCacheTest(unittest.TestCase):
                 self.assertEqual({p.name for p in destination.iterdir()}, {"result.json", "tree"})
                 second = cache.fetch("windows", "x64", destination, root=self.root, client=mock.Mock())
                 self.assertEqual(result, second)
-                self.assertEqual(result["extraction_scope"], "toolchains-and-args")
-                self.assertEqual((Path(result["source"]) / "out/Default/args.gn").stat().st_mtime_ns, MTIME)
-                self.assertFalse((Path(result["source"]) / "out/Default/.ninja_deps").exists())
+                self.assertEqual(result["extraction_scope"], "source-and-objects")
+                source_path = Path(result["source"])
+                expected = {"chrome/browser/file.cc": b"source", "out/Default/args.gn": b'target_cpu="x64"',
+                            "out/Default/build.ninja": b"build-ninja", "out/Default/obj/file.o": b"object",
+                            "out/Default/gen/generated.h": b"generated", "out/Default/.ninja_log": b"ninja-log",
+                            "out/Default/.ninja_deps": b"ninja-deps"}
+                for name, content in expected.items():
+                    self.assertEqual((source_path / name).read_bytes(), content)
+                    self.assertEqual((source_path / name).stat().st_mtime_ns, MTIME)
+                self.assertFalse((destination / "tree/build/download_cache").exists())
 
     @unittest.skipUnless(shutil.which("zstd"), "host zstd is unavailable")
     def test_linux_and_macos_zstd_hits(self):
@@ -373,18 +385,16 @@ class FetchUpstreamCacheTest(unittest.TestCase):
                 source = "build/src" if platform == "linux" else "src"
                 retained = ["chrome/browser/file.cc", "out/Default/build.ninja",
                             "out/Default/obj/file.o", "out/Default/gen/generated.h"]
-                extra = [(source + "/" + name, "file", b"fixture") for name in retained]
-                extra += [(source + "/third_party/node/linux/node-linux-x64/bin/node", "sym", "/usr/bin/node"),
-                          ("build/download_cache/package.tar.xz", "file", b"excluded")]
+                extra = [(source + "/third_party/node/linux/node-linux-x64/bin/node", "sym", "/usr/bin/node")]
                 client = self.fixture_client(platform, arch, source, extra)
                 destination = self.root / f"{platform}-{arch}"
                 result = cache.fetch(platform, arch, destination, root=self.root, client=client)
                 self.assertEqual(result["status"], "hit", result)
                 self.assertTrue(Path(result["source"]).is_absolute())
-                scope = "source-and-objects" if platform == "linux" else "toolchains-and-args"
-                self.assertEqual(result["extraction_scope"], scope)
+                self.assertEqual(result["extraction_scope"], "source-and-objects")
                 for name in retained + ["out/Default/.ninja_log", "out/Default/.ninja_deps"]:
-                    self.assertEqual((Path(result["source"]) / name).is_file(), platform == "linux", name)
+                    self.assertTrue((Path(result["source"]) / name).is_file(), name)
+                    self.assertEqual((Path(result["source"]) / name).stat().st_mtime_ns, MTIME)
                 self.assertFalse((destination / "tree/build/download_cache").exists())
                 self.assertFalse((Path(result["source"]) / "third_party/node").exists())
                 self.assertEqual(result["skipped_external_symlinks"], 1)
@@ -406,6 +416,126 @@ class FetchUpstreamCacheTest(unittest.TestCase):
             cache.safe_name(name)
         with self.assertRaises(cache.CacheMiss):
             cache.safe_name("build/src/../../escape", posix=True)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX archive names required")
+    def test_posix_source_paths_and_link_targets_preserve_literal_names(self):
+        names = [r"system-systemd\x2dcryptsetup.slice", "name:with:colon", "trailing.",
+                 "trailing ", "NUL", 'literal<>"|?*']
+        for platform in ("linux", "macos"):
+            for kind in ("tar", "zip"):
+                with self.subTest(platform=platform, kind=kind):
+                    tree = self.root / f"literal-{platform}-{kind}"
+                    tree.mkdir()
+                    entries = [("src/" + name, "file", b"literal") for name in names]
+                    entries += [(f"src/link-{index}", "sym", name) for index, name in enumerate(names)]
+                    selection = cache.SourceSelection(["src"], platform=platform)
+                    if kind == "tar":
+                        entries += [(f"src/hard-{index}", "hard", "src/" + name)
+                                    for index, name in enumerate(names)]
+                        cache.extract_tar(io.BytesIO(tar_bytes(entries)), tree, selection)
+                        for index, name in enumerate(names):
+                            self.assertEqual((tree / "src" / name).stat().st_ino,
+                                             (tree / f"src/hard-{index}").stat().st_ino)
+                    else:
+                        cache.extract_zip(io.BytesIO(zip_bytes(entries)), tree, selection)
+                    for index, name in enumerate(names):
+                        self.assertEqual((tree / "src" / name).read_bytes(), b"literal")
+                        self.assertEqual((tree / f"src/link-{index}").read_bytes(), b"literal")
+                        self.assertEqual(os.readlink(tree / f"src/link-{index}"), name)
+
+    def test_windows_source_paths_and_link_targets_remain_strict(self):
+        names = [r"literal\x2dname", r"..\outside", r"C:\outside", r"\\host\share", "C:/outside",
+                 "file:stream", "NUL", "NUL.txt", "COM¹", "CONOUT$", "trailing.", "trailing ",
+                 "bad<name", "bad>name", 'bad"name', "bad|name", "bad?name", "bad*name"]
+        for kind in ("tar", "zip"):
+            for index, name in enumerate(names):
+                for member in ("file", "sym", "hard") if kind == "tar" else ("file", "sym"):
+                    with self.subTest(kind=kind, name=name, member=member):
+                        tree = self.root / f"strict-{kind}-{index}-{member}"
+                        tree.mkdir()
+                        entry = ("src/" + name, "file", b"bad") if member == "file" else (
+                            "src/link", member, "src/" + name if member == "hard" else name)
+                        selection = cache.SourceSelection(["src"], platform="windows")
+                        with self.assertRaises(cache.CacheMiss):
+                            if kind == "tar":
+                                cache.extract_tar(io.BytesIO(tar_bytes([entry])), tree, selection)
+                            else:
+                                cache.extract_zip(io.BytesIO(zip_bytes([entry])), tree, selection)
+        with mock.patch.object(cache.os, "name", "nt"), self.assertRaises(cache.CacheMiss):
+            cache.safe_name(r"src/literal\x2dname", posix=True)
+        client = self.fixture_client(extra=[(r"src/literal\x2dname", "file", b"bad")])
+        result = cache.fetch("windows", "x64", self.destination, root=self.root, client=client)
+        self.assertEqual(result["reason"], "unsafe_archive_path")
+        self.assertEqual(result["extraction_scope"], "source-and-objects")
+        self.assertEqual({p.name for p in self.destination.iterdir()}, {"result.json"})
+
+    def test_case_folding_targets_reject_collisions_in_members_parents_and_links(self):
+        cases = [
+            [("src/File", "file", b"a"), ("src/file", "file", b"b")],
+            [("src/Dir/a", "file", b"a"), ("src/dir/b", "file", b"b")],
+            [("src/Dir", "dir", b""), ("src/dir", "sym", ".")],
+            [("src/Dir/a", "file", b"a"), ("src/dir", "dir", b"")],
+            [("src/é", "file", b"a"), ("src/e\u0301", "file", b"b")],
+            [("src/A", "sym", "/outside"), ("src/link", "sym", "a")],
+            [("src/A", "sym", "a")],
+            [("src/A", "sym", "B"), ("src/b", "sym", "a")],
+            [("src/A", "sym", ".."), ("src/link", "sym", "a/../outside")],
+            [("foreign/Dir/a", "file", b"a"), ("foreign/dir/b", "file", b"b")],
+        ]
+        for platform in ("windows", "macos"):
+            for kind in ("tar", "zip"):
+                for index, entries in enumerate(cases):
+                    with self.subTest(platform=platform, kind=kind, entries=entries):
+                        tree = self.root / f"case-{platform}-{kind}-{index}"
+                        tree.mkdir()
+                        selection = cache.SourceSelection(["src"], platform=platform)
+                        with self.assertRaises(cache.CacheMiss):
+                            if kind == "tar":
+                                cache.extract_tar(io.BytesIO(tar_bytes(entries)), tree, selection)
+                            else:
+                                cache.extract_zip(io.BytesIO(zip_bytes(entries)), tree, selection)
+                tree = self.root / f"case-hard-{platform}-{kind}"
+                tree.mkdir()
+                entries = [("src/File", "file", b"a"), ("src/hard", "hard", "src/file")]
+                with self.assertRaisesRegex(cache.CacheMiss, "archive_case_collision"):
+                    cache.extract_tar(io.BytesIO(tar_bytes(entries)), tree,
+                                      cache.SourceSelection(["src"], platform=platform))
+
+    def test_framework_and_forward_directory_symlink_chains(self):
+        framework = "src/out/Default/Chromium Framework.framework"
+        entries = [(framework + "/Resources", "sym", "Versions/Current/Resources"),
+                   (framework + "/Versions/Current", "sym", "A"),
+                   (framework + "/Versions/A/Resources/data", "file", b"resource"),
+                   (framework + "/Chromium Framework", "sym", "Versions/Current/Chromium Framework"),
+                   (framework + "/Versions/A/Chromium Framework", "file", b"binary"),
+                   ("src/forward", "sym", "directory-link"),
+                   ("src/directory-link", "sym", "empty"), ("src/empty", "dir", b""),
+                   ("src/file-link", "sym", "hard-link"),
+                   ("src/dangling", "sym", "missing")]
+        for platform in ("windows", "macos"):
+            for kind in ("tar", "zip"):
+                with self.subTest(platform=platform, kind=kind):
+                    tree = self.root / f"framework-{platform}-{kind}"
+                    tree.mkdir()
+                    selection = cache.SourceSelection(["src"], platform=platform)
+                    with mock.patch.object(cache.os, "symlink", wraps=os.symlink) as symlink:
+                        if kind == "tar":
+                            data = tar_bytes(entries + [("src/hard-link", "hard",
+                                                         framework + "/Versions/A/Chromium Framework")])
+                            cache.extract_tar(io.BytesIO(data), tree, selection)
+                        else:
+                            data = zip_bytes(entries + [("src/hard-link", "file", b"binary")])
+                            cache.extract_zip(io.BytesIO(data), tree, selection)
+                    directories = {framework + "/Resources", framework + "/Versions/Current",
+                                   "src/forward", "src/directory-link"}
+                    for call in symlink.call_args_list:
+                        name = call.args[1].relative_to(tree).as_posix()
+                        self.assertEqual(call.kwargs["target_is_directory"], name in directories, name)
+                    self.assertEqual((tree / framework / "Resources/data").read_bytes(), b"resource")
+                    self.assertEqual((tree / framework / "Chromium Framework").read_bytes(), b"binary")
+                    self.assertTrue((tree / "src/forward").is_dir())
+                    self.assertEqual((tree / "src/file-link").read_bytes(), b"binary")
+                    self.assertEqual(os.readlink(tree / "src/dangling"), "missing")
 
     def test_corrupt_archives_and_limits_fall_back(self):
         client = self.fixture_client()
@@ -529,7 +659,8 @@ class FetchUpstreamCacheTest(unittest.TestCase):
                     "out/Default/gen/generated.h", "tools/clang/scripts/update.py",
                     "third_party/llvm-build/Release+Asserts/bin/clang",
                     "third_party/llvm-build-tools/include/header.h", "third_party/rust-src/library/lib.rs",
-                    "third_party/rust-toolchain/lib/rustlib/src/rust/library/lib.rs"]
+                    "third_party/rust-toolchain/lib/rustlib/src/rust/library/lib.rs",
+                    "tools/clang/__pycache__/update.pyc", "download_cache/source-fixture"]
         excluded = ["build/download_cache/package.tar.xz", "build/other/data", "download_cache/package.tar.xz",
                     "build/src-backup/base/header.h", "foreign/build/src/base/header.h", "src/base/header.h"]
         source = "build/src"
@@ -596,6 +727,197 @@ class FetchUpstreamCacheTest(unittest.TestCase):
                 for name in names:
                     self.assertFalse((tree / name).is_symlink())
                 self.assertEqual(list(tree.iterdir()), [])
+
+    def test_source_selection_remaps_known_platform_internal_absolute_links(self):
+        roots = [
+            ("linux", "build/src", "/repo/build/src"),
+            ("macos", "src", "/Users/runner/work/ungoogled-chromium-macos/ungoogled-chromium-macos/build/src"),
+            ("windows", "src", r"C:\ungoogled-chromium-windows\build\src"),
+            ("windows", "build/src", "C:/ungoogled-chromium-windows/build/src"),
+        ]
+        rust = "third_party/rust-toolchain"
+        llvm = "third_party/llvm-build/Release+Asserts/bin"
+        files = {rust + "/rustc/bin/rustc": b"rustc", rust + "/rustfmt-preview/bin/rustfmt": b"rustfmt",
+                 rust + "/cargo/bin/cargo": b"cargo", rust + "/rustc/lib/libLLVM.dylib": b"lib",
+                 llvm + "/llvm-install-name-tool": b"llvm"}
+        links = {rust + "/bin/rustc": rust + "/rustc/bin/rustc",
+                 rust + "/bin/rustfmt": rust + "/rustfmt-preview/bin/rustfmt",
+                 rust + "/bin/cargo": rust + "/cargo/bin/cargo",
+                 rust + "/lib/libLLVM.dylib": rust + "/rustc/lib/libLLVM.dylib",
+                 rust + "/lib/libLLVM-current.dylib": rust + "/lib/libLLVM.dylib",
+                 rust + "/lib/current": rust + "/lib/runtime",
+                 rust + "/lib/runtime": rust + "/rustc/lib",
+                 llvm + "/install_name_tool": llvm + "/llvm-install-name-tool"}
+        for platform, source, original in roots:
+            separator = "\\" if "\\" in original else "/"
+            for kind in ("tar", "zip"):
+                with self.subTest(platform=platform, source=source, kind=kind):
+                    tree = self.root / f"absolute-internal-{platform}-{source.replace('/', '-')}-{kind}"
+                    tree.mkdir()
+                    entries = [(source + "/" + name, "sym", original + separator + target.replace("/", separator))
+                               for name, target in links.items()]
+                    entries += [(source + "/" + name, "file", data) for name, data in files.items()]
+                    entries.append((source + "/" + rust + "/bin/rustc-relative", "sym", "rustc"))
+                    selection = cache.SourceSelection(cache.SOURCES[platform][2], platform=platform)
+                    if kind == "tar":
+                        result = cache.extract_tar(io.BytesIO(tar_bytes(entries)), tree, selection)
+                    else:
+                        result = cache.extract_zip(io.BytesIO(zip_bytes(entries)), tree, selection)
+                    self.assertEqual(result["remapped_internal_symlinks"], len(links))
+                    self.assertEqual(result["skipped_external_symlinks"], 0)
+                    self.assertEqual(result["extracted_bytes"], sum(map(len, files.values())))
+                    for name, target in links.items():
+                        link = tree / source / name
+                        relative = os.path.relpath(tree / source / target, link.parent).replace(os.sep, "/")
+                        self.assertEqual(os.readlink(link), relative)
+                        self.assertTrue(link.resolve().is_relative_to(tree / source))
+                        self.assertEqual(link.lstat().st_mtime_ns, MTIME)
+                    for name, content in ((rust + "/bin/rustc", b"rustc"), (rust + "/bin/rustfmt", b"rustfmt"),
+                                          (rust + "/bin/cargo", b"cargo"), (rust + "/bin/rustc-relative", b"rustc"),
+                                          (rust + "/lib/libLLVM-current.dylib", b"lib"),
+                                          (rust + "/lib/current/libLLVM.dylib", b"lib"),
+                                          (llvm + "/install_name_tool", b"llvm")):
+                        self.assertEqual((tree / source / name).read_bytes(), content)
+
+    def test_absolute_external_links_are_omitted_and_unknown_internal_links_reject(self):
+        roots = {
+            "linux": ("build/src", "/repo/build/src"),
+            "macos": ("src", "/Users/runner/work/ungoogled-chromium-macos/ungoogled-chromium-macos/build/src"),
+            "windows": ("src", r"C:\ungoogled-chromium-windows\build\src"),
+        }
+        for platform, (source, original) in roots.items():
+            for kind in ("tar", "zip"):
+                with self.subTest(platform=platform, kind=kind):
+                    tree = self.root / f"absolute-external-{platform}-{kind}"
+                    tree.mkdir()
+                    entries = [
+                        (f"{source}/sdk-link", "sym", "/Applications/Xcode.app/Contents/Developer/SDKs/MacOSX.sdk/usr/include/stdio.h"),
+                        (f"{source}/go-link", "sym", "/usr/local/go/bin/go"),
+                    ]
+                    selection = cache.SourceSelection([source], platform=platform)
+                    if kind == "tar":
+                        result = cache.extract_tar(io.BytesIO(tar_bytes(entries)), tree, selection)
+                    else:
+                        result = cache.extract_zip(io.BytesIO(zip_bytes(entries)), tree, selection)
+                    self.assertEqual(result["remapped_internal_symlinks"], 0)
+                    self.assertEqual(result["skipped_external_symlinks"], 2)
+                    self.assertEqual(set(result["external_symlink_paths"]),
+                                     {f"{source}/sdk-link", f"{source}/go-link"})
+                    self.assertFalse((tree / source / "sdk-link").exists())
+                    self.assertFalse((tree / source / "go-link").exists())
+
+                    unknown = [(f"{source}/missing", "sym", original + "/not-in-archive")]
+                    bad_tree = self.root / f"absolute-missing-{platform}-{kind}"
+                    bad_tree.mkdir()
+                    with self.assertRaisesRegex(cache.CacheMiss, "missing_internal_symlink_target"):
+                        if kind == "tar":
+                            cache.extract_tar(io.BytesIO(tar_bytes(unknown)), bad_tree, selection)
+                        else:
+                            cache.extract_zip(io.BytesIO(zip_bytes(unknown)), bad_tree, selection)
+
+        tree = self.root / "linux-rejects-macos-root"
+        tree.mkdir()
+        mac_target = ("/Users/runner/work/ungoogled-chromium-macos/ungoogled-chromium-macos/"
+                      "build/src/third_party/rust-toolchain/rustc/bin/rustc")
+        result = cache.extract_tar(io.BytesIO(tar_bytes([("build/src/rustc", "sym", mac_target)])), tree,
+                                   cache.SourceSelection(["build/src"], platform="linux"))
+        self.assertEqual(result["remapped_internal_symlinks"], 0)
+        self.assertEqual(result["skipped_external_symlinks"], 1)
+        self.assertFalse((tree / "build/src/rustc").exists())
+
+    def test_remapped_absolute_links_still_validate_cycles_escape_case_and_existence(self):
+        roots = [("linux", "build/src", "/repo/build/src"),
+                 ("macos", "src", "/Users/runner/work/ungoogled-chromium-macos/ungoogled-chromium-macos/build/src"),
+                 ("windows", "src", r"C:\ungoogled-chromium-windows\build\src")]
+        for platform, source, original in roots:
+            cases = [
+                [("a", "sym", original + "/a")],
+                [("a", "sym", original + "/b"), ("b", "sym", original + "/a")],
+                [("a", "sym", original + "/b"), ("b", "sym", "a")],
+                [("a", "sym", original + "/../download_cache/file")],
+                [("a", "sym", original + "/b"), ("b", "sym", "../../../outside")],
+                [("a", "sym", original + "/b"), ("b", "sym", "../download_cache/file")],
+                [("a", "sym", original + "/b"), ("b", "sym", "/Applications/Xcode.app/SDK")],
+                [("a", "sym", original + "/missing")],
+                [("a", "sym", original + "/b"), ("b", "sym", "missing")],
+                [("a", "sym", original + "/b"), ("b", "sym", "missing/../file"), ("file", "file", b"data")],
+                [("a", "sym", original + "/b"), ("b", "sym", "file/../file"), ("file", "file", b"data")],
+                [("a", "sym", original + "/b"), ("b", "file", b"data"), ("a/nested", "file", b"bad")],
+                [("a/nested", "file", b"bad"), ("a", "sym", original + "/b"), ("b", "file", b"data")],
+            ]
+            if platform in ("macos", "windows"):
+                cases += [[("a", "sym", original + "/file"), ("File", "file", b"data")],
+                          [("a", "sym", original + "/dir/file"), ("Dir/file", "file", b"data")],
+                          [("A", "sym", original + "/a")]]
+            if platform == "windows":
+                cases += [[("a", "sym", original + suffix)] for suffix in
+                          (r"\..\outside", r"\file:stream", r"\NUL", r"\trailing.", r"\bad*name")]
+            for kind in ("tar", "zip"):
+                for index, members in enumerate(cases):
+                    entries = [(source + "/" + name, member, target) for name, member, target in members]
+                    tree = self.root / f"remap-unsafe-{platform}-{kind}-{index}"
+                    tree.mkdir()
+                    with self.subTest(platform=platform, kind=kind, entries=entries), self.assertRaises(cache.CacheMiss):
+                        selection = cache.SourceSelection(cache.SOURCES[platform][2], platform=platform)
+                        if kind == "tar":
+                            cache.extract_tar(io.BytesIO(tar_bytes(entries)), tree, selection)
+                        else:
+                            cache.extract_zip(io.BytesIO(zip_bytes(entries)), tree, selection)
+
+    def test_absolute_root_remapping_is_platform_and_source_scoped(self):
+        mac_root = "/Users/runner/work/ungoogled-chromium-macos/ungoogled-chromium-macos/build/src"
+        cases = [(cache.SourceSelection(["build/src"], platform="linux"), "build/src", mac_root),
+                 (cache.SourceSelection(["src"], platform="windows"), "src", mac_root),
+                 (cache.SourceSelection(["src"]), "src", mac_root),
+                 (cache.SourceSelection(["foreign/src"], platform="macos"), "foreign/src", mac_root),
+                 (cache.SourceSelection(["src"], platform="macos"), "src", mac_root + "-backup"),
+                 (cache.SourceSelection(["src"], platform="macos"), "src", "/another/build/src"),
+                 (cache.SourceSelection(["src"], platform="macos"), "src", "/repo/build/src")]
+        for kind in ("tar", "zip"):
+            for index, (selection, source, original) in enumerate(cases):
+                tree = self.root / f"remap-scope-{kind}-{index}"
+                tree.mkdir()
+                entries = [(source + "/file", "file", b"data"), (source + "/link", "sym", original + "/file")]
+                with self.subTest(kind=kind, source=source, original=original):
+                    if kind == "tar":
+                        result = cache.extract_tar(io.BytesIO(tar_bytes(entries)), tree, selection)
+                    else:
+                        result = cache.extract_zip(io.BytesIO(zip_bytes(entries)), tree, selection)
+                    self.assertEqual(result["remapped_internal_symlinks"], 0)
+                    self.assertEqual(result["external_symlink_paths"], [source + "/link"])
+                    self.assertEqual(result["skipped_external_symlinks"], 1)
+                    self.assertFalse((tree / source / "link").is_symlink())
+                    self.assertEqual((tree / source / "file").read_bytes(), b"data")
+
+    @unittest.skipUnless(shutil.which("zstd"), "host zstd is unavailable")
+    def test_macos_fetch_remaps_rust_chain_and_records_sdk_go_omissions(self):
+        original = "/Users/runner/work/ungoogled-chromium-macos/ungoogled-chromium-macos/build/src"
+        rust = "third_party/rust-toolchain"
+        sdk = "src/out/Default/sdk/xcode_links/MacOSX.sdk"
+        go = "src/third_party/go/src"
+        extra = [("src/" + rust + "/bin/rustc", "sym", original + "/" + rust + "/rustc/bin/rustc"),
+                 ("src/" + rust + "/rustc/bin/rustc", "file", b"rustc"),
+                 ("src/" + rust + "/bin/rustc-alias", "sym", original + "/" + rust + "/bin/rustc"),
+                 (sdk, "sym", "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"),
+                 (go, "sym", "/usr/local/go/src")]
+        for arch in ("x64", "arm64"):
+            with self.subTest(arch=arch):
+                destination = self.root / f"macos-links-{arch}"
+                client = self.fixture_client("macos", arch, "src", extra)
+                result = cache.fetch("macos", arch, destination, root=self.root, client=client)
+                self.assertEqual(result["status"], "hit", result)
+                self.assertEqual(result["remapped_internal_symlinks"], 2)
+                self.assertEqual(result["skipped_external_symlinks"], 2)
+                self.assertEqual(set(result["external_symlink_paths"]), {sdk, go})
+                self.assertEqual((Path(result["source"]) / rust / "bin/rustc-alias").read_bytes(), b"rustc")
+                self.assertEqual(json.loads((destination / "result.json").read_text()), result)
+                for name in (sdk, go):
+                    self.assertFalse((destination / "tree" / name).is_symlink())
+        client = self.fixture_client("macos", "x64", "src", extra=[
+            ("src/" + rust + "/bin/rustc", "sym", original + "/" + rust + "/rustc/bin/rustc")])
+        result = cache.fetch("macos", "x64", self.destination, root=self.root, client=client)
+        self.assertEqual(result["reason"], "missing_internal_symlink_target")
+        self.assertEqual({p.name for p in self.destination.iterdir()}, {"result.json"})
 
     def test_source_selection_rejects_escaping_and_excluded_link_targets(self):
         cases = [
@@ -703,27 +1025,30 @@ class FetchUpstreamCacheTest(unittest.TestCase):
         self.assertEqual(cache.DOWNLOAD_SECONDS, 15 * 60)
 
     def test_source_selection_uses_full_limit_and_disk_headroom(self):
-        tree = self.root / "source-limits"
-        tree.mkdir()
-        extractor = cache.Extractor(tree, cache.SourceSelection(["build/src"]))
-        stream = mock.Mock()
-        extractor.add("build/download_cache/file", "file", 100, 0o644, MTIME, stream)
-        stream.read.assert_not_called()
-        self.assertEqual(extractor.archive_bytes, 100)
-        self.assertEqual(extractor.bytes, 0)
-        with mock.patch.object(cache, "MAX_SELECTED", 2):
-            extractor.add("build/src/out/Default/obj/file.o", "file", 3, 0o644, MTIME, io.BytesIO(b"obj"))
-        self.assertEqual(extractor.bytes, 3)
-        self.assertEqual((tree / "build/src/out/Default/obj/file.o").read_bytes(), b"obj")
-        with mock.patch.object(cache, "MAX_EXTRACTED", 103), self.assertRaisesRegex(
-                cache.CacheMiss, "archive_too_large"):
-            extractor.add("build/src/out/Default/obj/large.o", "file", 1, 0o644, MTIME, stream)
-        self.assertEqual(cache.MAX_EXTRACTED, 300 * 1024**3)
-        self.assertEqual(cache.DISK_HEADROOM, 4 * 1024**3)
-        self.disk_usage.return_value = mock.Mock(free=cache.DISK_HEADROOM + 2)
-        with self.assertRaisesRegex(cache.CacheMiss, "insufficient_disk_space"):
-            extractor.add("build/src/base/header.h", "file", 3, 0o644, MTIME, io.BytesIO(b"abc"))
-        self.assertEqual((tree / "build/src/base/header.h").stat().st_size, 0)
+        for platform in ("linux", "macos", "windows"):
+            with self.subTest(platform=platform):
+                tree = self.root / f"source-limits-{platform}"
+                tree.mkdir()
+                extractor = cache.Extractor(tree, cache.SourceSelection(["build/src"], platform=platform))
+                stream = mock.Mock()
+                self.disk_usage.return_value = mock.Mock(free=1024**4)
+                extractor.add("build/download_cache/file", "file", 100, 0o644, MTIME, stream)
+                stream.read.assert_not_called()
+                self.assertEqual(extractor.archive_bytes, 100)
+                self.assertEqual(extractor.bytes, 0)
+                with mock.patch.object(cache, "MAX_SELECTED", 2):
+                    extractor.add("build/src/out/Default/obj/file.o", "file", 3, 0o644, MTIME, io.BytesIO(b"obj"))
+                self.assertEqual(extractor.bytes, 3)
+                self.assertEqual((tree / "build/src/out/Default/obj/file.o").read_bytes(), b"obj")
+                with mock.patch.object(cache, "MAX_EXTRACTED", 103), self.assertRaisesRegex(
+                        cache.CacheMiss, "archive_too_large"):
+                    extractor.add("build/src/out/Default/obj/large.o", "file", 1, 0o644, MTIME, stream)
+                self.assertEqual(cache.MAX_EXTRACTED, 300 * 1024**3)
+                self.assertEqual(cache.DISK_HEADROOM, 4 * 1024**3)
+                self.disk_usage.return_value = mock.Mock(free=cache.DISK_HEADROOM + 2)
+                with self.assertRaisesRegex(cache.CacheMiss, "insufficient_disk_space"):
+                    extractor.add("build/src/base/header.h", "file", 3, 0o644, MTIME, io.BytesIO(b"abc"))
+                self.assertEqual((tree / "build/src/base/header.h").stat().st_size, 0)
 
     def test_low_space_preflight_and_mid_extraction_fall_back(self):
         client = self.fixture_client()
@@ -749,39 +1074,19 @@ class FetchUpstreamCacheTest(unittest.TestCase):
             result = cache.fetch("windows", "x64", self.destination, root=self.root, client=client)
         self.assertEqual(result["reason"], "insufficient_disk_space")
         self.assertEqual(len(written), 2)
-        self.assertEqual(result["extraction_scope"], "toolchains-and-args")
+        self.assertEqual(result["extraction_scope"], "source-and-objects")
         self.assertEqual({p.name for p in self.destination.iterdir()}, {"result.json"})
 
-    def test_old_full_scope_hit_is_not_reused(self):
-        client = self.fixture_client(extra=[("src/out/Default/obj/object.o", "file", b"object")])
-        result = cache.fetch("windows", "x64", self.destination, root=self.root, client=client)
-        self.assertEqual(result["status"], "hit")
-        result.pop("extraction_scope")
-        (self.destination / "result.json").write_text(json.dumps(result))
-        old = Path(result["source"]) / "full-source.cc"
-        old.write_text("must not survive")
-        client = self.fixture_client(extra=[("src/out/Default/obj/object.o", "file", b"object")])
-        self.assertEqual(cache.load_manifest("windows", "x64", root=self.root)[1], result["manifest"])
-        result = cache.fetch("windows", "x64", self.destination, root=self.root, client=client)
-        self.assertEqual(result["status"], "hit")
-        self.assertEqual(result["extraction_scope"], "toolchains-and-args")
-        self.assertFalse(old.exists())
-        self.assertFalse((Path(result["source"]) / "out/Default/obj").exists())
-        client.open.assert_called_once()
-
-    @unittest.skipUnless(shutil.which("zstd"), "host zstd is unavailable")
-    def test_linux_toolchain_scope_hit_is_not_reused(self):
-        extra = [("build/src/out/Default/obj/object.o", "file", b"object"),
-                 ("build/src/base/header.h", "file", b"header")]
+    def test_windows_legacy_scope_hits_are_not_reused(self):
         for old_scope in (None, "toolchains-and-args"):
             with self.subTest(old_scope=old_scope):
-                destination = self.root / f"stale-{old_scope}"
-                client = self.fixture_client("linux", "x64", "build/src", extra)
-                result = cache.fetch("linux", "x64", destination, root=self.root, client=client)
+                destination = self.root / f"stale-windows-{old_scope}"
+                client = self.fixture_client()
+                result = cache.fetch("windows", "x64", destination, root=self.root, client=client)
                 self.assertEqual(result["status"], "hit", result)
                 source = Path(result["source"])
                 shutil.rmtree(source / "out/Default/obj")
-                (source / "base/header.h").unlink()
+                (source / "chrome/browser/file.cc").unlink()
                 if old_scope is None:
                     result.pop("extraction_scope")
                 else:
@@ -789,31 +1094,65 @@ class FetchUpstreamCacheTest(unittest.TestCase):
                 (destination / "result.json").write_text(json.dumps(result))
                 stale = source / "stale"
                 stale.write_text("must not survive")
-                client = self.fixture_client("linux", "x64", "build/src", extra)
-                self.assertEqual(cache.load_manifest("linux", "x64", root=self.root)[1], result["manifest"])
-                result = cache.fetch("linux", "x64", destination, root=self.root, client=client)
+                client = self.fixture_client()
+                self.assertEqual(cache.load_manifest("windows", "x64", root=self.root)[1], result["manifest"])
+                result = cache.fetch("windows", "x64", destination, root=self.root, client=client)
                 self.assertEqual(result["status"], "hit", result)
                 self.assertEqual(result["extraction_scope"], "source-and-objects")
-                self.assertEqual((source / "out/Default/obj/object.o").read_bytes(), b"object")
-                self.assertEqual((source / "base/header.h").read_bytes(), b"header")
+                self.assertEqual((source / "out/Default/obj/file.o").read_bytes(), b"object")
+                self.assertEqual((source / "chrome/browser/file.cc").read_bytes(), b"source")
                 self.assertFalse(stale.exists())
                 client.open.assert_called_once()
 
     @unittest.skipUnless(shutil.which("zstd"), "host zstd is unavailable")
-    def test_linux_low_space_during_source_extraction_cleans_up(self):
-        client = self.fixture_client("linux", "x64", "build/src")
-        original = cache.require_space
+    def test_posix_legacy_scope_hits_are_not_reused(self):
+        for platform, arch in (("linux", "x64"), ("linux", "arm64"), ("macos", "x64"), ("macos", "arm64")):
+            source_name = "build/src" if platform == "linux" else "src"
+            for old_scope in (None, "toolchains-and-args"):
+                with self.subTest(platform=platform, arch=arch, old_scope=old_scope):
+                    destination = self.root / f"stale-{platform}-{arch}-{old_scope}"
+                    client = self.fixture_client(platform, arch, source_name)
+                    result = cache.fetch(platform, arch, destination, root=self.root, client=client)
+                    self.assertEqual(result["status"], "hit", result)
+                    source = Path(result["source"])
+                    shutil.rmtree(source / "out/Default/obj")
+                    (source / "chrome/browser/file.cc").unlink()
+                    if old_scope is None:
+                        result.pop("extraction_scope")
+                    else:
+                        result["extraction_scope"] = old_scope
+                    (destination / "result.json").write_text(json.dumps(result))
+                    stale = source / "stale"
+                    stale.write_text("must not survive")
+                    client = self.fixture_client(platform, arch, source_name)
+                    self.assertEqual(cache.load_manifest(platform, arch, root=self.root)[1], result["manifest"])
+                    result = cache.fetch(platform, arch, destination, root=self.root, client=client)
+                    self.assertEqual(result["status"], "hit", result)
+                    self.assertEqual(result["extraction_scope"], "source-and-objects")
+                    self.assertEqual((source / "out/Default/obj/file.o").read_bytes(), b"object")
+                    self.assertEqual((source / "chrome/browser/file.cc").read_bytes(), b"source")
+                    self.assertFalse(stale.exists())
+                    client.open.assert_called_once()
 
-        def check_space(path, additional=0):
-            if Path(path) == self.destination / "tree" and additional:
-                self.disk_usage.return_value = mock.Mock(free=cache.DISK_HEADROOM + additional - 1)
-            original(path, additional)
+    @unittest.skipUnless(shutil.which("zstd"), "host zstd is unavailable")
+    def test_posix_low_space_during_source_extraction_cleans_up(self):
+        for platform, arch in (("linux", "x64"), ("linux", "arm64"), ("macos", "x64"), ("macos", "arm64")):
+            with self.subTest(platform=platform, arch=arch):
+                source = "build/src" if platform == "linux" else "src"
+                client = self.fixture_client(platform, arch, source)
+                self.disk_usage.return_value = mock.Mock(free=1024**4)
+                original = cache.require_space
 
-        with mock.patch.object(cache, "require_space", side_effect=check_space):
-            result = cache.fetch("linux", "x64", self.destination, root=self.root, client=client)
-        self.assertEqual(result["reason"], "insufficient_disk_space")
-        self.assertEqual(result["extraction_scope"], "source-and-objects")
-        self.assertEqual({p.name for p in self.destination.iterdir()}, {"result.json"})
+                def check_space(path, additional=0):
+                    if Path(path) == self.destination / "tree" and additional:
+                        self.disk_usage.return_value = mock.Mock(free=cache.DISK_HEADROOM + additional - 1)
+                    original(path, additional)
+
+                with mock.patch.object(cache, "require_space", side_effect=check_space):
+                    result = cache.fetch(platform, arch, self.destination, root=self.root, client=client)
+                self.assertEqual(result["reason"], "insufficient_disk_space")
+                self.assertEqual(result["extraction_scope"], "source-and-objects")
+                self.assertEqual({p.name for p in self.destination.iterdir()}, {"result.json"})
 
     def test_missing_zstd_is_miss_and_never_runs_cached_tool(self):
         with mock.patch.object(cache.shutil, "which", return_value=None):

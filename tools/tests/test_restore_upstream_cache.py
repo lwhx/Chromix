@@ -1,0 +1,695 @@
+import errno
+import json
+import os
+import shlex
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from tools import fetch_upstream_cache as fetcher
+from tools import restore_upstream_cache as restore
+
+
+class RestoreUpstreamCacheTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.repo = root / "repo"
+        self.work = root / "work"
+        self.cache = root / "cache"
+        for relative in ("CHROMIUM_VERSION", "build/ungoogled-revisions.psd1", "build/upstream-cache.json"):
+            destination = self.repo / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(restore.REPO / relative, destination)
+        self.platform, self.arch = "linux", "x64"
+        self.make_cache()
+
+    def write(self, path, value, mode=0o644):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(value.encode() if isinstance(value, str) else value)
+        path.chmod(mode)
+
+    def make_cache(self, platform="linux", arch="x64"):
+        self.platform, self.arch = platform, arch
+        if self.cache.exists():
+            shutil.rmtree(self.cache)
+        self.cache.mkdir()
+        identity, pin, manifest = restore.identities(self.repo, platform, arch)
+        root_name = pin["source_roots"][0]
+        self.donor = self.cache / "tree" / root_name
+        version = "\n".join(f"{key}={value}" for key, value in zip(
+            ("MAJOR", "MINOR", "BUILD", "PATCH"), identity["chromium_version"].split("."))) + "\n"
+        for relative, value in {
+            "chrome/VERSION": version,
+            "BUILD.gn": "group(\"fixture\") {}\n",
+            "out/Default/args.gn": f'target_cpu = "{arch}"\nis_debug = false\n',
+            "out/Default/build.ninja": "# tiny fixture\n",
+            "out/Default/.ninja_log": "# ninja log v5\n",
+            "out/Default/.ninja_deps": b"# ninjadeps\n\x04\x00\x00\x00",
+            "chrome/source.cc": "upstream\n",
+        }.items():
+            self.write(self.donor / relative, value)
+        self.write(self.donor / "out/Default/obj/output.o", b"object")
+        result = {
+            "owner": fetcher.OWNER, "status": "hit", "source": str(self.donor),
+            "destination": str(self.cache), "platform": platform, "arch": arch,
+            "manifest": manifest, "extraction_scope": fetcher.SOURCE_SCOPE,
+            "skipped_external_symlinks": 0, "external_symlink_paths": [],
+        }
+        self.write(self.cache / "result.json", json.dumps(result))
+        self.result = result
+
+    def invoke(self, phase="restore", cache=True):
+        return restore.run_restore(phase, self.platform, self.arch, self.work,
+                                   self.cache if cache else None, repo=self.repo)
+
+    def test_restore_moves_complete_source_and_writes_receipt(self):
+        source_mtime = (self.donor / "chrome/source.cc").stat().st_mtime_ns
+        output_mtime = (self.donor / "out/Default/obj/output.o").stat().st_mtime_ns
+        entry = self.invoke()
+        self.assertEqual(entry["status"], "hit", entry)
+        src = self.work / "src"
+        self.assertFalse(self.donor.exists())
+        self.assertTrue((src / "out/Default/build.ninja").exists())
+        self.assertEqual((src / "chrome/source.cc").stat().st_mtime_ns, source_mtime)
+        self.assertEqual((src / "out/Default/obj/output.o").stat().st_mtime_ns, output_mtime)
+        receipt = restore.verify_restored(self.work, "linux", "x64", self.repo)
+        self.assertEqual(receipt["owner"], restore.OWNER)
+        self.assertEqual(receipt["original_args"]["bytes"], len(receipt["original_args"]["text"].encode()))
+        self.assertFalse((src / ".chromix-source-ready").exists())
+        self.assertFalse((src / ".chromix-patches").exists())
+
+    def test_all_five_manifest_targets_restore(self):
+        for platform, arch in (("linux", "x64"), ("linux", "arm64"),
+                               ("macos", "x64"), ("macos", "arm64"), ("windows", "x64")):
+            with self.subTest(platform=platform, arch=arch):
+                self.make_cache(platform, arch)
+                self.work = Path(self.tmp.name) / f"work-{platform}-{arch}"
+                self.assertEqual(self.invoke()["status"], "hit")
+
+    def test_missing_cache_is_normal_miss_and_does_not_create_source(self):
+        shutil.rmtree(self.cache)
+        entry = self.invoke()
+        self.assertEqual(entry["status"], "miss")
+        self.assertFalse((self.work / "src").exists())
+        self.assertEqual(restore.main(["--phase", "restore", "--platform", "linux", "--arch", "x64",
+                                       "--workdir", str(self.work), "--cache-dir", str(self.cache)]), 0)
+
+    def test_existing_source_is_never_overwritten(self):
+        self.write(self.work / "src/keep", "canonical")
+        entry = self.invoke()
+        self.assertEqual(entry["status"], "miss")
+        self.assertEqual((self.work / "src/keep").read_text(), "canonical")
+        self.assertTrue(self.donor.exists())
+
+    def test_chromix_marker_and_unknown_omitted_link_are_rejected(self):
+        self.write(self.donor / ".chromix-patches", "must be prepared later")
+        entry = self.invoke()
+        self.assertEqual(entry["status"], "miss")
+        self.assertFalse(self.donor.exists())
+        self.make_cache()
+        self.result["skipped_external_symlinks"] = 1
+        self.result["external_symlink_paths"] = ["tree/build/src/unknown/tool"]
+        self.write(self.cache / "result.json", json.dumps(self.result))
+        self.assertEqual(self.invoke()["status"], "miss")
+        self.assertFalse(self.donor.exists())
+        self.assertFalse((self.work / "src").exists())
+
+    def test_mac_external_omissions_allow_exact_tools_and_xcode_links(self):
+        self.make_cache("macos", "arm64")
+        relative = [
+            "third_party/dawn/tools/golang/mac-arm64/bin/go",
+            "third_party/dawn/tools/golang/mac-amd64/bin/go",
+            "out/Default/sdk/xcode_links/MacOSX26.0.sdk",
+            "out/Default/sdk/xcode_links/MacOSX26.sdk",
+            "out/Default/sdk/xcode_links/MacOSX26.0.1.sdk",
+            "out/Default/sdk/xcode_links/MacOSX.sdk",
+            "out/Default/sdk/xcode_links/MacOSX.platform",
+            "out/Default/sdk/xcode_links/XcodeDefault.xctoolchain",
+        ]
+        archive_paths = [f"tree/src/{name}" for name in relative]
+        self.result.update(skipped_external_symlinks=len(archive_paths),
+                           external_symlink_paths=archive_paths)
+        self.write(self.cache / "result.json", json.dumps(self.result))
+        entry = self.invoke()
+        self.assertEqual(entry["status"], "hit", entry)
+        self.assertEqual(entry["receipt"]["external_symlink_paths"], sorted(relative))
+        self.assertFalse(any((self.work / "src" / name).exists() for name in relative))
+        self.assertEqual(self.invoke("verify", cache=False)["status"], "verified")
+        for name in relative:
+            self.write(self.work / "src" / name, "host link regenerated by GN")
+        self.assertEqual(self.invoke("verify", cache=False)["status"], "verified")
+
+    def test_mac_external_omissions_reject_unknown_or_nested_xcode_paths(self):
+        self.make_cache("macos", "x64")
+        for name in ("third_party/dawn/tools/golang/mac-x64/bin/go",
+                     "out/Default/sdk/xcode_links/MacOSX26.sdk/Headers",
+                     "out/Default/sdk/xcode_links/MacOSX26.0.sdk/Headers",
+                     "out/Default/sdk/xcode_links/MacOSX26.beta.sdk",
+                     "out/Default/sdk/xcode_links/MacOSX26..0.sdk",
+                     "out/Default/sdk/xcode_links/MacOSX26.0.sdk.extra",
+                     "out/Default/sdk/xcode_links/MacOSX.platform/Headers",
+                     "out/Default/sdk/xcode_links/../MacOSX26.0.sdk",
+                     "out/Default/sdk/xcode_links/MacOSX26.0.sdk\\evil",
+                     "out/Default/sdk/xcode_links/XcodeDefault.xctoolchain/bin/clang"):
+            with self.subTest(name=name):
+                self.make_cache("macos", "x64")
+                archive_name = "tree/src/" + name
+                self.result.update(skipped_external_symlinks=1,
+                                   external_symlink_paths=[archive_name])
+                self.write(self.cache / "result.json", json.dumps(self.result))
+                self.assertEqual(self.invoke()["status"], "miss")
+                self.assertFalse(self.donor.exists())
+
+    def test_non_macos_cannot_use_macos_external_omissions(self):
+        name = "tree/build/src/third_party/dawn/tools/golang/mac-arm64/bin/go"
+        self.result.update(skipped_external_symlinks=1, external_symlink_paths=[name])
+        self.write(self.cache / "result.json", json.dumps(self.result))
+        self.assertEqual(self.invoke()["status"], "miss")
+        self.assertFalse(self.donor.exists())
+
+    def test_real_core_mac_and_windows_flags_concatenation_last_wins(self):
+        core = (
+            "chrome_pgo_phase=0\nclang_use_chrome_plugins=false\n"
+            "disable_fieldtrial_testing_config=true\nenable_hangout_services_extension=false\n"
+            "enable_mdns=false\nenable_remoting=false\nenable_reporting=false\n"
+            "enable_service_discovery=false\nenable_widevine=true\nexclude_unwind_tables=true\n"
+            'google_api_key=""\ngoogle_default_client_id=""\ngoogle_default_client_secret=""\n'
+            "safe_browsing_mode=0\ntreat_warnings_as_errors=false\n"
+            "use_official_google_api_keys=false\nuse_unofficial_version_number=false\n"
+            "v8_drumbrake_bounds_checks=true\n")
+        mac = (
+            "blink_symbol_level=0\nchrome_pgo_phase=2\nenable_iterator_debugging=false\n"
+            "enable_mse_mpeg2ts_stream_parser=true\nenable_rust=true\nenable_swiftshader=true\n"
+            'enable_updater=false\nfatal_linker_warnings=false\nffmpeg_branding="Chrome"\n'
+            "is_clang=true\nis_debug=false\nis_official_build=true\nproprietary_codecs=true\n"
+            "symbol_level=1\nuse_thin_lto=true\nuse_sysroot=false\n")
+        windows = (
+            'chrome_pgo_phase=2\nenable_swiftshader=false\nffmpeg_branding="Chrome"\n'
+            "is_clang=true\nis_component_build=false\nis_debug=false\nis_official_build=true\n"
+            'proprietary_codecs=true\ntarget_cpu="x64"\nuse_sysroot=false\ndcheck_always_on=false\n'
+            "blink_symbol_level=0\nv8_symbol_level=0\nsymbol_level=0\nenable_rust=true\n"
+            "enable_mse_mpeg2ts_stream_parser=true\n")
+        from tools import merge_gn_args
+        for platform, arch, flags in (("macos", "x64", mac), ("macos", "arm64", mac),
+                                      ("windows", "x64", windows)):
+            with self.subTest(platform=platform, arch=arch):
+                self.make_cache(platform, arch)
+                self.work = Path(self.tmp.name) / f"work-{platform}-{arch}"
+                raw = core + flags + f'target_cpu="{arch}"\n'
+                path = self.donor / "out/Default/args.gn"
+                self.write(path, raw)
+                _, merged = merge_gn_args.parse(path)
+                entry = self.invoke()
+                self.assertEqual(entry["status"], "hit", entry)
+                args = entry["receipt"]["original_args"]
+                self.assertEqual(args["text"], raw)
+                self.assertEqual(args["assignments"]["chrome_pgo_phase"], "2")
+                self.assertEqual(args["assignments"]["target_cpu"], json.dumps(arch))
+                for key, value in merged.items():
+                    parsed = json.loads(value.split("=", 1)[1])
+                    self.assertEqual(args["assignments"][key], json.dumps(parsed, separators=(",", ":")))
+                self.assertEqual(self.invoke("verify", cache=False)["status"], "verified")
+
+    def test_gn_last_arch_mismatch_and_invalid_overridden_values_reject(self):
+        for text in (
+                'target_cpu="arm64"\ntarget_cpu="x64"\n',
+                'target_cpu="arm64"\nv8_target_cpu="arm64"\nv8_target_cpu="x64"\n',
+                'target_cpu=getenv("ARCH")\ntarget_cpu="arm64"\n',
+                'bad=true || false\nbad=true\ntarget_cpu="arm64"\n',
+                'target_cpu="arm64" + "x"\n', 'target_cpu=["arm64",]\n',
+                'target_cpu={"cpu":"arm64"}\n', 'target_cpu=null\n',
+                'target_cpu="arm64"\nchrome_pgo_phase=2.5\n',
+                'target_cpu="arm64"\nimport("execute.gni")\n'):
+            with self.subTest(text=text):
+                self.make_cache("macos", "arm64")
+                self.write(self.donor / "out/Default/args.gn", text)
+                entry = self.invoke()
+                self.assertEqual(entry["status"], "miss", entry)
+                self.assertFalse(self.donor.exists())
+
+    def test_gn_literal_comments_and_lists_do_not_evaluate_expressions(self):
+        path = Path(self.tmp.name) / "args.gn"
+        self.write(path, '# core\nchrome_pgo_phase = 0\n# platform\nchrome_pgo_phase = 2 # override\n'
+                   'literal = ["a", 1, false]\nsigned = -1\n')
+        self.assertEqual(restore.gn_assignments_last_wins(path), {
+            "chrome_pgo_phase": "2", "literal": '["a",1,false]', "signed": "-1"})
+
+    def test_owned_validated_miss_cleans_only_tree_and_records_diagnostic(self):
+        self.write(self.donor / "out/Default/args.gn", "target_cpu = \"arm64\"\n")
+        entry = self.invoke()
+        self.assertEqual(entry["status"], "miss")
+        self.assertEqual(entry["cleanup"]["status"], "removed", entry)
+        self.assertFalse((self.cache / "tree").exists())
+        self.assertTrue((self.cache / "result.json").is_file())
+        self.assertEqual(json.loads((self.cache / "result.json").read_text())["status"], "miss")
+        self.assertIn("cleanup", json.loads((self.work / restore.REPORT).read_text()))
+
+    def test_unowned_or_prevalidation_miss_preserves_tree(self):
+        self.result["owner"] = "not-chromix"
+        self.write(self.cache / "result.json", json.dumps(self.result))
+        entry = self.invoke()
+        self.assertEqual(entry["status"], "miss")
+        self.assertEqual(entry["cleanup"]["status"], "preserved")
+        self.assertTrue(self.donor.exists())
+
+    def test_verify_requires_current_pins(self):
+        self.assertEqual(self.invoke()["status"], "hit")
+        manifest = json.loads((self.repo / "build/upstream-cache.json").read_text())
+        manifest["chromium_version"] = "0.0.0.0"
+        (self.repo / "build/upstream-cache.json").write_text(json.dumps(manifest))
+        with self.assertRaises(restore.Miss):
+            restore.verify_restored(self.work, "linux", "x64", self.repo)
+
+    def test_is_restored_absent_and_present(self):
+        self.assertIsNone(restore.is_restored(self.work, "linux", "x64", self.repo))
+        self.assertEqual(self.invoke()["status"], "hit")
+        self.assertEqual(restore.is_restored(self.work, "linux", "x64", self.repo)["status"], "restored")
+
+    def test_receipt_owner_provenance_digest_scope_and_target_rejections(self):
+        cases = [("owner", "other-tool"), ("status", "miss"), ("destination", "/elsewhere"),
+                 ("platform", "macos"), ("arch", "arm64"),
+                 ("extraction_scope", fetcher.TOOLCHAIN_SCOPE)]
+        for field, value in cases:
+            with self.subTest(field=field):
+                self.make_cache()
+                self.result[field] = value
+                self.write(self.cache / "result.json", json.dumps(self.result))
+                self.assertEqual(self.invoke()["status"], "miss")
+                self.assertTrue(self.donor.exists())
+                self.assertFalse((self.work / "src").exists())
+        for field in ("sha256", "artifact_digest", "artifact_id", "head_sha", "run_id", "repository", "target"):
+            with self.subTest(manifest=field):
+                self.make_cache()
+                self.result["manifest"][field] = "incorrect"
+                self.write(self.cache / "result.json", json.dumps(self.result))
+                self.assertEqual(self.invoke()["status"], "miss")
+                self.assertTrue(self.donor.exists())
+
+    def test_incomplete_source_invalid_args_and_broken_ninja_metadata_miss(self):
+        for relative in restore.REQUIRED:
+            with self.subTest(missing=relative):
+                self.make_cache()
+                (self.donor / relative).unlink()
+                entry = self.invoke()
+                self.assertEqual(entry["status"], "miss")
+                self.assertEqual(self.donor.exists(), relative == "chrome/VERSION")
+        for args in ('is_debug = false\n', 'target_cpu = "arm64"\n',
+                     'target_cpu = getenv("ARCH")\n', 'target_cpu = "x64"\nv8_target_cpu = "arm64"\n'):
+            with self.subTest(args=args):
+                self.make_cache()
+                self.write(self.donor / "out/Default/args.gn", args)
+                self.assertEqual(self.invoke()["status"], "miss")
+        for relative in (".ninja_log", ".ninja_deps"):
+            self.make_cache()
+            self.write(self.donor / "out/Default" / relative, "broken metadata")
+            self.assertEqual(self.invoke()["status"], "miss")
+
+    def test_known_host_links_are_recorded_without_recreating_them(self):
+        paths = ["tree/build/src/" + name for name in sorted(restore.HOST_LINKS)]
+        self.result.update(skipped_external_symlinks=len(paths), external_symlink_paths=paths)
+        self.write(self.cache / "result.json", json.dumps(self.result))
+        entry = self.invoke()
+        self.assertEqual(entry["status"], "hit", entry)
+        self.assertEqual(entry["receipt"]["external_symlink_paths"], sorted(restore.HOST_LINKS))
+        self.assertEqual(entry["receipt"]["archive_external_symlink_paths"], paths)
+        for relative in restore.HOST_LINKS:
+            self.assertFalse((self.work / "src" / relative).exists())
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary)
+            donor = cache / "tree/build/src"
+            donor.mkdir(parents=True)
+            restore.importer.preserve_external_tool_lookups(cache, donor, self.result)
+            created = {path.relative_to(donor).as_posix() for path in donor.rglob("*") if path.is_file()}
+            self.assertEqual(created, restore.HOST_LINKS)
+
+    def test_incomplete_duplicate_or_traversing_omission_lists_miss(self):
+        name = "tree/build/src/" + sorted(restore.HOST_LINKS)[0]
+        for count, paths in ((1, []), (0, [name]), (2, [name, name]), (True, [name]),
+                             (1, ["../escape"]), (1, ["/absolute"]), (1, [42])):
+            with self.subTest(count=count, paths=paths):
+                self.make_cache()
+                self.result.update(skipped_external_symlinks=count, external_symlink_paths=paths)
+                self.write(self.cache / "result.json", json.dumps(self.result))
+                self.assertEqual(self.invoke()["status"], "miss")
+                self.assertFalse(self.donor.exists())
+
+    def test_locked_resume_and_unowned_caches_are_not_consumed_or_deleted(self):
+        for kind in ("lock", "resume", "unexpected"):
+            with self.subTest(kind=kind):
+                path = {"lock": self.cache / ".lock", "resume": self.work / ".chromix-resumed",
+                        "unexpected": self.cache / "keep"}[kind]
+                self.write(path, "owned elsewhere")
+                self.assertEqual(self.invoke()["status"], "miss")
+                self.assertEqual(path.read_text(), "owned elsewhere")
+                self.assertTrue(self.donor.exists())
+                path.unlink()
+
+    def test_local_overlaps_and_symlinks_are_errors(self):
+        for cache in (self.work, self.work.parent, self.work / "src/cache", self.repo):
+            with self.subTest(cache=cache), self.assertRaises(restore.LocalError):
+                restore.restore(self.work, "linux", "x64", cache, self.repo)
+        with self.assertRaises(restore.LocalError):
+            restore.restore(self.work, "windows", "arm64", self.cache, self.repo)
+        outside = Path(self.tmp.name) / "outside"
+        outside.mkdir()
+        self.work.mkdir(exist_ok=True)
+        for name in ("src", restore.REPORT):
+            path = self.work / name
+            path.symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(restore.LocalError):
+                self.invoke()
+            self.assertEqual(list(outside.iterdir()), [])
+            path.unlink()
+        alias = Path(self.tmp.name) / "alias"
+        alias.symlink_to(self.cache, target_is_directory=True)
+        with self.assertRaises(restore.LocalError):
+            restore.restore(self.work, "linux", "x64", alias, self.repo)
+
+    def test_source_escape_and_external_donor_symlinks_do_not_touch_outside(self):
+        outside = Path(self.tmp.name) / "outside"
+        self.write(outside / "keep", "outside")
+        self.result["source"] = str(outside)
+        self.write(self.cache / "result.json", json.dumps(self.result))
+        self.assertEqual(self.invoke()["status"], "miss")
+        self.make_cache()
+        (self.donor / "external").symlink_to(outside, target_is_directory=True)
+        self.assertEqual(self.invoke()["status"], "miss")
+        self.assertEqual((outside / "keep").read_text(), "outside")
+        self.assertFalse(self.donor.exists())
+
+    def test_internal_links_modes_mtimes_logs_and_raw_args_are_preserved(self):
+        alias = self.donor / "chrome/alias.cc"
+        alias.symlink_to("source.cc")
+        self.write(self.donor / "out/Default/args.gn", b'# raw args\r\ntarget_cpu = "x64"\r\n')
+        self.write(self.donor / "tools/never-run", "raise RuntimeError('must not run')", 0o755)
+        before = {}
+        for path in self.donor.rglob("*"):
+            info = path.lstat()
+            before[path.relative_to(self.donor)] = (info.st_mtime_ns, stat.S_IMODE(info.st_mode),
+                                                   path.read_bytes() if path.is_file() else None)
+        with mock.patch("subprocess.run", side_effect=AssertionError("no donor execution")), \
+                mock.patch.object(restore.shutil, "move", wraps=shutil.move) as move:
+            entry = self.invoke()
+        self.assertEqual(entry["status"], "hit", entry)
+        move.assert_called_once()
+        for relative, expected in before.items():
+            path = self.work / "src" / relative
+            info = path.lstat()
+            self.assertEqual((info.st_mtime_ns, stat.S_IMODE(info.st_mode),
+                              path.read_bytes() if path.is_file() else None), expected, relative)
+        self.assertEqual(os.readlink(self.work / "src/chrome/alias.cc"), "source.cc")
+        self.assertIn("\r\n", entry["receipt"]["original_args"]["text"])
+        self.assertIs(entry["receipt"]["environment"]["cache_hit_proven"], False)
+        self.assertEqual(json.loads((self.cache / "result.json").read_text())["status"], "consumed")
+        self.assertEqual([p.name for p in (self.work / "src").glob(".chromix*")], [restore.MARKER])
+
+    def test_cleanup_rechecks_receipt_and_top_level_entries(self):
+        original = restore.source_args
+        for change in ("owner", "digest", "extra", "tree_link"):
+            with self.subTest(change=change):
+                self.make_cache()
+                outside = Path(self.tmp.name) / "outside-cleanup"
+                self.write(outside / "keep", "unowned")
+
+                def changed(src, identity):
+                    if change in ("owner", "digest"):
+                        changed_result = dict(self.result)
+                        if change == "owner":
+                            changed_result["owner"] = "another-tool"
+                        else:
+                            changed_result["manifest"] = dict(self.result["manifest"], sha256="changed")
+                        self.write(self.cache / "result.json", json.dumps(changed_result))
+                    elif change == "extra":
+                        self.write(self.cache / "keep", "unowned")
+                    else:
+                        shutil.rmtree(self.cache / "tree")
+                        (self.cache / "tree").symlink_to(outside, target_is_directory=True)
+                    raise restore.Miss("invalid source")
+
+                with mock.patch.object(restore, "source_args", side_effect=changed):
+                    entry = self.invoke()
+                self.assertEqual(entry["status"], "miss", entry)
+                self.assertEqual(entry["cleanup"]["status"], "failed", entry)
+                self.assertEqual((outside / "keep").read_text(), "unowned")
+                self.assertTrue((self.cache / "tree").exists())
+                if change == "tree_link":
+                    (self.cache / "tree").unlink()
+        self.assertIs(restore.source_args, original)
+
+    def test_cleanup_delete_error_invalidates_hit_and_reports_remaining_tree(self):
+        self.write(self.donor / "out/Default/args.gn", 'target_cpu="arm64"\n')
+        with mock.patch.object(restore.shutil, "rmtree", side_effect=OSError("cannot remove tree")):
+            entry = self.invoke()
+        self.assertEqual(entry["status"], "miss")
+        self.assertEqual(entry["cleanup"]["status"], "failed", entry)
+        self.assertTrue(self.donor.exists())
+        self.assertFalse((self.cache / ".lock").exists())
+        result = json.loads((self.cache / "result.json").read_text())
+        self.assertEqual(result["status"], "miss")
+        self.assertIsNone(result["source"])
+
+    def test_cleanup_receipt_write_error_keeps_all_files(self):
+        self.write(self.donor / "out/Default/args.gn", 'target_cpu="arm64"\n')
+        write = restore.importer.write_json
+
+        def fail_receipt(path, value):
+            if path == self.cache / "result.json":
+                raise OSError("receipt not writable")
+            write(path, value)
+
+        with mock.patch.object(restore.importer, "write_json", side_effect=fail_receipt):
+            entry = self.invoke()
+        self.assertEqual(entry["cleanup"]["status"], "failed", entry)
+        self.assertTrue(self.donor.exists())
+        self.assertFalse((self.cache / ".lock").exists())
+        self.assertEqual(json.loads((self.cache / "result.json").read_text())["status"], "hit")
+
+    def test_cross_device_move_fallback_cannot_copy_or_remove_donor(self):
+        with mock.patch.object(restore.os, "rename", side_effect=OSError(errno.EXDEV, "different devices")):
+            entry = self.invoke()
+        self.assertEqual(entry["status"], "miss", entry)
+        self.assertIn("copy fallback is disabled", entry["reasons"][0])
+        self.assertEqual(entry["cleanup"]["status"], "preserved")
+        self.assertTrue(self.donor.exists())
+        self.assertFalse((self.work / "src").exists())
+        self.assertEqual(list(self.work.glob(".chromix-upstream-restore-*")), [])
+
+    def test_marker_failure_rolls_back_and_preserves_donor(self):
+        write_json = restore.importer.write_json
+
+        def fail_marker(path, value):
+            if path.name == restore.MARKER:
+                raise OSError("marker write failed")
+            write_json(path, value)
+
+        before = (self.donor / "out/Default/.ninja_deps").read_bytes()
+        with mock.patch.object(restore.importer, "write_json", side_effect=fail_marker):
+            entry = self.invoke()
+        self.assertEqual(entry["status"], "miss", entry)
+        self.assertTrue(self.donor.exists())
+        self.assertFalse((self.donor / restore.MARKER).exists())
+        self.assertEqual((self.donor / "out/Default/.ninja_deps").read_bytes(), before)
+        self.assertFalse((self.work / "src").exists())
+
+    def test_destination_appearing_during_restore_is_preserved(self):
+        move = shutil.move
+
+        def race(source, destination, **kwargs):
+            result = move(source, destination, **kwargs)
+            self.write(self.work / "src/keep", "another preparer")
+            return result
+
+        with mock.patch.object(restore.shutil, "move", side_effect=race):
+            with self.assertRaises(restore.LocalError):
+                self.invoke()
+        self.assertEqual((self.work / "src/keep").read_text(), "another preparer")
+        self.assertTrue(self.donor.exists())
+
+    def test_verify_does_not_require_cache_or_canonical_markers(self):
+        self.assertEqual(self.invoke()["status"], "hit")
+        shutil.rmtree(self.cache)
+        self.assertEqual(self.invoke("verify", cache=False)["status"], "verified")
+        self.assertEqual(restore.is_restored(self.work, repo=self.repo)["arch"], "x64")
+        self.write(self.work / "src/out/Default/args.gn", 'target_cpu = "x64"\nis_debug = true\n')
+        self.write(self.work / "src/.chromix-source-ready", "prep owns this")
+        receipt = restore.verify_restored(self.work, "linux", "x64", self.repo)
+        self.assertIn("is_debug = false", receipt["original_args"]["text"])
+
+    def test_verify_rejects_changed_receipt_version_arch_or_missing_build_state(self):
+        self.assertEqual(self.invoke()["status"], "hit")
+        marker = self.work / "src" / restore.MARKER
+        original = marker.read_text()
+        for field, value in (("owner", "other"), ("platform", "macos"), ("arch", "arm64"),
+                             ("manifest", {}), ("identity", {}), ("original_args", {})):
+            with self.subTest(field=field):
+                receipt = json.loads(original)
+                receipt[field] = value
+                marker.write_text(json.dumps(receipt))
+                with self.assertRaises(restore.Miss):
+                    restore.verify_restored(self.work, "linux", "x64", self.repo)
+        marker.write_text(original)
+        self.write(self.work / "src/chrome/VERSION", "MAJOR=1\nMINOR=0\nBUILD=0\nPATCH=0\n")
+        with self.assertRaises(restore.Miss):
+            restore.verify_restored(self.work, "linux", "x64", self.repo)
+        with self.assertRaises(restore.Miss):
+            restore.verify_restored(self.work, "linux", "arm64", self.repo)
+
+    def test_cli_verify_without_cache_and_unsafe_arguments_exit_nonzero(self):
+        command = [sys.executable, str(restore.REPO / "tools/restore_upstream_cache.py"),
+                   "--platform", "linux", "--arch", "x64", "--workdir", str(self.work)]
+        for args in (["--phase", "verify"], ["--phase", "restore"],
+                     ["--phase", "restore", "--cache-dir", str(self.work)]):
+            result = subprocess.run(command + args, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+        result = subprocess.run(command + ["--phase", "restore", "--cache-dir", str(self.cache)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("hit", result.stdout)
+        result = subprocess.run(command + ["--phase", "verify"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("verified", result.stdout)
+
+    @unittest.skipUnless(shutil.which("ninja") and shutil.which("tar") and os.name == "posix",
+                         "tiny Ninja/GNU tar fixture requires POSIX host tools")
+    def test_gnu_tar_repair_gives_second_ninja_no_work_without_changing_inputs_or_logs(self):
+        version = subprocess.run(["tar", "--version"], capture_output=True, text=True, check=True)
+        if "GNU tar" not in version.stdout:
+            self.skipTest("GNU tar required")
+        source_ns = (time.time_ns() // 10**9 - 60) * 10**9 + 123_456_789
+        source = self.donor / "chrome/source.cc"
+        os.utime(source, ns=(source_ns, source_ns))
+        script = ("from pathlib import Path\nimport sys\n"
+                  "source, target = map(Path, sys.argv[1:])\n"
+                  "target.parent.mkdir(parents=True, exist_ok=True)\n"
+                  "target.write_bytes(source.read_bytes())\n"
+                  "Path(str(target) + '.d').write_text(f'{target}: {source}\\n')\n")
+        self.write(self.donor / "emit.py", script)
+        self.write(self.donor / "out/Default/build.ninja",
+                   "rule generate\n  command = " + shlex.quote(sys.executable) + " ../../emit.py $in $out\n"
+                   "  depfile = $out.d\n  deps = gcc\n"
+                   "build obj/output.o: generate ../../chrome/source.cc\ndefault obj/output.o\n")
+        out = self.donor / "out/Default"
+        for name in (".ninja_log", ".ninja_deps", "obj/output.o"):
+            (out / name).unlink()
+        built = subprocess.run(["ninja", "-C", str(out)], capture_output=True, text=True)
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        output_ns = (out / "obj/output.o").stat().st_mtime_ns
+        if output_ns % 10**9 == 0:
+            self.skipTest("filesystem does not provide fractional output timestamps")
+        archive = Path(self.tmp.name) / "fixture.tar"
+        subprocess.run(["tar", "--format=gnu", "-cf", str(archive), "-C", str(self.cache / "tree"),
+                        self.donor.relative_to(self.cache / "tree").as_posix()], check=True)
+        shutil.rmtree(self.cache / "tree")
+        (self.cache / "tree").mkdir()
+        with archive.open("rb") as stream, mock.patch.object(fetcher, "require_space"):
+            fetcher.extract_tar(stream, self.cache / "tree", fetcher.SourceSelection(["build/src"]))
+        self.assertEqual((out / "obj/output.o").stat().st_mtime_ns, output_ns // 10**9 * 10**9)
+        before = {p.relative_to(self.donor): (p.read_bytes(), p.stat().st_mtime_ns)
+                  for p in self.donor.rglob("*") if p.is_file()}
+        subprocess.run(["ninja", "-C", str(out), "-n"], capture_output=True, text=True, check=True)
+        entry = self.invoke()
+        self.assertEqual(entry["status"], "hit", entry)
+        self.assertEqual(entry["receipt"]["ninja_mtimes"]["outputs_restored"], 1, entry)
+        src = self.work / "src"
+        for relative, (data, mtime) in before.items():
+            path = src / relative
+            self.assertEqual(path.read_bytes(), data)
+            self.assertEqual(path.stat().st_mtime_ns,
+                             output_ns if relative.as_posix() == "out/Default/obj/output.o" else mtime)
+        out = src / "out/Default"
+        second = subprocess.run(["ninja", "-C", str(out)], capture_output=True, text=True, check=True)
+        self.assertIn("no work to do", second.stdout)
+        self.assertEqual(restore.restore_ninja_output_mtimes(src)["outputs_restored"], 0)
+        graph = out / "build.ninja"
+        graph.write_text(graph.read_text().replace("../../emit.py", "-B ../../emit.py"))
+        dirty = subprocess.run(["ninja", "-C", str(out), "-n"], capture_output=True, text=True, check=True)
+        self.assertNotIn("no work to do", dirty.stdout)
+        os.utime(src / "chrome/source.cc", ns=(output_ns + 1, output_ns + 1))
+        self.assertEqual(restore.restore_ninja_output_mtimes(src)["outputs_restored"], 0)
+
+
+class NinjaTimestampTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.src = Path(self.tmp.name)
+        self.out = self.src / "out/Default"
+        (self.out / "obj").mkdir(parents=True)
+        self.output = self.out / "obj/a.o"
+        self.output.write_bytes(b"object")
+        self.input = self.src / "a.cc"
+        self.input.write_bytes(b"source")
+        self.recorded = 1_700_000_000_123_456_789
+        self.floor = self.recorded // 10**9 * 10**9
+        os.utime(self.input, ns=(self.floor - 10**9, self.floor - 10**9))
+        os.utime(self.output, ns=(self.floor, self.floor))
+        self.metadata()
+
+    def metadata(self, output="obj/a.o", dependency="../../a.cc", logged=None):
+        raw = bytearray(b"# ninjadeps\n\x04\x00\x00\x00")
+        for index, name in enumerate((output, dependency)):
+            name = name.encode()
+            payload = name + b"\0" * ((-len(name)) % 4) + struct.pack("<I", ~index & 0xffffffff)
+            raw += struct.pack("<I", len(payload)) + payload
+        record = struct.pack("<4I", 0, self.recorded & 0xffffffff, self.recorded >> 32, 1)
+        raw += struct.pack("<I", 0x80000000 | len(record)) + record
+        (self.out / ".ninja_deps").write_bytes(raw)
+        (self.out / ".ninja_log").write_text(
+            f"# ninja log v5\n0\t1\t{logged or self.recorded}\t{output}\t123456789abcdef0\n")
+
+    def test_exact_floor_only_and_hash_deps_input_unchanged(self):
+        before = [(p, p.read_bytes(), p.stat().st_mtime_ns)
+                  for p in (self.input, self.out / ".ninja_log", self.out / ".ninja_deps")]
+        result = restore.restore_ninja_output_mtimes(self.src)
+        self.assertEqual(result["outputs_restored"], 1, result)
+        self.assertEqual(self.output.stat().st_mtime_ns, self.recorded)
+        for path, content, mtime in before:
+            self.assertEqual(path.read_bytes(), content)
+            self.assertEqual(path.stat().st_mtime_ns, mtime)
+        for mtime in (self.floor - 10**9, self.floor + 1, self.recorded + 1, self.recorded):
+            os.utime(self.output, ns=(mtime, mtime))
+            self.assertEqual(restore.restore_ninja_output_mtimes(self.src)["outputs_restored"], 0)
+            self.assertEqual(self.output.stat().st_mtime_ns, mtime)
+
+    def test_newer_or_same_second_inputs_cannot_be_hidden(self):
+        for mtime in (self.floor, self.floor + 1, self.recorded + 1):
+            with self.subTest(mtime=mtime):
+                os.utime(self.input, ns=(mtime, mtime))
+                self.assertEqual(restore.restore_ninja_output_mtimes(self.src)["outputs_restored"], 0)
+                self.assertEqual(self.output.stat().st_mtime_ns, self.floor)
+                self.assertEqual(self.input.stat().st_mtime_ns, mtime)
+
+    def test_windows_dependency_paths_remain_unchanged_and_are_reported_as_skipped(self):
+        self.metadata(output=r"obj\a.obj", dependency=r"..\..\a.cc")
+        before = (self.out / ".ninja_deps").read_bytes()
+        result = restore.restore_ninja_output_mtimes(self.src)
+        self.assertEqual(result["outputs_restored"], 0)
+        self.assertEqual(result["skipped"], {"absolute or unsupported path": 1})
+        self.assertEqual((self.out / ".ninja_deps").read_bytes(), before)
+        self.assertEqual(self.output.stat().st_mtime_ns, self.floor)
+
+    def test_traversal_external_inputs_log_mismatch_and_hardlinks_are_skipped(self):
+        for output, dependency in (("../../a.cc", "../../a.cc"), ("/tmp/escape", "../../a.cc"),
+                                   ("obj/a.o", "/tmp/external"), ("obj/a.o", "../../absent")):
+            with self.subTest(output=output, dependency=dependency):
+                self.metadata(output, dependency)
+                self.assertEqual(restore.restore_ninja_output_mtimes(self.src)["outputs_restored"], 0)
+        self.metadata(logged=self.recorded - 1)
+        self.assertEqual(restore.restore_ninja_output_mtimes(self.src)["outputs_restored"], 0)
+        self.metadata()
+        os.link(self.output, self.src / "source-hardlink")
+        self.assertEqual(restore.restore_ninja_output_mtimes(self.src)["outputs_restored"], 0)
+        self.assertEqual(self.output.stat().st_mtime_ns, self.floor)
+
+
+if __name__ == "__main__":
+    unittest.main()

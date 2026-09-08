@@ -18,7 +18,13 @@ WORK="$(cd "$WORK" && pwd)"
 SRC="$WORK/src"
 OUT="$SRC/out/Chromix"
 "$REPO/build/prepare-ungoogled.sh" "$WORK" macos "$ARCH"
+if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
+  OUT="$SRC/out/Default"
+fi
 cd "$SRC"
+if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
+  bash "$REPO/build/posix/prepare-restored-tools.sh" "$WORK" macos "$ARCH"
+fi
 if [ ! -f "$SRC/.chromix-toolchain-ready" ]; then
   if [ -f "$SRC/.chromix-domain-substituted" ]; then
     echo "toolchain is incomplete in a domain-substituted source tree; use a clean work directory" >&2; exit 1
@@ -41,14 +47,16 @@ if [ "${CHROMIX_APPLY_DOMAIN_SUBSTITUTION:-1}" = 1 ] && [ ! -f "$SRC/.chromix-do
 fi
 mkdir -p "$OUT"
 printf 'target_cpu = "%s"\nv8_target_cpu = "%s"\n' "$ARCH" "$ARCH" > "$WORK/target.gn"
-python3 "$REPO/tools/merge_gn_args.py" "$OUT/args.gn" \
-  "$WORK/tooling/ungoogled-chromium/flags.gn" \
-  "$WORK/tooling/ungoogled-chromium-macos/flags.macos.gn" \
-  "$REPO/build/args.macos.gn" "$WORK/target.gn"
+GN_INPUTS=("$WORK/tooling/ungoogled-chromium/flags.gn"
+  "$WORK/tooling/ungoogled-chromium-macos/flags.macos.gn"
+  "$REPO/build/args.macos.gn" "$WORK/target.gn")
+if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
+  GN_INPUTS=("$OUT/args.gn" "${GN_INPUTS[@]}")
+fi
+python3 "$REPO/tools/merge_gn_args.py" "$OUT/args.gn" "${GN_INPUTS[@]}"
 if [ ! -x "$OUT/gn" ]; then
   python3 tools/gn/bootstrap/bootstrap.py -o "$OUT/gn" --skip-generate-buildfiles
 fi
-chromix_import_upstream_cache objects macos
 "$OUT/gn" gen "$OUT" --fail-on-unused-args
 chromix_report_upstream_plan chrome
 ninja -C "$OUT" -j "${CHROMIX_JOBS:-$(sysctl -n hw.ncpu)}" chrome

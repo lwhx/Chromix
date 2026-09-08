@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
-"""Fetch pinned upstream snapshots, never build or execute their contents.
+"""Fetch pinned upstream snapshots without building or executing their contents.
+
+The default extraction scope for every supported target is ``source-and-objects``:
+all files below the pinned source roots are retained, including source, ``out``,
+object/generated files, and Ninja state.  ``ToolchainSelection`` remains available
+for compatibility with older callers and tests, but is not used by ``fetch``.
+Extraction validates traversal, escaping, links, case collisions on case-folding
+platforms, and platform-specific path syntax.  POSIX targets may retain literal
+backslashes; Windows archives must use strict POSIX-style archive names. Absolute
+symlinks below the target's fixed upstream source root are rewritten as relative
+links only when their resolved targets exist in the archive. Other absolute links
+are omitted and recorded. The 300 GiB limit and disk-headroom checks still apply.
 
 GH_TOKEN authenticates GitHub API requests only. Availability/validation failures
 write a miss and exit zero; invalid arguments or destination paths exit nonzero.
 Linux/macOS require a host zstd executable. The destination must be dedicated to
 this tool; result.json records ownership and the absolute source path on a hit.
-Linux keeps the full pinned source root, including compiled objects and Ninja state.
-Windows/macOS keep only toolchains, update scripts, version markers, and donor args.
 """
 from __future__ import annotations
 
@@ -16,6 +25,7 @@ import hashlib
 import http.client
 import json
 import os
+import posixpath
 import re
 import shutil
 import stat
@@ -24,6 +34,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -52,6 +63,11 @@ SOURCES = {
     "linux": ("portablelinux", "UngoogledLinuxCommit", ["build/src"]),
     "macos": ("macos", "UngoogledMacOSCommit", ["src"]),
     "windows": ("windows", "UngoogledWindowsCommit", ["src", "build/src"]),
+}
+ORIGINAL_SOURCE_ROOTS = {
+    "linux": "/repo/build/src",
+    "macos": "/Users/runner/work/ungoogled-chromium-macos/ungoogled-chromium-macos/build/src",
+    "windows": "C:/ungoogled-chromium-windows/build/src",
 }
 
 
@@ -270,13 +286,18 @@ class GitHub:
 
 
 def safe_name(name, *, posix=False):
-    require(isinstance(name, str) and ("\\" not in name or posix and os.name == "posix") and ":" not in name
-            and not name.startswith("/") and not any(ord(c) < 32 for c in name), "unsafe_archive_path")
+    posix = posix and os.name == "posix"
+    require(isinstance(name, str) and not name.startswith("/")
+            and not any(ord(c) < 32 for c in name), "unsafe_archive_path")
+    if not posix:
+        require(not any(c in name for c in '\\:<>"|?*'), "unsafe_archive_path")
     parts = PurePosixPath(name).parts
     require(".." not in parts, "unsafe_archive_path")
-    for part in parts:
-        require(not part.endswith((".", " ")) and not re.fullmatch(
-            r"(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", part), "unsafe_archive_path")
+    if not posix:
+        for part in parts:
+            require(not part.endswith((".", " ")) and not re.fullmatch(
+                r"(?i)(CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])(?:\..*)?", part),
+                "unsafe_archive_path")
     return "/".join(parts)
 
 
@@ -304,7 +325,11 @@ def require_space(path, additional=0):
 
 
 class SourceSelection:
-    def __init__(self, source_roots):
+    """Keep complete pinned source roots, with the target's path restrictions."""
+
+    def __init__(self, source_roots, *, platform=None):
+        self.platform = platform
+        self.posix = platform != "windows" and os.name == "posix"
         self.trees = tuple(safe_name(root) for root in source_roots)
         require(self.trees and all(self.trees), "invalid_source_roots")
         self.parents = {str(parent) for root in self.trees
@@ -314,8 +339,27 @@ class SourceSelection:
         return (any(name == root or name.startswith(root + "/") for root in self.trees)
                 or (kind == "dir" and name in self.parents))
 
+    def remap_absolute(self, name, target):
+        original = ORIGINAL_SOURCE_ROOTS.get(self.platform)
+        if original is None:
+            return None
+        absolute = target.replace("\\", "/") if self.platform == "windows" else target
+        if absolute != original and not absolute.startswith(original + "/"):
+            return None
+        roots = [root for root in self.trees if root in SOURCES[self.platform][2]
+                 and (name == root or name.startswith(root + "/"))]
+        if not roots:
+            return None
+        require(len(roots) == 1, "ambiguous_internal_symlink")
+        suffix = absolute[len(original):].lstrip("/")
+        suffix = safe_name(suffix, posix=self.posix)
+        target_name = roots[0] + ("/" + suffix if suffix else "")
+        return posixpath.relpath(target_name, posixpath.dirname(name))
+
 
 class ToolchainSelection:
+    """Legacy toolchain-only selection for explicit callers, never the default."""
+
     def __init__(self, source_roots):
         self.files = tuple(f"{root}/{name}" for root in source_roots for name in
                            ("BUILD.gn", "chrome/VERSION", "out/Default/args.gn"))
@@ -362,6 +406,10 @@ class Extractor:
     def __init__(self, root, selection=None):
         self.root = root
         self.selection = selection
+        self.posix = isinstance(selection, SourceSelection) and selection.posix and os.name == "posix"
+        platform = getattr(selection, "platform", None)
+        self.case_insensitive = platform in ("windows", "macos") or os.name == "nt" or sys.platform == "darwin"
+        self.cases = {}
         self.names = {}
         self.parents = set()
         self.directories = {}
@@ -370,9 +418,21 @@ class Extractor:
         self.archive_bytes = 0
         self.skipped = 0
         self.external_symlinks = []
+        self.remapped_symlinks = {}
 
     def safe_name(self, name):
-        return safe_name(name, posix=isinstance(self.selection, SourceSelection))
+        return safe_name(name, posix=self.posix)
+
+    def check_case(self, name, *, register=False):
+        if not self.case_insensitive:
+            return
+        parts = name.split("/")
+        for end in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:end])
+            key = unicodedata.normalize("NFD", prefix).casefold()
+            require(self.cases.get(key, prefix) == prefix, "archive_case_collision")
+            if register:
+                self.cases[key] = prefix
 
     def selected(self, name, kind="file"):
         return self.selection is None or self.selection(name, kind)
@@ -391,6 +451,7 @@ class Extractor:
             require(kind == "dir", "empty_archive_path")
             return
         require(name not in self.names and len(self.names) < MAX_MEMBERS, "duplicate_archive_path")
+        self.check_case(name, register=True)
         require(kind in ("file", "dir", "sym", "hard") and size >= 0, "unsupported_archive_member")
         require(kind == "dir" or name not in self.parents, "archive_link_collision")
         for parent in PurePosixPath(name).parents:
@@ -438,11 +499,19 @@ class Extractor:
     def validate_links(self):
         symlinks = {name: target for name, kind, target, _, _ in self.links if kind == "sym"}
         hardlinks = {}
+        resolved_symlinks = {}
         for name, kind, target, _, _ in self.links:
-            require(target and "\x00" not in target and "\\" not in target
-                    and ":" not in target, "unsafe_link")
+            require(isinstance(target, str) and target and not any(ord(c) < 32 for c in target), "unsafe_link")
+            if kind == "sym" and isinstance(self.selection, SourceSelection):
+                remapped = self.selection.remap_absolute(name, target)
+                if remapped is not None:
+                    self.remapped_symlinks[name] = target = remapped
+                    symlinks[name] = target
+            for part in target.split("/"):
+                if part not in ("", ".", ".."):
+                    self.safe_name(part)
             if kind == "hard":
-                hardlinks[name] = safe_name(target)
+                hardlinks[name] = self.safe_name(target)
                 require(hardlinks[name], "unsafe_link")
         for name, target in symlinks.items():
             retained = self.selection is not None and self.selected(name)
@@ -458,9 +527,10 @@ class Extractor:
                     require(resolved, "escaping_symlink")
                     resolved.pop()
                     continue
-                safe_name(part)
+                self.safe_name(part)
                 resolved.append(part)
                 link_name = "/".join(resolved)
+                self.check_case(link_name)
                 link = symlinks.get(link_name)
                 if link is not None:
                     require(not link.startswith("/"), "external_symlink_chain")
@@ -469,13 +539,20 @@ class Extractor:
                     require(expansions <= 128, "cyclic_symlink")
                     resolved.pop()
                     pending.extendleft(reversed(PurePosixPath(link).parts))
+                elif pending and name in self.remapped_symlinks:
+                    require(self.names.get(link_name) == "dir" or link_name in self.parents,
+                            "missing_internal_symlink_target")
             target_name = "/".join(resolved)
             require(not retained or self.selected(target_name), "excluded_link_target")
+            if name in self.remapped_symlinks:
+                require(target_name in self.names or target_name in self.parents, "missing_internal_symlink_target")
+            resolved_symlinks[name] = target_name
         for name, target in hardlinks.items():
             seen = {name}
             while True:
                 require(target not in seen, "unresolved_hardlink")
                 seen.add(target)
+                self.check_case(target)
                 require(not (self.selection and self.selected(name)) or self.selected(target),
                         "excluded_link_target")
                 for parent in PurePosixPath(target).parents:
@@ -485,11 +562,13 @@ class Extractor:
                     require(kind == "file", "unsafe_hardlink")
                     break
                 target = hardlinks[target]
+        return resolved_symlinks
 
     def finish(self):
-        self.validate_links()
+        resolved_symlinks = self.validate_links()
         hard = []
         for name, kind, target, mode, mtime_ns in self.links:
+            target = self.remapped_symlinks.get(name, target)
             if kind == "sym" and target.startswith("/"):
                 self.skipped += 1
                 if self.selected(name):
@@ -501,19 +580,13 @@ class Extractor:
             path.parent.mkdir(parents=True, exist_ok=True)
             require(not path.exists() and not path.is_symlink(), "archive_link_collision")
             if kind == "hard":
-                target_name = safe_name(target)
+                target_name = self.safe_name(target)
                 require(target_name, "unsafe_link")
                 hard.append((path, target_name))
                 continue
-            combined = list(PurePosixPath(name).parent.parts)
-            for part in PurePosixPath(target).parts:
-                if part == "..":
-                    require(combined, "escaping_symlink")
-                    combined.pop()
-                else:
-                    safe_name(part)
-                    combined.append(part)
-            os.symlink(target, path, target_is_directory=(self.root / "/".join(combined)).is_dir())
+            target_name = resolved_symlinks[name]
+            is_directory = not target_name or self.names.get(target_name) == "dir" or target_name in self.parents
+            os.symlink(target, path, target_is_directory=is_directory)
             self.metadata(path, mode, mtime_ns, symlink=True)
         while hard:
             pending = []
@@ -531,7 +604,8 @@ class Extractor:
             self.metadata(self.path(name), *self.directories[name])
         return {"extracted_bytes": self.bytes, "members": len(self.names),
                 "skipped_external_symlinks": self.skipped,
-                "external_symlink_paths": self.external_symlinks}
+                "external_symlink_paths": self.external_symlinks,
+                "remapped_internal_symlinks": len(self.remapped_symlinks)}
 
 
 def extract_tar(stream, tree, selection=None):
@@ -669,7 +743,7 @@ def cleanup(destination):
 
 def fetch(platform, arch, destination, run_id=None, root=ROOT, client=None):
     started = time.monotonic()
-    scope = SOURCE_SCOPE if platform == "linux" else TOOLCHAIN_SCOPE
+    scope = SOURCE_SCOPE
     destination, previous = destination_path(str(destination))
     lock = destination / ".lock"
     try:
@@ -680,7 +754,8 @@ def fetch(platform, arch, destination, run_id=None, root=ROOT, client=None):
     result = {"owner": OWNER, "status": "miss", "source": None, "destination": str(destination),
               "platform": platform, "arch": arch, "manifest": {"path": str(root / "build/upstream-cache.json")},
               "download_bytes": 0, "inner_bytes": 0, "extracted_bytes": 0,
-              "skipped_external_symlinks": 0, "duration_seconds": 0,
+              "skipped_external_symlinks": 0, "remapped_internal_symlinks": 0,
+              "duration_seconds": 0,
               "extraction_scope": scope}
     try:
         if previous is None:
@@ -713,9 +788,8 @@ def fetch(platform, arch, destination, run_id=None, root=ROOT, client=None):
             result["download_bytes"] = client.download(pin, outer)
             result["inner_bytes"] = unpack_outer(outer, inner, pin["artifact"]["inner_archive"])
             outer.unlink()
-            selection = SourceSelection if platform == "linux" else ToolchainSelection
             result.update(extract_inner(inner, destination / "tree", zstd,
-                                        selection(pin["source_roots"])))
+                                        SourceSelection(pin["source_roots"], platform=platform)))
             inner.unlink()
             result["source"] = str(source_path(destination / "tree", pin))
             result["status"] = "hit"

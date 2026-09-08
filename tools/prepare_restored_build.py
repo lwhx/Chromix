@@ -1,0 +1,569 @@
+#!/usr/bin/env python3
+"""Check restored host tools and invalidate outputs without discarding Ninja state."""
+from __future__ import annotations
+
+import argparse
+import configparser
+import hashlib
+import json
+import os
+from pathlib import Path, PureWindowsPath
+import platform as host_platform
+import re
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+
+try:
+    from .import_upstream_cache import CLANG, RUST, Miss, digest_file
+    from .restore_upstream_cache import linked, verify_restored
+    from .upstream_object_cache import ninja_deps, ninja_log, write_json
+    from .upstream_script_identity import ENDPOINTS
+except ImportError:
+    from import_upstream_cache import CLANG, RUST, Miss, digest_file
+    from restore_upstream_cache import linked, verify_restored
+    from upstream_object_cache import ninja_deps, ninja_log, write_json
+    from upstream_script_identity import ENDPOINTS
+
+ROOT = Path(__file__).resolve().parents[1]
+MARKER = ".chromix-restored-build-prepared.json"
+INSPECTION = ".chromix-restored-build-inspection.json"
+SCHEMA = 2
+COMPILED_SUFFIXES = {".o", ".obj", ".a", ".lib", ".rlib", ".rmeta", ".pch", ".gch", ".pcm", ".bc"}
+METADATA = {"args.gn", "build.ninja", ".ninja_deps", ".ninja_log"}
+
+
+def inside_path(root: Path, relative: str, *, output=False) -> Path | None:
+    value = relative.replace("\\", "/")
+    if (not value or "\0" in value or Path(value).is_absolute()
+            or PureWindowsPath(value).drive or ":" in value):
+        return None
+    parts = Path(value).parts
+    if output and (".." in parts or {part.lower() for part in parts} & {"sdk", "xcode_links"}
+                   or Path(value).name in METADATA or value.endswith(".ninja")):
+        return None
+    path = root / value
+    try:
+        if not path.resolve().is_relative_to(root.resolve()):
+            return None
+        if output and any(linked(parent) for parent in (path, *path.parents)):
+            return None
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return path
+
+
+def host_identity() -> tuple[str, str]:
+    system = {"Linux": "linux", "Darwin": "macos", "Windows": "windows"}.get(host_platform.system(), "unknown")
+    machine = host_platform.machine().lower()
+    return system, {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64"}.get(machine, machine)
+
+
+def binary_architectures(path: Path, platform: str) -> set[str]:
+    """Read executable headers only; never execute a foreign architecture."""
+    cpus = {"linux": {62: "x64", 183: "arm64"},
+            "macos": {0x1000007: "x64", 0x100000C: "arm64"},
+            "windows": {0x8664: "x64", 0xAA64: "arm64"}}[platform]
+    with path.open("rb") as stream:
+        header = stream.read(64)
+        if platform == "linux" and header[:6] == b"\x7fELF\x02\x01" and len(header) >= 20:
+            cpu = struct.unpack_from("<H", header, 18)[0]
+        elif platform == "macos" and header[:4] == b"\xcf\xfa\xed\xfe" and len(header) >= 8:
+            cpu = struct.unpack_from("<I", header, 4)[0]
+        elif (platform == "macos" and len(header) >= 8
+              and header[:4] in (b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf")):
+            count = struct.unpack_from(">I", header, 4)[0]
+            if count > 32:
+                return set()
+            width = 32 if header[:4] == b"\xca\xfe\xba\xbf" else 20
+            stream.seek(8)
+            entries = stream.read(count * width)
+            if len(entries) != count * width:
+                return set()
+            return {cpus[cpu] for offset in range(0, len(entries), width)
+                    if (cpu := struct.unpack_from(">I", entries, offset)[0]) in cpus}
+        elif platform == "windows" and header[:2] == b"MZ" and len(header) == 64:
+            stream.seek(struct.unpack_from("<I", header, 60)[0])
+            pe = stream.read(6)
+            if len(pe) != 6 or pe[:4] != b"PE\0\0":
+                return set()
+            cpu = struct.unpack_from("<H", pe, 4)[0]
+        else:
+            return set()
+    return {cpus[cpu]} if cpu in cpus else set()
+
+
+def tool_paths(platform: str, arch: str) -> dict[str, Path]:
+    suffix = ".exe" if platform == "windows" else ""
+    clang = {"linux": ("clang", "clang++", "llvm-ar", "llvm-nm", "ld.lld"),
+             "macos": ("clang", "clang++", "llvm-ar", "ld64.lld"),
+             "windows": ("clang-cl", "lld-link", "llvm-ml")}[platform]
+    paths = {name: CLANG / "bin" / (name + suffix) for name in clang}
+    paths.update({name: RUST / "bin" / (name + suffix) for name in ("rustc", "cargo", "bindgen")})
+    node = {"linux": "linux/node-linux-x64/bin/node", "windows": "win/node.exe",
+            "macos": "mac_arm64/node-darwin-arm64/bin/node" if arch == "arm64" else "mac/node-darwin-x64/bin/node"}[platform]
+    paths.update(node=Path("third_party/node") / node, gn=Path("out/Default") / ("gn" + suffix))
+    return paths
+
+
+def inspect_native_tools(src: Path, platform: str, arch: str) -> dict:
+    system, machine = host_identity()
+    native_host = (system, machine) == (platform, arch)
+    tools = {}
+    for name, relative in tool_paths(platform, arch).items():
+        path = src / relative
+        entry = {"path": relative.as_posix(), "native": False, "architectures": [], "exists": path.is_file(),
+                 "file_identity": _stat_identity(path)}
+        try:
+            architectures = binary_architectures(path, platform)
+            entry["architectures"] = sorted(architectures)
+            entry["wrong_host"] = bool(architectures and machine not in architectures)
+            if not native_host or machine not in architectures:
+                raise ValueError("binary does not match the native runner")
+            if platform != "windows" and not os.access(path, os.X_OK):
+                raise ValueError("tool is not executable")
+            probe_arg = "/?" if name == "llvm-ml" else "--version"
+            entry["probe_argument"] = probe_arg
+            completed = subprocess.run([str(path), probe_arg], cwd=src, text=True,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       timeout=30, check=False)
+            entry["version"] = completed.stdout.strip()[:2000]
+            if completed.returncode:
+                raise ValueError(f"{probe_arg} exited {completed.returncode}")
+            entry["native"] = True
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            entry["reason"] = str(error)
+        tools[name] = entry
+    return {"native_tools": all(value["native"] for value in tools.values()),
+            "toolchains_native": all(value["native"] for name, value in tools.items() if name not in ("node", "gn")),
+            "compilers_native": all(value["native"] for name, value in tools.items() if name not in ("node", "gn", "bindgen")),
+            "host_mismatch": any(value.get("wrong_host", False) for value in tools.values()),
+            "host": {"platform": system, "arch": machine}, "tools": tools}
+
+
+def validate_native_tools(src: Path, platform: str, arch: str) -> dict:
+    # verify_restored supplies provenance, not Chromium's compiler stamp format.
+    return inspect_native_tools(src, platform, arch)
+
+
+def _safe_file(root: Path, name: str) -> Path:
+    path = inside_path(root, name, output=True)
+    if path is None:
+        raise ValueError(f"linked or unsafe preparation path: {name}")
+    return path
+
+
+def _read_marker(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or value.get("schema_version") != SCHEMA:
+        raise ValueError(f"invalid restored preparation marker: {path.name}")
+    return value
+
+
+def _stat_identity(path: Path) -> dict:
+    try:
+        info = path.stat()
+        return {"path": str(path.resolve()), "size": info.st_size, "mtime_ns": info.st_mtime_ns}
+    except (OSError, RuntimeError):
+        return {"path": str(path), "missing": True}
+
+
+def environment_identity(src: Path, platform: str) -> dict:
+    keys = ("ImageOS", "ImageVersion", "RUNNER_OS", "RUNNER_ARCH", "RUNNER_NAME",
+            "GITHUB_JOB", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "DEVELOPER_DIR", "SDKROOT",
+            "WindowsSdkDir", "WindowsSDKVersion", "VCToolsInstallDir", "VCToolsVersion",
+            "UniversalCRTSdkDir", "UCRTVersion", "VSINSTALLDIR", "GYP_MSVS_OVERRIDE_PATH",
+            "INCLUDE", "LIB", "CPATH", "CPLUS_INCLUDE_PATH", "LIBRARY_PATH")
+    result = {"host": list(host_identity()), "release": host_platform.release(),
+              "version": host_platform.version(), "environment": {key: os.environ.get(key, "") for key in keys}}
+    sdk_paths = [Path(os.environ[key]) for key in ("SDKROOT", "WindowsSdkDir", "VCToolsInstallDir") if os.environ.get(key)]
+    if platform == "macos":
+        commands = (("xcode-select", "--print-path"), ("xcrun", "--sdk", "macosx", "--show-sdk-path"),
+                    ("xcrun", "--sdk", "macosx", "--show-sdk-version"),
+                    ("xcrun", "--sdk", "macosx", "--show-sdk-build-version"), ("xcodebuild", "-version"))
+        for command in commands:
+            completed = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       check=True, timeout=30)
+            value = completed.stdout.strip()
+            result[" ".join(command)] = value
+            if command[-1] == "--show-sdk-path":
+                sdk_paths.append(Path(value))
+    result["sdks"] = [{"root": _stat_identity(path), "settings": {
+        name: digest_file(path / name) for name in ("SDKSettings.json", "SDKSettings.plist", "System/Library/CoreServices/SystemVersion.plist")
+        if (path / name).is_file()}} for path in sdk_paths]
+    # Sysroot stamps, unlike GN-generated sdk links, survive graph regeneration.
+    result["sysroots"] = {str(path.relative_to(src)): _stat_identity(path)
+                          for path in sorted((src / "build/linux").glob("*sysroot/.stamp"))}
+    return result
+
+
+def tool_fingerprint(src: Path, platform: str, arch: str) -> dict:
+    """Identify tool content, including runtime libraries, without stamp conventions."""
+    result = {}
+    def walk_error(error):
+        raise error
+
+    for relative in (CLANG, RUST):
+        root = src / relative
+        if linked(root) or not root.is_dir():
+            raise ValueError(f"missing or linked toolchain root: {relative}")
+        digest = hashlib.sha256()
+        for directory, dirs, files in os.walk(root, followlinks=False, onerror=walk_error):
+            dirs.sort()
+            for name in sorted(dirs + files):
+                path = Path(directory) / name
+                rel = path.relative_to(root).as_posix()
+                if linked(path):
+                    resolved = path.resolve(strict=True)
+                    if not resolved.is_relative_to(src):
+                        raise ValueError(f"external toolchain link: {relative}/{rel}")
+                    target = str(resolved.relative_to(src))
+                    value = [rel, "link", target]
+                elif path.is_file():
+                    value = [rel, "file", stat.S_IMODE(path.stat().st_mode), digest_file(path)]
+                else:
+                    continue
+                digest.update(json.dumps(value).encode())
+        result[relative.as_posix()] = digest.hexdigest()
+    return result
+
+
+def generator_paths(platform: str, arch: str) -> dict[str, Path]:
+    paths = {"node": tool_paths(platform, arch)["node"]}
+    if platform == "windows":
+        paths["go"] = Path("third_party/dawn/tools/golang/windows-amd64/bin/go.exe")
+    else:
+        system = "mac" if platform == "macos" else "linux"
+        cpu = "amd64" if arch == "x64" else "arm64"
+        paths["go"] = Path(f"third_party/dawn/tools/golang/{system}-{cpu}/bin/go")
+        if platform == "linux":
+            paths.update(gperf=Path("third_party/gperf/cipd/bin/gperf"),
+                         clang_format=Path("buildtools/linux64-format/clang-format"))
+    return paths
+
+
+def generator_fingerprint(src: Path, platform: str, arch: str) -> dict:
+    result = {}
+    for name, relative in generator_paths(platform, arch).items():
+        path = src / relative
+        result[name] = {"path": relative.as_posix(),
+                        "sha256": digest_file(path) if path.is_file() else None}
+    return result
+
+
+def invalidate_generated_outputs(src: Path) -> dict:
+    """Regenerate logged actions without compiler deps when host generators change."""
+    out = src / "out/Default"
+    dependencies = ninja_deps(out / ".ninja_deps")
+    result = {"removed_outputs": 0, "unknown_outputs": []}
+    for name in ninja_log(out / ".ninja_log"):
+        if name in dependencies or Path(name.replace("\\", "/")).name in ("gn", "gn.exe"):
+            continue
+        output = inside_path(out, name, output=True)
+        if output is None:
+            result["unknown_outputs"].append(name)
+        elif _remove_output(output):
+            result["removed_outputs"] += 1
+    return result
+
+
+def _remove_output(path: Path | None) -> bool:
+    if path is not None and path.is_file() and not linked(path):
+        path.unlink()
+        return True
+    return False
+
+
+def invalidate_external_dependencies(src: Path, *, invalidate_all=False, recheck_external=True) -> dict:
+    out = src / "out/Default"
+    if any(linked(parent) for parent in (out, *out.parents)):
+        raise ValueError("linked output root")
+    records = ninja_deps(out / ".ninja_deps")
+    result = {"dependency_records": len(records), "external_dependency_outputs": 0,
+              "missing_dependency_outputs": 0, "removed_outputs": 0,
+              "toolchain_invalidated_outputs": 0, "unknown_outputs": []}
+    inputs = {}
+    source_root = src.resolve()
+    for name, (_, dependencies) in records.items():
+        output = inside_path(out, name, output=True)
+        if output is None:
+            result["unknown_outputs"].append({"output": name, "reason": "unsafe or nonlocal output"})
+            continue
+        external = missing = False
+        if recheck_external:
+            for dependency in dependencies:
+                if dependency not in inputs:
+                    value = dependency.replace("\\", "/")
+                    try:
+                        path = (out / value).resolve()
+                        outside = bool(Path(value).is_absolute() or PureWindowsPath(value).drive
+                                       or ":" in value or not path.is_relative_to(source_root))
+                        inputs[dependency] = (outside, not outside and not path.is_file())
+                    except (OSError, ValueError, RuntimeError):
+                        inputs[dependency] = (True, False)
+                outside, absent = inputs[dependency]
+                external |= outside
+                missing |= absent
+        if external or missing:
+            result["external_dependency_outputs" if external else "missing_dependency_outputs"] += 1
+        if invalidate_all or external or missing:
+            if _remove_output(output):
+                result["removed_outputs"] += 1
+                result["toolchain_invalidated_outputs"] += int(invalidate_all)
+    return result
+
+
+def invalidate_compiled_outputs(src: Path) -> dict:
+    """Cover Rust/archive/host binaries not recorded in GCC-style Ninja deps."""
+    out = src / "out/Default"
+    if any(linked(parent) for parent in (out, *out.parents)):
+        raise ValueError("linked output root")
+    result = {"removed_outputs": 0, "unknown_outputs": []}
+
+    def walk_error(error):
+        raise error
+
+    for directory, dirs, files in os.walk(out, followlinks=False, onerror=walk_error):
+        dirs[:] = [name for name in dirs if name.lower() not in ("sdk", "xcode_links")
+                   and not linked(Path(directory) / name)]
+        for name in files:
+            relative = (Path(directory) / name).relative_to(out).as_posix()
+            path = inside_path(out, relative, output=True)
+            if path is None:
+                continue
+            compiled = path.suffix.lower() in COMPILED_SUFFIXES | {".exe", ".dll", ".so", ".dylib"}
+            if not compiled:
+                with path.open("rb") as stream:
+                    header = stream.read(4)
+                compiled = header in (b"\x7fELF", b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf") or header[:2] == b"MZ"
+            if compiled and _remove_output(path):
+                result["removed_outputs"] += 1
+    return result
+
+
+def remove_final_products(src: Path, platform: str) -> list[str]:
+    out = src / "out/Default"
+    names = {"linux": ("chrome", "chrome_crashpad_handler", "chrome_sandbox"),
+             "macos": ("Chromium.app",),
+             "windows": ("chrome.exe", "chrome.dll", "chrome_elf.dll")}[platform]
+    removed = []
+    for name in names:
+        path = inside_path(out, name, output=True)
+        if path is None:
+            raise ValueError("symlinked final build product")
+        if path.is_dir():
+            shutil.rmtree(path)
+            removed.append(name)
+        elif _remove_output(path):
+            removed.append(name)
+    return removed
+
+
+def restore_tool_endpoints(src: Path) -> list[str]:
+    names = ("tools/clang/scripts/update.py", "tools/clang/scripts/build.py",
+             "tools/rust/update_rust.py", "tools/rust/build_rust.py", "tools/rust/build_bindgen.py",
+             "build/linux/sysroot_scripts/install-sysroot.py",
+             "build/linux/sysroot_scripts/sysroots.json")
+    changed = []
+    for name in names:
+        path = _safe_file(src, name)
+        text = path.read_text(encoding="utf-8")
+        restored = text
+        for blocked, endpoint in ENDPOINTS.values():
+            restored = restored.replace(blocked, endpoint)
+        if restored != text:
+            path.write_text(restored, encoding="utf-8")
+            changed.append(name)
+    return changed
+
+
+def repair_linux_arm64_tool_script(src: Path) -> None:
+    """Complete the four Rust hunks skipped by the pinned malformed overlay."""
+    path = _safe_file(src, "tools/rust/build_rust.py")
+    text = path.read_text(encoding="utf-8")
+    replacements = (
+        ("{OPENSSL_CIPD_LINUX_AMD_PATH}", '{OPENSSL_CIPD_LINUX_AMD_PATH.replace("amd64", GetHostSysrootPlatform())}'),
+        ("return 'x86_64-unknown-linux-gnu'", "return f'{platform.machine()}-unknown-linux-gnu'"),
+        ("DownloadDebianSysroot('amd64', args.skip_checkout)",
+         "DownloadDebianSysroot(\n            GetHostSysrootPlatform(), args.skip_checkout)"),
+    )
+    for before, after in replacements:
+        if before in text:
+            if text.count(before) != 1:
+                raise ValueError("ambiguous pinned Rust ARM64 workaround")
+            text = text.replace(before, after)
+        elif after not in text and not (before.startswith("DownloadDebianSysroot") and re.search(
+                r"DownloadDebianSysroot\(\s*GetHostSysrootPlatform\(\), args\.skip_checkout\)", text)):
+            raise ValueError("unknown restored Rust ARM64 build script")
+    block = re.compile(r"(?m)^( +)'--disable-asserts',\n\1'--no-tools',")
+    matches = list(block.finditer(text))
+    if len(matches) == 1:
+        text = block.sub(lambda match: (match[1] + "'--disable-asserts',\n" +
+                         "".join(match[1] + repr(flag) + ",\n" for flag in
+                                 ("--use-system-cmake", "--host-cc=clang", "--host-cxx=clang++")) +
+                         match[1] + "'--no-tools',"), text)
+    elif matches or not re.search(
+            r"(?m)^( +)'--disable-asserts',\n\1'--use-system-cmake',\n\1'--host-cc=clang',\n\1'--host-cxx=clang\+\+',\n\1'--no-tools',", text):
+        raise ValueError("unknown restored Rust LLVM build arguments")
+    if "GetHostSysrootPlatform, GitRevert" not in text:
+        raise ValueError("restored Rust script lacks the pinned host-sysroot import")
+    if text != path.read_text(encoding="utf-8"):
+        path.write_text(text, encoding="utf-8")
+
+
+def verify_tooling(work: Path, platform: str, repo: Path = ROOT) -> None:
+    pins = dict(re.findall(r'^\s*(\w+) = "([^"\n]+)"',
+                           (repo / "build/ungoogled-revisions.psd1").read_text(), re.M))
+    names = {"ungoogled-chromium": pins["UngoogledCommit"]}
+    if platform == "macos":
+        names["ungoogled-chromium-macos"] = pins["UngoogledMacOSCommit"]
+    for name, commit in names.items():
+        path = _safe_file(work, "tooling/" + name)
+        head = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], text=True,
+                              stdout=subprocess.PIPE, check=True, timeout=30).stdout.strip()
+        if head != commit:
+            raise ValueError(f"tooling checkout does not match repository pins: {name}")
+        if name == "ungoogled-chromium-macos":
+            for filename in ("downloads-x86-64.ini", "downloads-arm64.ini",
+                             "downloads-x86-64-rustlib.ini", "downloads-arm64-rustlib.ini"):
+                downloads = configparser.ConfigParser()
+                downloads.read(path / filename)
+                if not downloads.sections():
+                    raise ValueError(f"missing pinned platform downloads: {filename}")
+                for section in downloads.sections():
+                    destination = Path(downloads[section]["output_path"])
+                    if ".." in destination.parts or not any(destination == allowed or allowed in destination.parents for allowed in
+                               (CLANG, RUST, Path("third_party/node/mac"), Path("third_party/node/mac_arm64"))):
+                        raise ValueError(f"platform resource would overwrite source: {section}")
+        subprocess.run(["git", "-C", str(path), "diff", "--exit-code", "HEAD", "--", ".", ":(exclude)ungoogled-chromium"],
+                       stdout=subprocess.PIPE, check=True, timeout=30)
+
+
+def prepare_tooling_links(work: Path, platform: str, arch: str) -> None:
+    def link(relative, target):
+        path = work / relative
+        if any(linked(parent) for parent in path.parents):
+            raise ValueError(f"linked tooling parent: {relative}")
+        if path.is_symlink():
+            path.unlink()
+        elif path.is_dir():
+            path.rmdir()
+        elif path.exists():
+            raise ValueError(f"refusing to replace non-link tooling entry: {relative}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.symlink_to(target, target_is_directory=target.is_dir())
+
+    if platform == "macos":
+        base = "tooling/ungoogled-chromium-macos/"
+        (work / "download_cache").mkdir(exist_ok=True)
+        link(base + "ungoogled-chromium", work / "tooling/ungoogled-chromium")
+        link(base + "build/src", work / "src")
+        link(base + "build/download_cache", work / "download_cache")
+        tools = {f"third_party/dawn/tools/golang/mac-{'arm64' if arch == 'arm64' else 'amd64'}/bin/go": "go"}
+    else:
+        tools = {f"third_party/node/linux/node-linux-{cpu}/bin/node": "node" for cpu in ("x64", arch)}
+        tools.update({"third_party/gperf/cipd/bin/gperf": "gperf", "buildtools/linux64-format/clang-format": "clang-format",
+                      f"third_party/dawn/tools/golang/linux-{'arm64' if arch == 'arm64' else 'amd64'}/bin/go": "go"})
+    for relative, name in tools.items():
+        target = shutil.which(name)
+        if not target:
+            raise ValueError(f"required host tool is missing: {name}")
+        path = work / "src" / relative
+        if path.is_file() and not linked(path):
+            # Only the fixed host-tool paths are replaceable here.
+            _safe_file(work / "src", relative).unlink()
+        link("src/" + relative, Path(target))
+
+
+def prepare(workdir: Path, platform: str, arch: str, *, phase="finish", repo: Path = ROOT) -> dict:
+    workdir = workdir.absolute()
+    receipt = verify_restored(workdir, platform, arch, repo=repo)
+    src = workdir / "src"
+    marker = _safe_file(src, MARKER)
+    pending_path = _safe_file(src, INSPECTION)
+    report_path = _safe_file(workdir, "upstream-cache-preparation.json")
+    old, pending = _read_marker(marker), _read_marker(pending_path)
+    for entry in (old, pending):
+        if entry and (entry.get("platform"), entry.get("arch")) != (platform, arch):
+            raise ValueError("restored preparation identity changed")
+    if old and old.get("source_identity") != receipt.get("identity"):
+        raise ValueError("restored preparation source identity changed")
+    inspection = validate_native_tools(src, platform, arch)
+    incompatible = (not inspection["toolchains_native"] or any(
+        entry.get("wrong_host", False) for name, entry in inspection["tools"].items()
+        if name not in ("node", "gn")))
+    changed_since_inspect = bool(pending and any(
+        pending.get("tools", {}).get(name, {}).get("file_identity") != entry.get("file_identity")
+        for name, entry in inspection["tools"].items() if name not in ("node", "gn")))
+    needs_invalidation = (incompatible or changed_since_inspect
+                          or bool(pending and pending.get("needs_invalidation")))
+    generators = generator_fingerprint(src, platform, arch)
+    generators_changed = (bool(pending and pending.get("generators_changed"))
+                          or bool(pending and pending.get("generator_fingerprint") != generators)
+                          or bool(old and old.get("generator_fingerprint") != generators))
+    data = {"schema_version": SCHEMA, "phase": phase, "platform": platform, "arch": arch,
+            **inspection, "needs_invalidation": needs_invalidation,
+            "generator_fingerprint": generators, "generators_changed": generators_changed}
+    if phase == "inspect":
+        write_json(pending_path, data)
+        return data
+    if phase != "finish":
+        raise ValueError(f"unsupported preparation phase: {phase}")
+    if not inspection["toolchains_native"] or not inspection["tools"]["node"]["native"]:
+        write_json(pending_path, dict(data, phase="inspect"))
+        raise ValueError("restored toolchain/node cannot execute on the native host; prepare tools before finish")
+    environment = environment_identity(src, platform)
+    fingerprint = tool_fingerprint(src, platform, arch)
+    tool_changed = needs_invalidation or bool(old and old.get("tool_fingerprint") != fingerprint)
+    environment_changed = not old or old.get("environment") != environment
+    first_finish = old is None
+    products = remove_final_products(src, platform) if first_finish else []
+    generated = (invalidate_generated_outputs(src) if first_finish or generators_changed
+                 else {"removed_outputs": 0, "unknown_outputs": []})
+    dependencies = invalidate_external_dependencies(src, invalidate_all=tool_changed,
+                                                   recheck_external=environment_changed or generators_changed or bool(generated["removed_outputs"]))
+    compiled = invalidate_compiled_outputs(src) if tool_changed else {"removed_outputs": 0, "unknown_outputs": []}
+    gn = inspection["tools"]["gn"]
+    gn_path = _safe_file(src / "out/Default", Path(gn["path"]).name)
+    if gn["exists"] and not gn["native"]:
+        _remove_output(gn_path)
+    removed_gn = gn["exists"] and not gn_path.exists()
+    if removed_gn:
+        data["native_tools"] = False
+        data["tools"]["gn"].update(native=False, exists=False, reason="GN bootstrap required after tool invalidation")
+    data.update(phase="finish", ready_for_gn=True, needs_invalidation=False, generators_changed=False,
+                source_identity=receipt.get("identity"), environment=environment, tool_fingerprint=fingerprint,
+                dependencies=dependencies, compiled_outputs=compiled, generated_outputs=generated, removed_gn=removed_gn,
+                removed_final_products=products, counters={
+                    "tool_swap_invalidations": int(tool_changed), "environment_rechecks": int(environment_changed),
+                    "generator_rechecks": int(first_finish or generators_changed),
+                    "toolchain_invalidated_outputs": dependencies["toolchain_invalidated_outputs"] + compiled["removed_outputs"],
+                    "first_finish": int(first_finish)})
+    write_json(marker, data)
+    write_json(report_path, data)
+    pending_path.unlink(missing_ok=True)
+    return data
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--phase", choices=("inspect", "finish"), default="finish")
+    parser.add_argument("--platform", choices=("linux", "macos", "windows"), required=True)
+    parser.add_argument("--arch", choices=("x64", "arm64"), required=True)
+    parser.add_argument("--workdir", type=Path, required=True)
+    args = parser.parse_args(argv)
+    try:
+        data = prepare(args.workdir.absolute(), args.platform, args.arch, phase=args.phase)
+        print(json.dumps(data, sort_keys=True))
+    except (OSError, ValueError, Miss, RuntimeError, subprocess.SubprocessError) as error:
+        print(f"restored build preparation failed: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

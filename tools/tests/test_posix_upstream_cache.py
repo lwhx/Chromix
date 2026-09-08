@@ -22,33 +22,110 @@ class PosixUpstreamCacheTest(unittest.TestCase):
         self.assertIn("upstream-cache-import.json", workflow)
         self.assertIn("upstream-cache-plan.log", workflow)
 
-    def test_fetch_only_after_source_preparation_on_first_stage(self):
+    def test_restore_precedes_source_preparation_only_on_fresh_first_stage(self):
         stage = (REPO / "build/posix/ci-stage.sh").read_text()
-        self.assertLess(stage.index('"$REPO/build/prepare-ungoogled.sh"'),
-                        stage.index('"$REPO/build/posix/fetch-upstream-cache.sh"'))
+        self.assertLess(stage.index('"$REPO/build/posix/fetch-upstream-cache.sh"'),
+                        stage.index('"$REPO/tools/restore_upstream_cache.py"'))
+        self.assertLess(stage.index('"$REPO/tools/restore_upstream_cache.py"'),
+                        stage.index('"$REPO/build/prepare-ungoogled.sh"'))
         self.assertIn('[ "$STAGE_INDEX" -eq 1 ] && [ -z "$FROM_SNAPSHOT" ]', stage)
         self.assertIn('[ "$(remaining_min)" -ge 90 ]', stage)
-        self.assertIn('export CHROMIX_UPSTREAM_CACHE_DIR=', stage)
+        self.assertIn('[ ! -e "$SRC" ]', stage)
+        self.assertNotIn('export CHROMIX_UPSTREAM_CACHE_DIR=', stage)
 
-    def test_builders_keep_domain_and_graph_order(self):
+    def test_builders_keep_restored_output_and_regenerate_chromix_graph(self):
         for platform, script in (("linux", "build/build.sh"), ("macos", "build/macos/build.sh")):
             with self.subTest(platform=platform):
                 source = (REPO / script).read_text()
-                self.assertLess(source.index(f"chromix_import_upstream_cache toolchain {platform}"),
-                                source.index('utils/domain_substitution.py" apply'))
                 self.assertLess(source.index('utils/domain_substitution.py" apply'),
-                                source.index(f"chromix_import_upstream_cache objects {platform}"))
-                if platform == "linux":
-                    self.assertLess(source.index("chromix_configure_upstream_objects"),
-                                    source.index('"$OUT/gn" gen'))
-                    self.assertLess(source.index('"$OUT/gn" gen'),
-                                    source.index("chromix_import_upstream_cache objects linux"))
-                else:
-                    self.assertLess(source.index(f"chromix_import_upstream_cache objects {platform}"),
-                                    source.index('"$OUT/gn" gen'))
+                                source.index('"$OUT/gn" gen'))
                 self.assertLess(source.index('"$OUT/gn" gen'),
                                 source.index("chromix_report_upstream_plan"))
                 self.assertIn('OUT="$SRC/out/Chromix"', source)
+                self.assertIn('OUT="$SRC/out/Default"', source)
+                self.assertIn('.chromix-upstream-restored.json', source)
+                self.assertNotIn('chromix_import_upstream_cache objects', source)
+                self.assertNotIn('chromix_configure_upstream_objects', source)
+                self.assertIn('"$REPO/tools/merge_gn_args.py"', source)
+                self.assertIn('--fail-on-unused-args', source)
+
+    def run_restored_builder(self, platform, arch, *, fail_tools=False):
+        with tempfile.TemporaryDirectory(prefix="restored build ") as directory:
+            root = Path(directory)
+            repo, work, binaries = root / "repo", root / "work", root / "bin"
+            src, out = work / "src", work / "src/out/Default"
+            out.mkdir(parents=True)
+            binaries.mkdir()
+            log = root / "calls"
+
+            def script(path, body):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("#!/bin/sh\n" + body)
+                path.chmod(0o755)
+
+            builder = "build/build.sh" if platform == "linux" else "build/macos/build.sh"
+            for relative in (builder, "build/posix/upstream-cache.sh", "tools/merge_gn_args.py"):
+                target = repo / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(REPO / relative, target)
+            script(repo / "build/prepare-ungoogled.sh", 'printf "prepare\\n" >> "$CALL_LOG"\n')
+            script(repo / "build/posix/prepare-restored-tools.sh",
+                   'printf "tools\\n" >> "$CALL_LOG"\n' +
+                   ('exit 19\n' if fail_tools else 'touch "$1/src/.chromix-toolchain-ready"\n'))
+            script(repo / "build/macos/select-xcode.sh", 'select_macos_xcode() { :; }\n')
+            for name in (".chromix-upstream-restored.json", ".chromix-domain-substituted"):
+                (src / name).touch()
+            overlay = "args.gn" if platform == "linux" else "args.macos.gn"
+            (repo / "build" / overlay).write_text('symbol_level = 0\nchrome_pgo_phase = 0\n')
+            platform_repo = "ungoogled-chromium-" + ("portablelinux" if platform == "linux" else "macos")
+            for name, flag in (("ungoogled-chromium", "flags.gn"), (platform_repo, f"flags.{platform}.gn")):
+                path = work / "tooling" / name / flag
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('symbol_level = 1\n')
+            (out / "args.gn").write_text('symbol_level = 2\nchrome_pgo_phase = 2\nupstream_extra = true\n')
+            for name in (".ninja_deps", ".ninja_log", "build.ninja", "retained.o"):
+                (out / name).write_text(name)
+            script(out / "gn", 'printf "gn\\n" >> "$CALL_LOG"\n')
+            script(out / "chrome", 'printf "Chromium fixture\\n"\n')
+            for name in ("node", "go", "gperf", "clang-format"):
+                script(binaries / name, "exit 0\n")
+            script(binaries / "ninja", 'printf "ninja\\n" >> "$CALL_LOG"\n')
+            machine = "x86_64" if arch == "x64" else ("aarch64" if platform == "linux" else "arm64")
+            system = "Linux" if platform == "linux" else "Darwin"
+            script(binaries / "uname", f'case "$1" in -m) printf "{machine}\\n";; -s) printf "{system}\\n";; esac\n')
+            script(binaries / "sysctl", 'printf "2\\n"\n')
+            env = {**os.environ, "PATH": str(binaries) + os.pathsep + os.environ["PATH"],
+                   "CHROMIX_SKIP_DEPS": "1", "CHROMIX_JOBS": "2", "CALL_LOG": str(log)}
+            env.pop("CHROMIX_UPSTREAM_CACHE_DIR", None)
+            for _ in range(1 if fail_tools else 2):
+                result = subprocess.run([str(BASH32 if BASH32.exists() else shutil.which("bash")),
+                                         str(repo / builder), str(work), arch],
+                                        env=env, capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 19 if fail_tools else 0, result.stdout + result.stderr)
+            if fail_tools:
+                self.assertEqual(log.read_text().splitlines(), ["prepare", "tools"])
+            else:
+                self.assertEqual(log.read_text().splitlines(), ["prepare", "tools", "gn", "ninja", "ninja"] * 2)
+                args = (out / "args.gn").read_text()
+                self.assertIn("upstream_extra = true", args)
+                self.assertIn("symbol_level = 0", args)
+                self.assertIn("chrome_pgo_phase = 0", args)
+                self.assertIn(f'target_cpu = "{arch}"', args)
+                self.assertNotIn("symbol_level = 2", args)
+            for name in (".ninja_deps", ".ninja_log", "build.ninja", "retained.o"):
+                self.assertEqual((out / name).read_text(), name)
+            self.assertFalse((src / "out/Chromix").exists())
+
+    def test_four_restored_builders_prepare_tools_on_every_resume_and_keep_args(self):
+        for platform in ("linux", "macos"):
+            for arch in ("x64", "arm64"):
+                with self.subTest(platform=platform, arch=arch):
+                    self.run_restored_builder(platform, arch)
+
+    def test_restored_tool_failure_stops_before_gn_and_ninja(self):
+        for platform in ("linux", "macos"):
+            with self.subTest(platform=platform):
+                self.run_restored_builder(platform, "x64", fail_tools=True)
 
     def run_helper(self, bash, enabled):
         with tempfile.TemporaryDirectory(prefix="cache shell ") as directory:
@@ -120,11 +197,11 @@ class PosixUpstreamCacheTest(unittest.TestCase):
             self.assertNotIn("cc_wrapper", (out / "args.gn").read_text())
             self.assertFalse((root / ".chromix-object-wrapper").exists())
 
-    def test_donor_finalized_after_build_before_handoff(self):
+    def test_restore_diagnostic_is_finalized_before_handoff(self):
         source = (REPO / "build/posix/ci-stage.sh").read_text()
-        self.assertLess(source.index("RC=$?"), source.index("--phase finalize"))
-        self.assertLess(source.index("--phase finalize"), source.index('if [ "$RC" -eq 124 ]'))
-        self.assertIn("upstream-object-cache.json", (REPO / ".github/workflows/build-posix-github.yml").read_text())
+        self.assertIn("upstream-cache-restore.json", (REPO / ".github/workflows/build-posix-github.yml").read_text())
+        self.assertLess(source.index("--phase restore"), source.index('"$TIMEOUT" -k 7m'))
+        self.assertIn(".chromix-upstream-restored.json", source)
 
     def test_disabled_cache_is_noop(self):
         self.run_helper(shutil.which("bash"), False)

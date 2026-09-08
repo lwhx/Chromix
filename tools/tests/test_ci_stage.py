@@ -151,10 +151,10 @@ class DomainSubstitutionRegressionTest(unittest.TestCase):
     def setUp(self):
         self.stage = CI_STAGE.read_text(encoding="utf-8")
         guard_start = self.stage.index('$domainProgress = Join-Path $Src')
-        guard_end = self.stage.index('\nif ($FromArtifact) {', guard_start)
+        guard_end = self.stage.index('\n$MigrateRestoredSource =', guard_start)
         self.guard = self.stage[guard_start:guard_end]
         start = self.stage.index('  if (-not (Test-Path $domainMarker)) {')
-        end = self.stage.index('  if ($ImportUpstreamCache) {', start)
+        end = self.stage.index('  & $gn gen $OutDir', start)
         self.substitution = self.stage[start:end]
 
     def test_matches_native_windows_substitution_after_tool_setup(self):
@@ -171,7 +171,7 @@ class DomainSubstitutionRegressionTest(unittest.TestCase):
         start = self.stage.index(self.substitution)
         self.assertLess(self.stage.index('throw "bindgen build failed"'), start)
         self.assertLess(self.stage.index('throw "GN bootstrap failed"'), start)
-        self.assertLess(start, self.stage.index('--phase objects'))
+        self.assertNotIn('--phase objects', self.stage)
         self.assertLess(start, self.stage.index('& $gn gen $OutDir'))
         self.assertNotIn('$ValidateOnly', self.substitution)
         self.assertNotIn('$ImportUpstreamCache', self.substitution)
@@ -182,7 +182,7 @@ class DomainSubstitutionRegressionTest(unittest.TestCase):
         self.assertLess(restore, guard)
         self.assertLess(guard, self.stage.index('update-restored-source.ps1', restore))
         self.assertLess(guard, self.stage.index('prepare-ungoogled.ps1', restore))
-        self.assertLess(guard, self.stage.index('--phase toolchain'))
+        self.assertLess(guard, self.stage.index('--phase restore'))
         self.assertIn('if (Test-Path $domainProgress)', self.guard)
         self.assertNotIn('Test-Path $domainMarker', self.guard)
         self.assertNotIn('Remove-Item', self.guard)
@@ -228,7 +228,7 @@ class DomainSubstitutionRegressionTest(unittest.TestCase):
         (root / "gn.ps1").write_text(
             'Add-Content -Path $env:DOMAIN_TEST_CALLS -Value "gn"\n'
             '$global:LASTEXITCODE = 0\n')
-        end = self.stage.index('  if ($ImportUpstreamCache) {',
+        end = self.stage.index('  if ($RestoredUpstream) {',
                                self.stage.index('throw "gn gen failed"'))
         pipeline = self.stage[self.stage.index(self.substitution):end]
         script = root / "fixture.ps1"
@@ -241,15 +241,10 @@ $OutDir = Join-Path $Src "out"
 $UngoogledTooling = Join-Path $WorkDir "tooling/ungoogled-chromium"
 $WindowsTooling = Join-Path $WorkDir "tooling/ungoogled-chromium-windows"
 $Revisions = @{ UngoogledCommit = "fixture-core-commit" }
-$ImportUpstreamCache = ($env:DOMAIN_TEST_IMPORT -eq "1")
+$RestoredUpstream = $false
 $UpstreamCacheDir = Join-Path $WorkDir "cache"
 $gn = Join-Path $WorkDir "gn.ps1"
 function python {
-  if ($args[0] -like '*import_upstream_cache.py') {
-    Add-Content -Path $env:DOMAIN_TEST_CALLS -Value "objects"
-    $global:LASTEXITCODE = 0
-    return
-  }
   Add-Content -Path $env:DOMAIN_TEST_CALLS -Value "substitution"
   & $env:DOMAIN_TEST_PYTHON @args
   $global:LASTEXITCODE = $LASTEXITCODE
@@ -267,7 +262,7 @@ function python {
         return subprocess.run(command, env={**env, "DOMAIN_TEST_IMPORT": str(int(imported))},
                               capture_output=True, text=True, timeout=20)
 
-    def test_real_substitution_then_objects_and_gn_and_idempotent_resume(self):
+    def test_real_substitution_then_gn_and_idempotent_resume(self):
         import tarfile
 
         root, command, env = self.fixture()
@@ -285,7 +280,7 @@ function python {
             self.assertEqual(archive.extractfile("orig/source.cc").read(), original)
             self.assertIn(b"source.cc|", archive.extractfile("cache_index.list").read())
         self.assertEqual((root / "calls").read_text().splitlines(),
-                         ["substitution", "objects", "gn"])
+                         ["substitution", "gn"])
         modified = (src / "source.cc").stat().st_mtime_ns
         cache_bytes = cache.read_bytes()
         resumed = self.run_fixture(command, env)
@@ -293,7 +288,7 @@ function python {
         self.assertEqual((src / "source.cc").stat().st_mtime_ns, modified)
         self.assertEqual(cache.read_bytes(), cache_bytes)
         self.assertEqual((root / "calls").read_text().splitlines(),
-                         ["substitution", "objects", "gn", "objects", "gn"])
+                         ["substitution", "gn", "gn"])
 
     def test_substitution_is_required_without_upstream_cache(self):
         root, command, env = self.fixture()
@@ -422,7 +417,7 @@ class ReleaseChannelRegressionTest(unittest.TestCase):
 
 
 class RestoredSourceUpdateRegressionTest(unittest.TestCase):
-    def test_upstream_cache_never_adopts_source_or_stamps_unproven_layers(self):
+    def test_upstream_cache_restores_before_preparation_without_stamping_unproven_layers(self):
         stage = CI_STAGE.read_text(encoding="utf-8")
         self.assertIn('[switch]$UseUpstreamCache', stage)
         self.assertNotIn('$UpstreamArtifactPath', stage)
@@ -430,8 +425,9 @@ class RestoredSourceUpdateRegressionTest(unittest.TestCase):
         self.assertNotIn('Set-Content -Path (Join-Path $Src ".chromix-ungoogled-core")', stage)
         self.assertNotIn('Set-Content -Path (Join-Path $Src ".chromix-ungoogled-windows")', stage)
         prepare = stage.index('& "$PSScriptRoot\\prepare-ungoogled.ps1"')
-        imported = stage.index('--phase toolchain')
-        self.assertLess(prepare, imported)
+        restored = stage.index('--phase restore')
+        self.assertLess(restored, prepare)
+        self.assertNotIn('import_upstream_cache.py', stage)
 
     def test_resume_source_update_avoids_powershell_host_automatic_variable(self):
         update_source = RESTORED_SOURCE_UPDATE.read_text(encoding="utf-8")
@@ -447,9 +443,9 @@ class RestoredSourceUpdateRegressionTest(unittest.TestCase):
         update_source = RESTORED_SOURCE_UPDATE.read_text(encoding="utf-8")
         restore = stage_source.index('& $sevenZip x "C:\\restore\\tree.7z.001"')
         update = stage_source.index('update-restored-source.ps1', restore)
-        prepare = stage_source.index('.chromix-source-ready', update)
-        self.assertLess(restore, update)
-        self.assertLess(update, prepare)
+        prepare = stage_source.index('& "$PSScriptRoot\\prepare-ungoogled.ps1"', restore)
+        self.assertLess(restore, prepare)
+        self.assertLess(prepare, update)
         self.assertIn('$normalizedContent = $content.Replace("`r`n", "`n")', update_source)
         self.assertIn('$normalizedOldText = $OldText.Replace("`r`n", "`n")', update_source)
         self.assertIn('$normalizedNewText = $NewText.Replace("`r`n", "`n")', update_source)
@@ -617,7 +613,7 @@ class RestoredSourceUpdateRegressionTest(unittest.TestCase):
             stage,
             r'(?s)if \(\$restoredVersion -and .*?\) \{.*?Remove-Item \$Src '
             r'-Recurse -Force\s+\} elseif \(Test-Path \$readyMarker\) \{\s+'
-            r'& "\$PSScriptRoot\\update-restored-source\.ps1"',
+            r'\$MigrateRestoredSource = -not \$RestoredUpstream',
         )
 
     def test_resume_defers_source_migrations_for_interrupted_patch_layers(self):
@@ -630,9 +626,9 @@ class RestoredSourceUpdateRegressionTest(unittest.TestCase):
         restore = stage.index('& $sevenZip x "C:\\restore\\tree.7z.001"')
         ready_gate = stage.index("elseif (Test-Path $readyMarker)", restore)
         migration = stage.index("update-restored-source.ps1", ready_gate)
-        prepare = stage.index("prepare-ungoogled.ps1", migration)
-        self.assertLess(ready_gate, migration)
-        self.assertLess(migration, prepare)
+        prepare = stage.index('prepare-ungoogled.ps1', ready_gate)
+        self.assertLess(ready_gate, prepare)
+        self.assertLess(prepare, migration)
 
     def test_interrupted_chromix_patch_layer_resumes_without_discarding_source(self):
         prepare = PREPARE_UNGOOGLED.read_text(encoding="utf-8")

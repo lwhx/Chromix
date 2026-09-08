@@ -1,5 +1,5 @@
 diff --git a/third_party/blink/renderer/core/frame/screen.cc b/third_party/blink/renderer/core/frame/screen.cc
-index 69ffc2b05f..ed8e2ea806 100644
+index ed50289..254f3d2 100644
 --- a/third_party/blink/renderer/core/frame/screen.cc
 +++ b/third_party/blink/renderer/core/frame/screen.cc
 @@ -29,6 +29,9 @@
@@ -10,9 +10,9 @@ index 69ffc2b05f..ed8e2ea806 100644
 +#include "base/uxr_config.h"
 +#include "base/strings/string_number_conversions.h"  // UXR
  #include "services/network/public/mojom/permissions_policy/permissions_policy_feature.mojom-blink.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
  #include "third_party/blink/renderer/core/event_target_names.h"
- #include "third_party/blink/renderer/core/frame/local_dom_window.h"
-@@ -40,6 +43,23 @@
+@@ -41,6 +44,23 @@
  
  namespace blink {
  
@@ -36,7 +36,7 @@ index 69ffc2b05f..ed8e2ea806 100644
  Screen::Screen(LocalDOMWindow* window, int64_t display_id)
      : ExecutionContextClient(window), display_id_(display_id) {}
  
-@@ -81,12 +101,14 @@ bool Screen::AreWebExposedScreenPropertiesEqual(
+@@ -90,12 +110,14 @@ bool Screen::AreWebExposedScreenPropertiesEqual(
  int Screen::height() const {
    if (!DomWindow())
      return 0;
@@ -51,7 +51,7 @@ index 69ffc2b05f..ed8e2ea806 100644
    return GetRect(/*available=*/false).width();
  }
  
-@@ -100,6 +122,8 @@ unsigned Screen::colorDepth() const {
+@@ -109,6 +131,8 @@ unsigned Screen::colorDepth() const {
    if (!DomWindow()) {
      return unknown_color_depth;
    }
@@ -60,7 +60,7 @@ index 69ffc2b05f..ed8e2ea806 100644
    return GetScreenInfo().depth == 0
               ? unknown_color_depth
               : base::saturated_cast<unsigned>(GetScreenInfo().depth);
-@@ -124,12 +148,23 @@ int Screen::availTop() const {
+@@ -133,12 +157,23 @@ int Screen::availTop() const {
  int Screen::availHeight() const {
    if (!DomWindow())
      return 0;

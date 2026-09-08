@@ -1,5 +1,5 @@
 diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
-index c76f6553e1..ccf835340a 100644
+index 0159341..36c1533 100644
 --- a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
 +++ b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
 @@ -33,6 +33,9 @@
@@ -11,8 +11,8 @@ index c76f6553e1..ccf835340a 100644
 +#include "base/uxr_config.h"  // UXR
  #include "base/memory/ptr_util.h"
  #include "third_party/blink/renderer/platform/image-encoders/image_encoder_utils.h"
- #include "third_party/blink/renderer/platform/wtf/text/base64.h"
-@@ -43,6 +46,51 @@
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+@@ -44,6 +47,51 @@
  
  namespace blink {
  
@@ -64,7 +64,7 @@ index c76f6553e1..ccf835340a 100644
  ImageDataBuffer::ImageDataBuffer(scoped_refptr<StaticBitmapImage> image) {
    if (!image)
      return;
-@@ -89,6 +137,7 @@ ImageDataBuffer::ImageDataBuffer(scoped_refptr<StaticBitmapImage> image) {
+@@ -90,6 +138,7 @@ ImageDataBuffer::ImageDataBuffer(scoped_refptr<StaticBitmapImage> image) {
        return;
      }
      MSAN_CHECK_MEM_IS_INITIALIZED(pixmap_.addr(), pixmap_.computeByteSize());

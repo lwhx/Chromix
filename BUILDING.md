@@ -176,7 +176,7 @@ placed in `actions/cache`: their size, runner/toolchain coupling, and file
 metadata make a blind restore unreliable. A POSIX retry instead restores the
 explicit tar/zstd stage snapshots — never a cache guess.
 
-### Pinned upstream cache import
+### Pinned upstream build-directory restoration
 
 Fresh unified builds try the five upstream Actions artifacts pinned in
 `build/upstream-cache.json`. The manifest records the repository, source commit,
@@ -185,47 +185,60 @@ cross-repository artifact download, not shared `actions/cache` access. A manual
 unified dispatch can set `use_upstream_cache` to false for a full source build.
 An optional `UPSTREAM_ACTIONS_TOKEN` secret can grant access to public upstream
 Actions artifacts; otherwise the workflow tries its own `github.token`. A 403,
-404, expired artifact, checksum failure, or compatibility rejection records a
-cache miss and follows the normal build path.
+404, expired artifact, checksum failure, or rejected source identity records a
+cache miss and follows the normal source-preparation path.
 
-The importer runs **after canonical source preparation**. It never adopts the
-upstream source as Chromix source or writes source-layer markers on its behalf.
-Compiler/Rust/bindgen reuse is assessed separately from Chromium object reuse.
-The existing source-layer order, GN settings, SDK selection, and five-platform
-release checks remain authoritative. In particular, upstream `out/Default` is
-not blindly renamed to `out/Chromix`: differing flags, compiler inputs, SDKs,
-paths, or unverified external dependencies must prevent stale object reuse.
-Windows/macOS PGO and symbol settings differ from Chromix, so matching Chromium
-versions alone do not establish a usable object cache.
+Restoration runs **before fresh source preparation**, only when `WORK/src` is
+absent. All five targets restore the complete upstream source tree and its
+`src/out/Default`, including objects, generated inputs, `build.ninja`,
+`.ninja_log`, and `.ninja_deps`. The directory is moved on the same filesystem,
+not duplicated or renamed to `out/Chromix`. Ordinary fresh builds still use
+`out/Chromix`; when packaging a restored build manually, use `out/Default` in
+the commands above. Own-stage snapshots take precedence and never refetch the
+upstream artifact.
 
 Download and extraction occur in a separate, owned directory. Signed blob
 redirects receive no GitHub authorization header; the outer ZIP is hashed before
-its inner archive is extracted. Traversal, escaping links, and unsupported archive
-members cause fallback. Linux retains the complete donor source and generated
-inputs during the first build stage. After canonical GN generation, a compiler
-wrapper checks individual C/C++ commands, compiler/sysroot contents, Ninja records,
-input hashes, and both trees' preprocessor output. Compatible objects are copied
-with canonical dependency files; unsupported or changed inputs compile normally.
-PCM-consuming module builds, PCH, and response-file commands are not reused.
-For pinned GNU tar archives with second-resolution mtimes, object times must
-match the recorded timestamp's exact truncation, and inputs must predate the
-entire compilation-start second; ambiguous same-second inputs are misses.
-Windows/macOS currently reuse only compatible toolchain components, not objects.
+its inner archive is extracted. Unsafe archive members are rejected. Internal
+absolute symlinks are remapped only from the pinned platform's known source
+root to an existing internal target. Known external host-tool and Xcode SDK
+links are omitted and recorded for recreation on the current runner. Source
+version, architecture, manifest identity, and required Ninja state are verified
+before an atomic installation; an existing source tree is never overwritten.
+Exact whole-second output timestamps are repaired from trusted Ninja records
+only when the recorded inputs prove they are unambiguous.
 
-The donor and unused candidates are removed before first-stage handoff; copied
-objects and Ninja's own dependency records remain in the normal stage snapshot.
-The compiler wrapper stays configured on resumed stages to avoid changing Ninja
-commands, and passes through when no donor is available. Own-stage resume takes
-precedence and does not fetch upstream artifacts again.
+The restored source already contains the pinned ungoogled core patches,
+platform overlay, pruning, and domain substitution. Preparation verifies those
+pins and appends Chromix `patches/series` without reapplying upstream layers.
+`tools/apply_restored_patches.py` translates patch context and additions using
+the pinned domain-substitution rules and applies with `--fuzz=0`. Interrupted
+or mismatched patch markers fail instead of accepting a partially patched tree.
 
-Diagnostics include `upstream-cache-import.json`, `upstream-object-cache.json`
-(actual first-stage hits, misses, and reused bytes), the downloader's `result.json`,
-and a `ninja -n` planned-work log when the build reaches graph generation. A
-successful download is not an object-cache hit, and a planned-work count is not
-a measured speedup. Native CI is required to establish actual hits and elapsed
-time; local regression tests use small fixtures and never compile Chromium.
-Artifact expiry requires updating the pinned manifest after checking the new
-upstream run and digest, rather than silently selecting the newest upload.
+Native tool headers and executable probes check the actual runner architecture.
+Required tool replacement happens only in Actions. A changed compiler/runtime
+invalidates compiled outputs; unknown external or missing Ninja dependencies
+invalidate their dependent outputs. Host generator contents (Node, Go, gperf,
+and clang-format where used) are tracked separately. Initial restoration or a
+changed generator removes logged generated outputs lacking compiler dependency
+records, without clearing unrelated C/C++ objects merely because a host link
+was restored. Runner/SDK identity is rechecked on resume.
+The first preparation removes upstream final browser products to force a new
+Chromix link. Chromix GN settings override restored arguments, GN regenerates
+`out/Default` for the current environment, and Ninja compiles incrementally.
+Matching Chromium versions alone does not prove an object is reusable: different
+flags, host tools, SDKs, or dependency paths can require substantial recompilation.
+
+Diagnostics include `upstream-cache-restore.json`,
+`upstream-cache-preparation.json`, the source's `.chromix-upstream-restored.json`
+receipt, the downloader's `result.json`, and `upstream-cache-plan.log` from
+`ninja -n`. The preparation report records invalidated outputs and removed final
+products. A successful restoration is not proof of object hits, and a dry-run
+count is not a measured speedup. Native CI must establish actual reuse and
+elapsed time; local regression tests use small fixtures and sparse patch checks,
+without downloading full build artifacts or compiling Chromium. Artifact expiry
+requires reviewing and updating the pinned manifest rather than silently
+selecting the newest upload.
 
 Host toolchains follow the host architecture, not the target: Node resolves
 through `third_party/node/linux/node-linux-$HOST_ARCH/bin/node` with an extra

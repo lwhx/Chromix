@@ -88,6 +88,21 @@ if [ -n "$FROM_SNAPSHOT" ] && [ -d "$FROM_SNAPSHOT" ]; then
   rm -rf "$FROM_SNAPSHOT"
 fi
 
+# Own snapshots take precedence over a fresh upstream restore.
+if [ "$STAGE_INDEX" -eq 1 ] && [ -z "$FROM_SNAPSHOT" ] &&
+   [ ! -e "$SRC" ] && [ "${CHROMIX_USE_UPSTREAM_CACHE:-0}" = 1 ] &&
+   [ "$(remaining_min)" -ge 90 ]; then
+  UPSTREAM_CACHE_DIR="${RUNNER_TEMP:-$(dirname "$WORK")}/chromix-upstream"
+  bash "$REPO/build/posix/fetch-upstream-cache.sh" \
+    --platform "$PLATFORM" --arch "$ARCH" --destination "$UPSTREAM_CACHE_DIR"
+  python3 "$REPO/tools/restore_upstream_cache.py" --phase restore \
+    --platform "$PLATFORM" --arch "$ARCH" --workdir "$WORK" \
+    --cache-dir "$UPSTREAM_CACHE_DIR"
+fi
+if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
+  OUT="$SRC/out/Default"
+fi
+
 if [ -f "$SRC/.chromix-domain-substitution-in-progress" ]; then
   die "domain substitution was interrupted; use a clean work directory"
 fi
@@ -104,16 +119,6 @@ else
     exit 0
   fi
   "$REPO/build/prepare-ungoogled.sh" "$WORK" "$PLATFORM" "$ARCH"
-fi
-
-# Upstream trees are donors only; source preparation above remains authoritative.
-if [ "$STAGE_INDEX" -eq 1 ] && [ -z "$FROM_SNAPSHOT" ] &&
-   [ "${CHROMIX_USE_UPSTREAM_CACHE:-0}" = 1 ] &&
-   [ "$(remaining_min)" -ge 90 ]; then
-  UPSTREAM_CACHE_DIR="${RUNNER_TEMP:-$(dirname "$WORK")}/chromix-upstream"
-  bash "$REPO/build/posix/fetch-upstream-cache.sh" \
-    --platform "$PLATFORM" --arch "$ARCH" --destination "$UPSTREAM_CACHE_DIR"
-  export CHROMIX_UPSTREAM_CACHE_DIR="$UPSTREAM_CACHE_DIR"
 fi
 
 # ---- bounded compile ------------------------------------------------------
@@ -149,11 +154,6 @@ set +e
     "$BUILD_SCRIPT" "$WORK" "$ARCH"
 RC=$?
 set -e
-if [ -n "${CHROMIX_UPSTREAM_CACHE_DIR:-}" ]; then
-  python3 "$REPO/tools/import_upstream_cache.py" --phase finalize \
-    --platform "$PLATFORM" --arch "$ARCH" --workdir "$WORK" \
-    --cache-dir "$CHROMIX_UPSTREAM_CACHE_DIR"
-fi
 # Mirror the Windows chain's last-stage guard: a green run without a finished
 # build would let release-browser accept an incomplete artifact set.
 

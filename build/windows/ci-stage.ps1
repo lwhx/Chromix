@@ -22,9 +22,9 @@ $Root = "C:\c"
 $WorkDir = "$Root\chromix"
 $Src = "$WorkDir\src"
 $OutDir = "$Src\out\Chromix"
+$RestoredUpstream = $false
 $PartsDir = "C:\parts"
 $UpstreamCacheDir = "C:\u"
-$ImportUpstreamCache = $false
 $Deadline = (Get-Date).AddMinutes(300)
 $PackReserveMin = 40
 
@@ -330,11 +330,24 @@ if ($FromArtifact) {
 
 $domainProgress = Join-Path $Src ".chromix-domain-substitution-in-progress"
 $domainMarker = Join-Path $Src ".chromix-domain-substituted"
+$restoreReceipt = Join-Path $Src ".chromix-upstream-restored.json"
+if (Get-ChildItem -LiteralPath $WorkDir -Directory -Filter ".chromix-upstream-restore-*" -ErrorAction SilentlyContinue) {
+  throw "upstream restore transaction was interrupted; use a clean work directory"
+}
+if (Test-Path $restoreReceipt) {
+  Write-Host "==> verifying restored upstream source receipt and pins"
+  & python (Join-Path $Repo "tools\restore_upstream_cache.py") --phase verify `
+    --platform windows --arch x64 --workdir $WorkDir
+  if ($LASTEXITCODE -ne 0) { throw "restored upstream source verification failed (exit $LASTEXITCODE)" }
+  $RestoredUpstream = $true
+  $OutDir = "$Src\out\Default"
+}
 if (Test-Path $domainProgress) {
   throw "domain substitution was interrupted; use a clean work directory"
 }
 
-if ($FromArtifact) {
+$MigrateRestoredSource = $false
+if ($FromArtifact -and -not $RestoredUpstream) {
   $unpackedMarker = Join-Path $Src ".chromix-source-unpacked"
   $readyMarker = Join-Path $Src ".chromix-source-ready"
   $restoredVersion = ""
@@ -347,32 +360,14 @@ if ($FromArtifact) {
     Write-Host "==> restored tree targets Chromium $restoredVersion; preserving tooling/download_cache and removing incompatible src/out"
     Remove-Item $Src -Recurse -Force
   } elseif (Test-Path $readyMarker) {
-    & "$PSScriptRoot\update-restored-source.ps1" -Src $Src -OutDir $OutDir
+    $MigrateRestoredSource = -not $RestoredUpstream
   } else {
     Write-Host "==> restored source is not ready; deferring migrations until patch preparation completes"
   }
 }
 
-if (-not (Test-Path (Join-Path $Src ".chromix-source-ready"))) {
-  if ((Get-RemainingMin) -lt ($PackReserveMin + 30)) {
-    Save-Handoff -Mode Unsynced
-    return
-  }
-  $prepareDeadline = [DateTimeOffset]::new($Deadline).ToUnixTimeSeconds()
-  try {
-    & "$PSScriptRoot\prepare-ungoogled.ps1" -Root $WorkDir -Repo $Repo `
-      -DeadlineEpoch $prepareDeadline -ReserveMinutes $PackReserveMin
-  } catch {
-    if ($_.Exception.Message -like "PREPARE_BUDGET_EXHAUSTED:*") {
-      Save-Handoff -Mode Unsynced
-      return
-    }
-    throw
-  }
-}
-
 if ($StageIndex -eq 1 -and -not $ValidateOnly -and -not $FromArtifact -and
-    ($UseUpstreamCache -or $UpstreamRunId)) {
+    -not (Test-Path $Src) -and ($UseUpstreamCache -or $UpstreamRunId)) {
   # Leave time for bootstrap/compile and the normal snapshot reserve.
   if ((Get-RemainingMin) -lt ($PackReserveMin + 60)) {
     Write-Host "==> skipping optional upstream cache: insufficient stage budget"
@@ -387,39 +382,65 @@ if ($StageIndex -eq 1 -and -not $ValidateOnly -and -not $FromArtifact -and
     $fetchRc = Invoke-Tracked -File (Get-Command python -ErrorAction Stop).Source `
       -ArgList $fetchCommandLine -Cwd $Repo -TimeoutSec 1200
     if ($fetchRc -eq 124) {
-      Write-Host "==> optional upstream cache timed out; continuing with the prepared source"
+      Write-Host "==> optional upstream cache timed out; continuing with normal source preparation"
     } elseif ($fetchRc -ne 0) {
       throw "upstream cache fetch helper failed (exit $fetchRc)"
     } else {
-      $ImportUpstreamCache = $true
+      python (Join-Path $Repo "tools\restore_upstream_cache.py") --phase restore `
+        --platform windows --arch x64 --workdir $WorkDir --cache-dir $UpstreamCacheDir
+      if ($LASTEXITCODE -ne 0) { throw "upstream restore helper failed (exit $LASTEXITCODE)" }
+      if (Test-Path $Src) {
+        if (-not (Test-Path -LiteralPath $restoreReceipt -PathType Leaf)) {
+          throw "upstream restore created source without a receipt"
+        }
+        $RestoredUpstream = $true
+        $OutDir = "$Src\out\Default"
+        Write-Host "==> restored upstream source/out/Default; appending Chromix patches before incremental Ninja"
+      } else {
+        Write-Host "==> upstream restore missed; continuing with normal source preparation"
+      }
     }
   }
 }
 
-if ($ImportUpstreamCache) {
-  # Optional misses return zero; the prepared source remains authoritative.
-  python (Join-Path $Repo "tools\import_upstream_cache.py") --phase toolchain `
-    --platform windows --arch x64 --workdir $WorkDir --cache-dir $UpstreamCacheDir
-  if ($LASTEXITCODE -ne 0) { throw "upstream toolchain import helper failed (exit $LASTEXITCODE)" }
+if (-not (Test-Path (Join-Path $Src ".chromix-source-ready")) -and
+    (Get-RemainingMin) -lt ($PackReserveMin + 30)) {
+  Save-Handoff -Mode Unsynced
+  return
+}
+$prepareDeadline = [DateTimeOffset]::new($Deadline).ToUnixTimeSeconds()
+try {
+  # Revalidate ready markers on every stage, including artifact resumes.
+  & "$PSScriptRoot\prepare-ungoogled.ps1" -Root $WorkDir -Repo $Repo `
+    -DeadlineEpoch $prepareDeadline -ReserveMinutes $PackReserveMin
+} catch {
+  if ($_.Exception.Message -like "PREPARE_BUDGET_EXHAUSTED:*") {
+    Save-Handoff -Mode Unsynced
+    return
+  }
+  throw
+}
+if ($MigrateRestoredSource) {
+  & "$PSScriptRoot\update-restored-source.ps1" -Src $Src -OutDir $OutDir
 }
 
 $UngoogledTooling = Join-Path $WorkDir "tooling\ungoogled-chromium"
 $WindowsTooling = Join-Path $WorkDir "tooling\ungoogled-chromium-windows"
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-python (Join-Path $Repo "tools\merge_gn_args.py") (Join-Path $OutDir "args.gn") `
-  (Join-Path $UngoogledTooling "flags.gn") `
-  (Join-Path $WindowsTooling "flags.windows.gn") `
+$gnArgs = Join-Path $OutDir "args.gn"
+$mergeArgs = @((Join-Path $Repo "tools\merge_gn_args.py"), $gnArgs)
+if ($RestoredUpstream) { $mergeArgs += $gnArgs }
+$mergeArgs += @(
+  (Join-Path $UngoogledTooling "flags.gn"),
+  (Join-Path $WindowsTooling "flags.windows.gn"),
   (Join-Path $Repo "build\args.windows.gn")
+)
+python @mergeArgs
 if ($LASTEXITCODE -ne 0) { throw "GN argument merge failed" }
 
 $env:PATH = "$(Join-Path $Src 'third_party\ninja');$(Join-Path $Src 'third_party\node\win');$env:PATH"
 Push-Location $Src
 try {
-  $gn = Join-Path $OutDir "gn.exe"
-  if (-not (Test-Path $gn)) {
-    python tools\gn\bootstrap\bootstrap.py -o $gn --skip-generate-buildfiles
-    if ($LASTEXITCODE -ne 0) { throw "GN bootstrap failed" }
-  }
   if (-not (Test-Path "third_party\rust-toolchain\bin\bindgen.exe")) {
     # bindgen's build script hard-requires cargo+rustc that prepare merged
     # into third_party\rust-toolchain; failing fast here with the directory
@@ -434,8 +455,39 @@ try {
         throw ("bindgen precondition failed: third_party\rust-toolchain\bin\$binary is missing")
       }
     }
+    if ($RestoredUpstream) {
+      # Only restore known tool-download endpoints, never browser source domains.
+      $normalizeToolUrls = @'
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / 'tools'))
+from upstream_script_identity import ENDPOINTS, RESTORED
+src = Path(sys.argv[2])
+for relative, keys in RESTORED.items():
+    path = src / relative
+    original = path.read_bytes()
+    normalized = original
+    for key in keys:
+        before, after = ENDPOINTS[key]
+        normalized = normalized.replace(before.encode('ascii'), after.encode('ascii'))
+    if normalized != original:
+        path.write_bytes(normalized)
+'@
+      python -c $normalizeToolUrls $Repo $Src
+      if ($LASTEXITCODE -ne 0) { throw "restored tool download endpoint normalization failed" }
+    }
     python tools\rust\build_bindgen.py --skip-test
     if ($LASTEXITCODE -ne 0) { throw "bindgen build failed" }
+  }
+  if ($RestoredUpstream) {
+    python (Join-Path $Repo "tools\prepare_restored_build.py") --phase finish `
+      --platform windows --arch x64 --workdir $WorkDir
+    if ($LASTEXITCODE -ne 0) { throw "restored build preparation failed (exit $LASTEXITCODE)" }
+  }
+  $gn = Join-Path $OutDir "gn.exe"
+  if (-not (Test-Path $gn)) {
+    python tools\gn\bootstrap\bootstrap.py -o $gn --skip-generate-buildfiles
+    if ($LASTEXITCODE -ne 0) { throw "GN bootstrap failed" }
   }
   if (-not (Test-Path $domainMarker)) {
     # The pinned helper selects compression from the cache filename's suffix.
@@ -453,18 +505,13 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "domain substitution failed" }
     Move-Item -LiteralPath $domainProgress -Destination $domainMarker
   }
-  if ($ImportUpstreamCache) {
-    # The helper may reject incompatible objects without replacing args.gn or the output layout.
-    python (Join-Path $Repo "tools\import_upstream_cache.py") --phase objects `
-      --platform windows --arch x64 --workdir $WorkDir --cache-dir $UpstreamCacheDir
-    if ($LASTEXITCODE -ne 0) { throw "upstream object import helper failed (exit $LASTEXITCODE)" }
-  }
   & $gn gen $OutDir --fail-on-unused-args
   if ($LASTEXITCODE -ne 0) { throw "gn gen failed" }
-  if ($ImportUpstreamCache) {
+  if ($RestoredUpstream) {
+    Write-Host "==> recording incremental Ninja plan for restored upstream source/out/Default"
     & (Join-Path $Src "third_party\ninja\ninja.exe") -C $OutDir -n chrome `
       *> (Join-Path $WorkDir "upstream-cache-plan.log")
-    if ($LASTEXITCODE -ne 0) { throw "upstream cache build-plan check failed" }
+    if ($LASTEXITCODE -ne 0) { throw "restored upstream build-plan check failed" }
   }
 } finally {
   Pop-Location

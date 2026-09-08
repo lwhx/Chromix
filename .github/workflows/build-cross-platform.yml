@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       use_upstream_cache:
-        description: 'Try pinned upstream toolchain/build artifacts; incompatible caches fall back'
+        description: 'Restore pinned upstream build trees, apply Chromix patches, and resume compilation'
         type: boolean
         default: true
   push:
@@ -16,6 +16,8 @@ on:
       - 'tools/*upstream_cache.py'
       - 'tools/upstream_object_cache.py'
       - 'tools/upstream_script_identity.py'
+      - 'tools/apply_restored_patches.py'
+      - 'tools/prepare_restored_build.py'
       - 'tools/gen_posix_workflow.py'
       - 'tools/merge_gn_args.py'
       - '.github/workflows/build-cross-platform.yml'

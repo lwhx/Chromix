@@ -47,12 +47,34 @@ print(hash.hexdigest())
 PY
 )"
 KEY="$PLATFORM|$ARCH|$CHROMIUM_VERSION|$CORE_COMMIT|$PLATFORM_COMMIT|$PATCH_HASH"
+RESTORED=0
+if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
+  python3 "$REPO/tools/restore_upstream_cache.py" --phase verify \
+    --platform "$PLATFORM" --arch "$ARCH" --workdir "$WORK"
+  RESTORED=1
+fi
+for marker in .chromix-domain-substitution-in-progress .chromix-restored-patches-in-progress; do
+  if [ -e "$SRC/$marker" ]; then
+    echo "source preparation was interrupted: $marker; use a clean work directory" >&2
+    exit 1
+  fi
+done
 if [ -f "$READY" ] && [ "$(cat "$READY")" = "$KEY" ]; then
+  if [ "$RESTORED" -eq 1 ]; then
+    PATCH_BIN="${PATCH_BIN:-$(command -v gpatch || command -v patch)}"
+    python3 "$REPO/tools/apply_restored_patches.py" --src "$SRC" --repo "$REPO" \
+      --core "$CORE_REPO" --platform-tooling "$PLATFORM_REPO" \
+      --platform "$PLATFORM" --patch-bin "$PATCH_BIN" --check
+  fi
   echo "==> pinned ungoogled source already prepared: $KEY"
   exit 0
 fi
-if [ -e "$SRC" ]; then
+if [ -e "$SRC" ] && [ "$RESTORED" -ne 1 ]; then
   echo "source is incomplete or has different pins; use a clean work directory: $WORK" >&2
+  exit 1
+fi
+if [ -e "$READY" ]; then
+  echo "prepared patch set changed; use a clean work directory: $WORK" >&2
   exit 1
 fi
 mkdir -p "$WORK/tooling" "$CACHE"
@@ -75,6 +97,21 @@ if [ "$PLATFORM" = macos ]; then
   test "$CORE_VERSION.$(cat "$PLATFORM_REPO/revision.txt")" = "$PLATFORM_VERSION"
 else
   test "$CORE_VERSION" = "$PLATFORM_VERSION"
+fi
+if [ "$RESTORED" -eq 1 ]; then
+  PATCH_BIN="${PATCH_BIN:-$(command -v gpatch || command -v patch)}"
+  python3 "$REPO/tools/prepare_restored_build.py" --phase inspect --platform "$PLATFORM" --arch "$ARCH" \
+    --workdir "$WORK"
+  python3 "$REPO/tools/apply_restored_patches.py" --src "$SRC" --repo "$REPO" \
+    --core "$CORE_REPO" --platform-tooling "$PLATFORM_REPO" \
+    --platform "$PLATFORM" --patch-bin "$PATCH_BIN"
+  printf '%s\n' "$CORE_COMMIT" > "$SRC/.chromix-ungoogled-core"
+  printf '%s\n' "$PLATFORM_COMMIT" > "$SRC/.chromix-ungoogled-platform"
+  printf '%s\n' "$CHROMIUM_VERSION" > "$SRC/.chromix-chromium-version"
+  printf '%s\n' "$CORE_COMMIT" > "$SRC/.chromix-domain-substituted"
+  printf '%s\n' "$KEY" > "$READY"
+  echo "==> restored upstream source with Chromix patches: $KEY"
+  exit 0
 fi
 if [ "$PLATFORM" = linux ]; then
   # The pinned patch's short import hunk silently hides four Rust ARM64 hunks.

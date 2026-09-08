@@ -221,15 +221,121 @@ function Invoke-ChromixPatches(
     Remove-Item -Force
 }
 
+function Resolve-HostPatch {
+  $command = Get-Command patch.exe -ErrorAction SilentlyContinue
+  if ($command) { return $command.Source }
+  $gitPath = (Get-Command git.exe -ErrorAction Stop).Source
+  $path = Join-Path (Split-Path (Split-Path $gitPath)) "usr\bin\patch.exe"
+  if (Test-Path -LiteralPath $path -PathType Leaf) { return $path }
+  throw "GNU patch.exe from the host Git installation is required for restored source"
+}
+
+function Assert-RestoredToolchain {
+  foreach ($relative in @(
+    "third_party\git\usr\bin\patch.exe",
+    "third_party\ninja\ninja.exe",
+    "third_party\node\win\node.exe",
+    "third_party\llvm-build\Release+Asserts\bin\clang-cl.exe",
+    "third_party\llvm-build\Release+Asserts\bin\lld-link.exe",
+    "third_party\llvm-build\Release+Asserts\bin\llvm-lib.exe",
+    "third_party\llvm-build\Release+Asserts\bin\llvm-ml.exe",
+    "third_party\rust-toolchain\bin\cargo.exe",
+    "third_party\rust-toolchain\bin\rustc.exe",
+    "third_party\rust-toolchain\INSTALLED_VERSION",
+    "third_party\dawn\tools\golang\windows-amd64\bin\go.exe",
+    "third_party\devtools-frontend\src\third_party\esbuild\esbuild.exe"
+  )) {
+    $path = Join-Path $Src $relative
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item -LiteralPath $path).Length -eq 0) {
+      throw "restored Windows build dependency is missing or empty: $relative"
+    }
+  }
+  $libraries = @{
+    "third_party\rust-toolchain\lib\rustlib\x86_64-pc-windows-msvc\lib" = @(
+      "libstd-*.rlib", "libcore-*.rlib", "liballoc-*.rlib", "libcompiler_builtins-*.rlib"
+    )
+    "third_party\rust-toolchain\bin" = @("rustc_driver*.dll")
+    "third_party\llvm-build\Release+Asserts\lib\clang" = @(
+      "stddef.h", "stdarg.h", "clang_rt.builtins-x86_64.lib"
+    )
+  }
+  foreach ($relative in $libraries.Keys) {
+    foreach ($pattern in $libraries[$relative]) {
+      $files = @(Get-ChildItem -LiteralPath (Join-Path $Src $relative) -Filter $pattern -File -Recurse -ErrorAction SilentlyContinue)
+      if ($files.Count -eq 0 -or ($files | Where-Object { $_.Length -eq 0 })) {
+        throw "restored Windows toolchain libraries are missing or empty: $relative\$pattern"
+      }
+    }
+  }
+  if ((Test-Path (Join-Path $Src "third_party\rust-toolchain\bin\bindgen.exe")) -and
+      -not (Test-Path -LiteralPath (Join-Path $Src "third_party\rust-toolchain\bin\libclang.dll") -PathType Leaf)) {
+    throw "restored bindgen is missing its libclang.dll runtime"
+  }
+}
+
+function Assert-PreparedLayers {
+  $markers = @{
+    ".chromix-source-unpacked" = $Revisions.ChromiumVersion
+    ".chromix-ungoogled-core" = $Revisions.UngoogledCommit
+    ".chromix-ungoogled-windows" = $Revisions.UngoogledWindowsCommit
+    ".chromix-binaries-pruned" = $Revisions.UngoogledCommit
+    ".chromix-patches" = $patchSetKey
+  }
+  if ($RestoredUpstream) {
+    $markers[".chromix-domain-substituted"] = $Revisions.UngoogledCommit
+    $markers[".chromix-toolchain-ready"] = $toolchainKey
+  }
+  foreach ($name in $markers.Keys) {
+    if (-not (Test-Marker $name $markers[$name])) {
+      throw "prepared source layer marker is missing or mismatched: $name"
+    }
+  }
+}
+
 $patchSetKey = Get-PatchSetKey
 $versionKey = "$($Revisions.ChromiumVersion)|$($Revisions.UngoogledCommit)|$($Revisions.UngoogledWindowsCommit)|$patchSetKey"
-if (Test-Marker ".chromix-source-ready" $versionKey) {
-  Write-Host "==> source layers already prepared"
-  return
+$toolchainKey = "$($Revisions.UngoogledCommit)|$($Revisions.UngoogledWindowsCommit)"
+$readyMarker = Join-Path $Src ".chromix-source-ready"
+$RestoredUpstream = Test-Path (Join-Path $Src ".chromix-upstream-restored.json")
+if (Get-ChildItem -LiteralPath $Root -Directory -Filter ".chromix-upstream-restore-*" -ErrorAction SilentlyContinue) {
+  throw "upstream restore transaction was interrupted; use a clean work directory"
 }
-if (Test-Path (Join-Path $Src ".chromix-source-ready")) {
-  $preparedKey = (Get-Content (Join-Path $Src ".chromix-source-ready") -Raw).Trim()
+if (-not $RestoredUpstream -and (Test-Path (Join-Path $Src ".chromix-restored-patches.json"))) {
+  throw "restored Chromix patches exist without an upstream receipt"
+}
+foreach ($name in @(".chromix-domain-substitution-in-progress", ".chromix-restored-patches-in-progress")) {
+  if (Test-Path (Join-Path $Src $name)) { throw "source preparation was interrupted: $name; use a clean work directory" }
+}
+foreach ($name in @(".chromix-layer-in-progress", ".chromix-patch-in-progress")) {
+  if ((Test-Path (Join-Path $Src $name)) -and ((Test-Path $readyMarker) -or $RestoredUpstream)) {
+    throw "source layer is still in progress: $name; refusing to trust a ready marker or restored source"
+  }
+}
+if ((Test-Path (Join-Path $Src ".chromix-patch-in-progress")) -and
+    -not (Test-Path (Join-Path $Src ".chromix-layer-in-progress"))) {
+  throw "orphaned Chromix patch progress marker; use a clean work directory"
+}
+if ($RestoredUpstream) {
+  Invoke-Checked $Python @(
+    (Join-Path $Repo "tools\restore_upstream_cache.py"), "--phase", "verify",
+    "--platform", "windows", "--arch", "x64", "--workdir", $Root
+  )
+}
+if ((Test-Path $readyMarker) -and -not (Test-Marker ".chromix-source-ready" $versionKey)) {
+  $preparedKey = (Get-Content $readyMarker -Raw).Trim()
   throw "prepared source key is $preparedKey, expected $versionKey; use a clean work directory"
+}
+if (Test-Path (Join-Path $Src ".chromix-domain-substituted")) {
+  if (-not (Test-Marker ".chromix-domain-substituted" $Revisions.UngoogledCommit)) {
+    throw "domain substitution marker does not match the pinned core commit"
+  }
+}
+if (Test-Path $readyMarker) {
+  Assert-PreparedLayers
+  if (-not $RestoredUpstream) {
+    Write-Host "==> source layers already prepared and verified: $versionKey"
+    return
+  }
 }
 $resumeChromixPatch = ""
 $resumeChromixPatchHash = ""
@@ -297,6 +403,35 @@ if ($actualUngoogledVersion -ne $Revisions.UngoogledVersion) {
 $actualWindowsVersion = "$actualUngoogledVersion.$((Get-Content (Join-Path $Windows 'revision.txt') -Raw).Trim())"
 if ($actualWindowsVersion -ne $Revisions.UngoogledWindowsVersion) {
   throw "ungoogled-chromium-windows version is $actualWindowsVersion, expected $($Revisions.UngoogledWindowsVersion)"
+}
+
+if ($RestoredUpstream) {
+  Invoke-Checked $Python @(
+    (Join-Path $Repo "tools\prepare_restored_build.py"), "--phase", "inspect",
+    "--platform", "windows", "--arch", "x64", "--workdir", $Root
+  )
+  Assert-RestoredToolchain
+  $RestoredPatchExe = Resolve-HostPatch
+  Write-Host "==> verified upstream core/Windows overlay/prune/domain layers; appending Chromix patches"
+  $applyArgs = @(
+    (Join-Path $Repo "tools\apply_restored_patches.py"),
+    "--src", $Src, "--repo", $Repo, "--core", $Ungoogled,
+    "--platform-tooling", $Windows, "--platform", "windows", "--patch-bin", $RestoredPatchExe
+  )
+  if (Test-Path $readyMarker) { $applyArgs += "--check" }
+  Invoke-Checked $Python $applyArgs
+  if (-not (Test-Path $readyMarker)) {
+    Set-Marker ".chromix-source-unpacked" $Revisions.ChromiumVersion
+    Set-Marker ".chromix-ungoogled-core" $Revisions.UngoogledCommit
+    Set-Marker ".chromix-ungoogled-windows" $Revisions.UngoogledWindowsCommit
+    Set-Marker ".chromix-binaries-pruned" $Revisions.UngoogledCommit
+    Set-Marker ".chromix-patches" $patchSetKey
+    Set-Marker ".chromix-domain-substituted" $Revisions.UngoogledCommit
+    Set-Marker ".chromix-toolchain-ready" $toolchainKey
+    Set-Marker ".chromix-source-ready" $versionKey
+  }
+  Write-Host "==> restored source ready and verified: $versionKey"
+  return
 }
 
 if (-not (Test-Marker ".chromix-source-unpacked" $Revisions.ChromiumVersion)) {

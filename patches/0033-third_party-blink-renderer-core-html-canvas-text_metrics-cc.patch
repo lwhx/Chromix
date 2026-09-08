@@ -1,9 +1,9 @@
 diff --git a/third_party/blink/renderer/core/html/canvas/text_metrics.cc b/third_party/blink/renderer/core/html/canvas/text_metrics.cc
-index a78150b4a6..f1814f0673 100644
+index a30a1f3..3db19f2 100644
 --- a/third_party/blink/renderer/core/html/canvas/text_metrics.cc
 +++ b/third_party/blink/renderer/core/html/canvas/text_metrics.cc
-@@ -92,6 +92,7 @@ TextMetrics::TextMetrics(const Font* font,
-   Update(font, direction, baseline, align, text, text_painter);
+@@ -110,6 +110,7 @@ void TextMetrics::Shuffle(const double factor) {
+   baselines_->setIdeographic(baselines_->ideographic() * factor);
  }
  
 +// Text metrics remain derived from the actual shaped and rendered font.

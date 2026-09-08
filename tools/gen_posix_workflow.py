@@ -265,6 +265,11 @@ FINAL_UPLOADS = """      - name: Upload final bundle
           path: |
             ${{ runner.temp }}/chromix-logs/
             ${{ runner.temp }}/chromix-build/src/out/Chromix/args.gn
+            ${{ runner.temp }}/chromix-build/src/out/Default/args.gn
+            ${{ runner.temp }}/chromix-build/src/.chromix-upstream-restored.json
+            ${{ runner.temp }}/chromix-build/src/.chromix-restored-patches.json
+            ${{ runner.temp }}/chromix-build/upstream-cache-restore.json
+            ${{ runner.temp }}/chromix-build/upstream-cache-preparation.json
             ${{ runner.temp }}/chromix-build/upstream-cache-import.json
             ${{ runner.temp }}/chromix-build/upstream-cache-plan.log
             ${{ runner.temp }}/chromix-build/upstream-object-cache.json

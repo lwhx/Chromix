@@ -1,16 +1,20 @@
+import json
 import os
 import re
 import shutil
+import struct
 import subprocess
+import sys
+import tempfile
 import textwrap
 import unittest
 from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parents[2]
-STAGE = REPO / "build" / "windows" / "ci-stage.ps1"
-WORKFLOW = REPO / ".github" / "workflows" / "build-win-x64-github.yml"
-PREPARE = REPO / "build" / "windows" / "prepare-ungoogled.ps1"
+STAGE = REPO / "build/windows/ci-stage.ps1"
+WORKFLOW = REPO / ".github/workflows/build-win-x64-github.yml"
+PREPARE = REPO / "build/windows/prepare-ungoogled.ps1"
 
 
 def workflow_job(source: str, name: str) -> str:
@@ -29,261 +33,712 @@ class WindowsUpstreamCacheRegressionTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.stage = STAGE.read_text(encoding="utf-8")
+        cls.prepare = PREPARE.read_text(encoding="utf-8")
         cls.workflow = WORKFLOW.read_text(encoding="utf-8")
         cls.validate = workflow_job(cls.workflow, "validate")
         cls.build_one = workflow_job(cls.workflow, "build-1")
-        cls.powershell_runs = workflow_runs(cls.validate)
-        for number in range(1, 13):
-            cls.powershell_runs.extend(workflow_runs(workflow_job(cls.workflow, f"build-{number}")))
         start = cls.stage.index("if ($StageIndex -eq 1 -and -not $ValidateOnly")
-        end = cls.stage.index("\n$UngoogledTooling =", start)
+        end = cls.stage.index('\nif (-not (Test-Path (Join-Path $Src ".chromix-source-ready"))', start)
         cls.cache = cls.stage[start:end]
-        cls.object_import = cls.stage[
-            cls.stage.index("  if ($ImportUpstreamCache) {", end):
-            cls.stage.index("  & $gn gen $OutDir", end)
-        ]
+        start = cls.prepare.index('if ($RestoredUpstream) {\n  Invoke-Checked $Python @(\n'
+                                  '    (Join-Path $Repo "tools\\prepare_restored_build.py")')
+        end = cls.prepare.index('\nif (-not (Test-Marker ".chromix-source-unpacked"', start)
+        cls.restored_prep = cls.prepare[start:end]
 
-    def test_gate_one_fresh_build_validation_is_required_with_or_without_cache(self):
+    def test_clean_validation_still_gates_fresh_build(self):
         self.assertIn("if: ${{ inputs.resume_run_id == '' }}", self.validate)
         self.assertNotIn("upstream", self.validate.lower())
         self.assertIn("-StageIndex 1 -MaxStages 12 -ValidateOnly", self.validate)
         self.assertIn("needs: validate", self.build_one)
-        self.assertIn(
-            "if: ${{ always() && inputs.resume_run_id == '' && needs.validate.result == 'success' }}",
-            self.build_one,
-        )
+        self.assertIn("inputs.resume_run_id == '' && needs.validate.result == 'success'", self.build_one)
 
-    def test_gate_two_fetch_is_once_after_cleanup_on_opted_in_fresh_stage_one(self):
-        self.assertRegex(
-            self.cache,
-            r"^if \(\$StageIndex -eq 1 -and -not \$ValidateOnly -and -not \$FromArtifact -and\s+"
-            r"\(\$UseUpstreamCache -or \$UpstreamRunId\)\) \{",
-        )
+    def test_fetch_and_restore_only_fresh_opted_in_stage_one_before_preparation(self):
+        self.assertRegex(self.cache, r"^if \(\$StageIndex -eq 1 -and -not \$ValidateOnly -and -not \$FromArtifact -and\s+"
+                         r"-not \(Test-Path \$Src\) -and \(\$UseUpstreamCache -or \$UpstreamRunId\)\) \{")
         self.assertEqual(self.stage.count("fetch_upstream_cache.py"), 1)
-        self.assertEqual(self.stage.count("$fetchRc = Invoke-Tracked"), 1)
+        self.assertEqual(self.stage.count("--phase restore"), 1)
         self.assertLess(self.stage.index("\nFree-Disk\n"), self.stage.index(self.cache))
-        self.assertIn('$UpstreamCacheDir = "C:\\u"', self.stage)
-        self.assertIn(
-            '"--platform", "windows", "--arch", "x64", "--destination", $UpstreamCacheDir',
-            self.cache,
-        )
-        self.assertNotIn("actions/download-artifact", self.build_one)
-        self.assertNotIn("--repository", self.cache)
-        self.assertNotIn("--artifact", self.cache)
+        self.assertLess(self.stage.index("--phase restore"), self.stage.index('& "$PSScriptRoot\\prepare-ungoogled.ps1"'))
+        self.assertIn('"--platform", "windows", "--arch", "x64", "--destination", $UpstreamCacheDir', self.cache)
+        self.assertIn('--platform windows --arch x64 --workdir $WorkDir --cache-dir $UpstreamCacheDir', self.cache)
         for number in range(2, 13):
             job = workflow_job(self.workflow, f"build-{number}")
             self.assertIn(f"-StageIndex {number} -MaxStages 12 -FromArtifact", job)
             self.assertNotIn("upstream", job.lower())
 
-    def test_gate_three_source_preparation_remains_authoritative_before_imports(self):
-        prepare = self.stage.index('& "$PSScriptRoot\\prepare-ungoogled.ps1" -Root $WorkDir')
-        fetch = self.stage.index(self.cache)
-        toolchain = self.stage.index("--phase toolchain")
-        self.assertLess(prepare, fetch)
-        self.assertLess(fetch, toolchain)
-        self.assertIn('if (-not (Test-Path (Join-Path $Src ".chromix-source-ready"))) {', self.stage)
-        self.assertNotIn("$UseUpstreamCache", self.stage[prepare:fetch])
-        source = PREPARE.read_text(encoding="utf-8")
-        layers = [
-            '"utils\\downloads.py"), "unpack"',
-            'Invoke-PatchDirectory (Join-Path $Ungoogled "patches")',
-            'Invoke-PatchDirectory (Join-Path $Windows "patches")',
-            '"utils\\prune_binaries.py"',
-            "Invoke-ChromixPatches $resumeChromixPatch",
-            'Set-Marker ".chromix-source-ready" $versionKey',
-        ]
-        offsets = [source.index(layer) for layer in layers]
+    def test_resume_verifies_receipt_and_ready_key_before_migrations(self):
+        restore = self.stage.index('& $sevenZip x "C:\\restore\\tree.7z.001"')
+        verify = self.stage.index("--phase verify", restore)
+        prepare = self.stage.index('& "$PSScriptRoot\\prepare-ungoogled.ps1"', verify)
+        migration = self.stage.index('& "$PSScriptRoot\\update-restored-source.ps1"', prepare)
+        self.assertLess(verify, prepare)
+        self.assertLess(prepare, migration)
+        self.assertIn('$MigrateRestoredSource = -not $RestoredUpstream', self.stage)
+        self.assertIn('if (Test-Path $readyMarker) { $applyArgs += "--check" }', self.restored_prep)
+        self.assertIn('Assert-PreparedLayers', self.prepare)
+        self.assertIn('prepared source key is $preparedKey, expected $versionKey', self.prepare)
+        self.assertIn('domain substitution marker does not match the pinned core commit', self.prepare)
+
+    def test_restore_prep_verifies_then_appends_without_replaying_upstream_layers(self):
+        verify = self.prepare.index('"--phase", "verify"')
+        checkout = self.prepare.index('Ensure-Checkout "https://github.com/ungoogled-software/ungoogled-chromium.git"')
+        restored = self.prepare.index(self.restored_prep)
+        self.assertLess(verify, checkout)
+        self.assertLess(checkout, restored)
+        self.assertIn('"--platform-tooling", $Windows, "--platform", "windows", "--patch-bin", $RestoredPatchExe', self.restored_prep)
+        self.assertIn('$RestoredPatchExe = Resolve-HostPatch', self.restored_prep)
+        self.assertNotIn('downloads.py', self.restored_prep)
+        self.assertNotIn('Invoke-PatchDirectory', self.restored_prep)
+        self.assertNotIn('prune_binaries.py', self.restored_prep)
+        self.assertNotIn('Prepare-RustToolchain', self.restored_prep)
+        self.assertLess(self.restored_prep.index('Invoke-Checked $Python $applyArgs'),
+                        self.restored_prep.index('Set-Marker ".chromix-source-ready"'))
+        normal = self.prepare[restored + len(self.restored_prep):]
+        layers = ['"utils\\downloads.py"), "unpack"', 'Invoke-PatchDirectory (Join-Path $Ungoogled "patches")',
+                  'Invoke-PatchDirectory (Join-Path $Windows "patches")', '"utils\\prune_binaries.py"',
+                  'Invoke-ChromixPatches $resumeChromixPatch', 'Set-Marker ".chromix-source-ready"']
+        offsets = [normal.index(layer) for layer in layers]
         self.assertEqual(offsets, sorted(offsets))
 
-    def test_gate_four_toolchain_import_precedes_bootstrap_and_bindgen(self):
-        self.assertIn("if ($ImportUpstreamCache) {", self.cache)
-        self.assertIn(
-            'python (Join-Path $Repo "tools\\import_upstream_cache.py") --phase toolchain',
-            self.cache,
-        )
-        imported = self.stage.index("--phase toolchain")
-        self.assertLess(imported, self.stage.index("python tools\\gn\\bootstrap\\bootstrap.py"))
-        self.assertLess(imported, self.stage.index("python tools\\rust\\build_bindgen.py --skip-test"))
-        self.assertIn('if (-not (Test-Path "third_party\\rust-toolchain\\bin\\bindgen.exe")) {', self.stage)
-        self.assertIn('foreach ($binary in @("cargo.exe", "rustc.exe"))', self.stage)
-
-    def test_gate_five_objects_follow_real_substitution_but_precede_gn_gen(self):
-        imported = self.stage.index("--phase objects")
-        substitution = self.stage.index('python (Join-Path $UngoogledTooling "utils\\domain_substitution.py") apply')
-        completed = self.stage.index('Move-Item -LiteralPath $domainProgress -Destination $domainMarker')
-        self.assertLess(self.stage.index("tools\\merge_gn_args.py"), substitution)
-        self.assertLess(self.stage.index("python tools\\gn\\bootstrap\\bootstrap.py"), substitution)
-        self.assertLess(self.stage.index("python tools\\rust\\build_bindgen.py --skip-test"), substitution)
-        self.assertLess(substitution, self.stage.index('if ($LASTEXITCODE -ne 0) { throw "domain substitution failed" }'))
-        self.assertLess(self.stage.index('throw "domain substitution failed"'), completed)
-        self.assertLess(completed, imported)
-        self.assertLess(imported, self.stage.index("& $gn gen $OutDir --fail-on-unused-args"))
-        self.assertIn("if ($ImportUpstreamCache) {", self.object_import)
-        self.assertEqual(self.stage.count("import_upstream_cache.py"), 2)
-        for phase in (self.cache, self.object_import):
-            self.assertIn("--platform windows --arch x64 --workdir $WorkDir --cache-dir $UpstreamCacheDir", phase)
+    def test_same_default_out_is_used_by_merge_gn_ninja_and_packaging(self):
         self.assertIn('$OutDir = "$Src\\out\\Chromix"', self.stage)
-        self.assertIn(
-            'python (Join-Path $Repo "tools\\merge_gn_args.py") (Join-Path $OutDir "args.gn") `\n'
-            '  (Join-Path $UngoogledTooling "flags.gn") `\n'
-            '  (Join-Path $WindowsTooling "flags.windows.gn") `\n'
-            '  (Join-Path $Repo "build\\args.windows.gn")',
-            self.stage,
-        )
+        self.assertEqual(self.stage.count('$OutDir = "$Src\\out\\Default"'), 2)
+        self.assertNotIn('import_upstream_cache.py', self.stage)
+        self.assertNotIn('$ImportUpstreamCache', self.stage)
+        self.assertNotIn('Rename-Item', self.stage)
+        merge = self.stage[self.stage.index('$gnArgs = Join-Path $OutDir "args.gn"'):
+                           self.stage.index('if ($LASTEXITCODE -ne 0) { throw "GN argument merge failed" }')]
+        self.assertIn('$mergeArgs = @((Join-Path $Repo "tools\\merge_gn_args.py"), $gnArgs)', merge)
+        self.assertIn('if ($RestoredUpstream) { $mergeArgs += $gnArgs }', merge)
+        inputs = ['$mergeArgs += $gnArgs', '(Join-Path $UngoogledTooling "flags.gn")',
+                  '(Join-Path $WindowsTooling "flags.windows.gn")', '(Join-Path $Repo "build\\args.windows.gn")',
+                  'python @mergeArgs']
+        offsets = [merge.index(value) for value in inputs]
+        self.assertEqual(offsets, sorted(offsets))
+        self.assertIn('$gn = Join-Path $OutDir "gn.exe"', self.stage)
+        self.assertIn('if (-not (Test-Path $gn)) {', self.stage)
+        generated = self.stage.index('& $gn gen $OutDir --fail-on-unused-args')
+        planned = self.stage.index('-C $OutDir -n chrome')
+        built = self.stage.index('$rc = Invoke-Tracked -File (Join-Path $Src "third_party\\ninja\\ninja.exe")')
+        packaged = self.stage.index('& "$PSScriptRoot\\package-win.ps1" -Out $OutDir')
+        self.assertLess(generated, planned)
+        self.assertLess(planned, built)
+        self.assertLess(built, packaged)
+        self.assertLess(packaged, self.stage.index('\n  Verify-FinalBundle\n', packaged))
+        self.assertNotRegex(self.cache, r'Set-Content|Set-Marker|Copy-Item|Move-Item|Expand-Archive')
 
-    def test_no_source_marker_spoofing_or_direct_donor_tree_import(self):
-        self.assertNotIn("UpstreamArtifactPath", self.stage + self.workflow)
-        for obsolete in (
-            "$upstreamSrc", "$upstreamOut", "$upstreamVersion", "artifacts.zip",
-            ".chromix-ungoogled-core", ".chromix-ungoogled-windows", "out\\Default",
-        ):
-            self.assertNotIn(obsolete, self.stage)
-        for code in (self.cache, self.object_import):
-            self.assertNotRegex(code, r"Set-Content|Add-Content|WriteAllText|Set-Marker")
-            self.assertNotRegex(code, r"Move-Item|Copy-Item|Remove-Item|Expand-Archive|sevenZip")
-            self.assertNotIn(".chromix-", code)
-            self.assertNotIn("--force", code)
-        self.assertNotRegex(
-            self.stage,
-            r'(?m)^\s*(?:Set-Content|Add-Content|Set-Marker).*\.chromix-',
-        )
-        writes = re.findall(r'(?m)^\s*(?:Set-Content|Add-Content) -Path (\$domain\w+)', self.stage)
-        self.assertEqual(writes, ['$domainProgress'])
-        self.assertNotIn('Set-Content -Path $domainMarker', self.stage)
-        self.assertEqual(self.stage.count('Move-Item -LiteralPath $domainProgress -Destination $domainMarker'), 1)
+    def test_optional_miss_timeout_and_budget_keep_normal_path(self):
+        self.assertIn('if ($fetchRc -eq 124)', self.cache)
+        self.assertIn('continuing with normal source preparation', self.cache)
+        self.assertIn('upstream restore missed', self.cache)
+        self.assertIn('throw "upstream restore created source without a receipt"', self.cache)
+        self.assertIn('throw "upstream restore helper failed (exit $LASTEXITCODE)"', self.cache)
+        self.assertIn('if ((Get-RemainingMin) -lt ($PackReserveMin + 60))', self.cache)
+        self.assertIn('-ArgList $fetchCommandLine -Cwd $Repo -TimeoutSec 1200', self.cache)
+        self.assertIn('$Deadline = (Get-Date).AddMinutes(300)', self.stage)
+        self.assertIn('$PackReserveMin = 40', self.stage)
 
-    def test_boolean_defaults_disable_cache_unless_run_id_is_explicit(self):
-        inputs = re.findall(
-            r"(?m)^      use_upstream_cache:\n((?:        [^\n]*\n)+)",
-            self.workflow,
-        )
-        self.assertEqual(len(inputs), 2)
-        for fields in inputs:
-            self.assertIn("required: false", fields)
-            self.assertIn("type: boolean", fields)
-            self.assertIn("default: true", fields)
-        self.assertIn("[switch]$UseUpstreamCache", self.stage)
-        self.assertIn("UseUpstreamCache = ($env:USE_UPSTREAM_CACHE -eq 'true')", self.build_one)
-        self.assertIn("($UseUpstreamCache -or $UpstreamRunId)", self.cache)
-        self.assertIn('if ($UpstreamRunId) { $fetchArgs += @("--run-id", $UpstreamRunId) }', self.cache)
+    def test_missing_bindgen_uses_normal_builder_with_known_endpoint_normalization(self):
+        start = self.stage.index('if (-not (Test-Path "third_party\\rust-toolchain\\bin\\bindgen.exe"))')
+        end = self.stage.index('  if (-not (Test-Path $domainMarker))', start)
+        bindgen = self.stage[start:end]
+        self.assertIn('foreach ($binary in @("cargo.exe", "rustc.exe"))', bindgen)
+        self.assertIn('if ($RestoredUpstream)', bindgen)
+        self.assertIn('from upstream_script_identity import ENDPOINTS, RESTORED', bindgen)
+        self.assertIn('python tools\\rust\\build_bindgen.py --skip-test', bindgen)
+        self.assertLess(bindgen.index('python -c $normalizeToolUrls'), bindgen.index('python tools\\rust'))
 
-    def test_user_input_and_optional_token_use_environment_not_shell_interpolation(self):
-        runs = self.powershell_runs
+    def test_inspect_precedes_tools_and_finish_precedes_gn_without_placeholder_report(self):
+        self.assertIn('"--phase", "inspect"', self.restored_prep)
+        self.assertIn('"--platform", "windows", "--arch", "x64", "--workdir", $Root', self.restored_prep)
+        self.assertLess(self.restored_prep.index('prepare_restored_build.py'),
+                        self.restored_prep.index('Assert-RestoredToolchain'))
+        self.assertLess(self.stage.index('& "$PSScriptRoot\\prepare-ungoogled.ps1"'),
+                        self.stage.index('python tools\\rust\\build_bindgen.py'))
+        finish = self.stage.index('prepare_restored_build.py") --phase finish')
+        self.assertLess(self.stage.index('throw "bindgen build failed"'), finish)
+        self.assertLess(finish, self.stage.index('python tools\\gn\\bootstrap\\bootstrap.py'))
+        self.assertLess(finish, self.stage.index('& $gn gen $OutDir'))
+        self.assertNotIn('upstream-cache-preparation.json', self.stage)
+
+    def test_user_input_and_optional_token_use_environment_not_interpolation(self):
+        runs = workflow_runs(self.validate)
+        for number in range(1, 13):
+            runs.extend(workflow_runs(workflow_job(self.workflow, f"build-{number}")))
         self.assertEqual(len(runs), 25)
         for run in runs:
             self.assertNotIn("${{", run)
-        for run in workflow_runs(self.workflow):
-            self.assertNotRegex(run, r"\$\{\{\s*inputs\.")
         self.assertIn("UPSTREAM_RUN_ID: ${{ inputs.upstream_run_id }}", self.build_one)
         self.assertIn("USE_UPSTREAM_CACHE: ${{ inputs.use_upstream_cache }}", self.build_one)
-        self.assertIn("$stageArgs.UpstreamRunId = $env:UPSTREAM_RUN_ID", self.build_one)
-        self.assertIn("& build\\windows\\ci-stage.ps1 @stageArgs", self.build_one)
-        self.assertIn(r"[ValidatePattern('\A[0-9]*\z')] [string]$UpstreamRunId", self.stage)
         self.assertIn("GH_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_TOKEN || github.token }}", self.build_one)
-        self.assertRegex(self.workflow, r"secrets:\s+UPSTREAM_ACTIONS_TOKEN:\s+required: false")
-        self.assertNotIn("GH_TOKEN", "\n".join(runs))
-        self.assertNotIn("Invoke-Expression", self.stage + self.workflow)
+        self.assertIn(r"[ValidatePattern('\A[0-9]*\z')] [string]$UpstreamRunId", self.stage)
+        self.assertIn('if ($UpstreamRunId) { $fetchArgs += @("--run-id", $UpstreamRunId) }', self.cache)
         self.assertIn('$fetchCommandLine = ($fetchArgs | ForEach-Object { "`"$_`"" }) -join " "', self.cache)
-        self.assertIn("-ArgList $fetchCommandLine -Cwd $Repo", self.cache)
+        self.assertNotIn('Invoke-Expression', self.stage)
 
-    def test_optional_misses_continue_through_both_phases_and_normal_build(self):
-        self.assertIn("$ImportUpstreamCache = $false", self.stage)
-        self.assertIn("$ImportUpstreamCache = $true", self.cache)
-        self.assertRegex(
-            self.cache,
-            r'if \(\$fetchRc -eq 124\) \{\s+Write-Host "[^"\n]+"\s+'
-            r'\} elseif \(\$fetchRc -ne 0\) \{\s+'
-            r'throw "upstream cache fetch helper failed \(exit \$fetchRc\)"\s+'
-            r'\} else \{\s+\$ImportUpstreamCache = \$true',
-        )
-        for helper in ("toolchain import", "object import"):
-            self.assertIn(
-                f'if ($LASTEXITCODE -ne 0) {{ throw "upstream {helper} helper failed (exit $LASTEXITCODE)" }}',
-                self.stage,
-            )
-        for code in (self.cache, self.object_import):
-            self.assertNotRegex(code, r"\b(?:return|exit)\s+[0-9]|Write-OutVar finished")
-            self.assertNotIn("Test-Path", code)
-            self.assertNotIn("ConvertFrom-Json", code)
-            self.assertNotIn("--required", code)
-        generated = self.stage.index("& $gn gen $OutDir --fail-on-unused-args")
-        validation = self.stage.index("if ($ValidateOnly) {")
-        compilation = self.stage.index('$rc = Invoke-Tracked -File (Join-Path $Src "third_party\\ninja\\ninja.exe")')
-        self.assertLess(generated, validation)
-        self.assertLess(validation, compilation)
-        self.assertIn('throw "gn gen failed"', self.stage)
-        self.assertIn('throw "V8 Torque validation failed (exit $validationRc)"', self.stage)
-        self.assertIn('throw "ninja failed (exit $rc)"', self.stage)
-        package = self.stage.index('& "$PSScriptRoot\\package-win.ps1"')
-        verified = self.stage.index("\n  Verify-FinalBundle\n", package)
-        finished = self.stage.index("Write-OutVar finished true", verified)
-        self.assertLess(package, verified)
-        self.assertLess(verified, finished)
-
-    def test_cache_respects_existing_stage_budget(self):
-        self.assertIn("$Deadline = (Get-Date).AddMinutes(300)", self.stage)
-        self.assertIn("$PackReserveMin = 40", self.stage)
-        self.assertIn("if ((Get-RemainingMin) -lt ($PackReserveMin + 60)) {", self.cache)
-        self.assertIn("skipping optional upstream cache: insufficient stage budget", self.cache)
-        self.assertIn("-ArgList $fetchCommandLine -Cwd $Repo -TimeoutSec 1200", self.cache)
-        self.assertIn("optional upstream cache timed out; continuing with the prepared source", self.cache)
-        self.assertNotIn("--timeout", self.cache)
-        self.assertNotIn("--retries", self.cache)
-        self.assertEqual(self.workflow.count("timeout-minutes: 355"), 12)
-
-    def test_stage_one_uploads_only_cache_reports_even_after_failure(self):
-        start = self.build_one.index("      - name: Upload upstream cache diagnostics")
-        end = self.build_one.index("      - name: Ensure build tree snapshot", start)
-        diagnostics = self.build_one[start:end]
-        self.assertIn("if: ${{ always() }}", diagnostics)
-        self.assertIn("uses: actions/upload-artifact@v4", diagnostics)
-        self.assertIn("if-no-files-found: ignore", diagnostics)
-        paths = re.search(r"path: \|\n((?:            [^\n]+\n)+)", diagnostics)
-        self.assertIsNotNone(paths)
-        self.assertEqual(
-            [line.strip() for line in paths.group(1).splitlines()],
-            [r"C:\u\result.json", r"C:\c\chromix\upstream-cache-import.json",
-             r"C:\c\chromix\upstream-cache-plan.log"],
-        )
-        self.assertNotIn(r"C:\u\tree", self.workflow)
-        self.assertNotIn(r"C:\u\*", self.workflow)
-        self.assertEqual(self.workflow.count("Upload upstream cache diagnostics"), 1)
-        self.assertEqual(self.workflow.count("- name: Ensure build tree snapshot"), 12)
-        self.assertEqual(self.workflow.count("- name: Upload tree part"), 48)
-
-    @unittest.skipUnless(shutil.which("pwsh"), "pwsh is not installed; parse-only check unavailable")
-    def test_powershell_stage_and_workflow_commands_parse_without_execution(self):
-        stage_parser = r"""
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh is not installed")
+    def test_powershell_scripts_and_workflow_commands_parse_without_execution(self):
+        commands = workflow_runs(self.validate)
+        for number in range(1, 13):
+            commands.extend(workflow_runs(workflow_job(self.workflow, f"build-{number}")))
+        commands.extend([self.stage, self.prepare])
+        parser = r'''
 $tokens = $null
 $errors = $null
-[Management.Automation.Language.Parser]::ParseFile($env:STAGE_PATH, [ref]$tokens, [ref]$errors) | Out-Null
-if ($errors.Count -gt 0) {
-  $errors | ForEach-Object { Write-Error $_.Message }
-  exit 1
+[Management.Automation.Language.Parser]::ParseInput($env:PS_INPUT, [ref]$tokens, [ref]$errors) | Out-Null
+if ($errors.Count) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }
+'''
+        for code in commands:
+            result = subprocess.run([shutil.which("pwsh"), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", parser],
+                                    env={**os.environ, "PS_INPUT": code}, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class WindowsRestoredPreparationFixture:
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="windows restored prep ")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.work = self.root / "work"
+        self.src = self.work / "src"
+        self.repo.mkdir()
+        self.src.mkdir(parents=True)
+        self.calls = self.root / "calls"
+        self.pins = dict(re.findall(r'^\s*(\w+) = "([^"\n]+)"',
+                                   (REPO / "build/ungoogled-revisions.psd1").read_text(), re.M))
+        self.put(self.repo / "build/ungoogled-revisions.psd1", (REPO / "build/ungoogled-revisions.psd1").read_text())
+        self.put(self.repo / "patches/series", "patches/one.patch\n")
+        self.put(self.repo / "patches/one.patch", "diff --git a/sample.cc b/sample.cc\n--- a/sample.cc\n+++ b/sample.cc\n"
+                 "@@ -1 +1 @@\n-google.test upstream\n+google.test Chromix\n")
+        self.put(self.src / "sample.cc", "blocked.test upstream\n")
+        self.put(self.src / ".chromix-upstream-restored.json", '{"valid": true}')
+        self.put(self.src / "out/Default/obj/retained.obj", "cached object")
+        self.put(self.repo / "tools/apply_restored_patches.py", (REPO / "tools/apply_restored_patches.py").read_text())
+        self.put(self.repo / "tools/restore_upstream_cache.py", '''import json, os, sys
+from pathlib import Path
+with open(os.environ['MOCK_CALLS'], 'a') as output:
+    output.write('verify\\n')
+assert sys.argv[1:7] == ['--phase', 'verify', '--platform', 'windows', '--arch', 'x64']
+assert '--cache-dir' not in sys.argv
+src = Path(sys.argv[sys.argv.index('--workdir') + 1]) / 'src'
+assert json.loads((src / '.chromix-upstream-restored.json').read_text()).get('valid')
+''')
+        core = self.work / "tooling/ungoogled-chromium"
+        windows = self.work / "tooling/ungoogled-chromium-windows"
+        self.put(core / "chromium_version.txt", self.pins["ChromiumVersion"])
+        self.put(core / "revision.txt", "1")
+        self.put(windows / "revision.txt", "1")
+        self.put(core / "domain_regex.list", r"google\.test#blocked.test" + "\n")
+        self.put(windows / "domain_substitution.list", "sample.cc\n")
+        source = PREPARE.read_text()
+        toolcheck = source[source.index('function Assert-RestoredToolchain'):source.index('function Assert-PreparedLayers')]
+        for relative in re.findall(r'^    "(third_party[^"\n]+)"[,]?$', toolcheck, re.M):
+            self.put(self.src / relative.replace('\\', '/'), "tool fixture")
+        for name in ("libstd-fixture.rlib", "libcore-fixture.rlib", "liballoc-fixture.rlib", "libcompiler_builtins-fixture.rlib"):
+            self.put(self.src / "third_party/rust-toolchain/lib/rustlib/x86_64-pc-windows-msvc/lib" / name, "std")
+        self.put(self.src / "third_party/rust-toolchain/bin/rustc_driver-fixture.dll", "driver")
+        for relative in ("include/stddef.h", "include/stdarg.h", "lib/windows/clang_rt.builtins-x86_64.lib"):
+            self.put(self.src / "third_party/llvm-build/Release+Asserts/lib/clang/22" / relative, "resource")
+        self.prepare_build_fixture()
+        # Only host executable discovery differs on Linux; the preparation body is unchanged.
+        source = source.replace('(Get-Command python.exe -ErrorAction Stop).Source', '$env:MOCK_PYTHON')
+        source = source.replace('Get-Command patch.exe -ErrorAction SilentlyContinue', 'Get-Command patch -ErrorAction SilentlyContinue')
+        self.script = self.root / "prepare.ps1"
+        self.put(self.script, source)
+        self.wrapper = self.root / "run.ps1"
+        self.put(self.wrapper, r'''
+$ErrorActionPreference = "Stop"
+function git {
+  Add-Content -LiteralPath $env:MOCK_CALLS -Value ("git " + ($args -join " "))
+  if ($args[0] -eq "clone") {
+    New-Item -ItemType Directory -Force -Path (Join-Path $args[-1] ".git") | Out-Null
+  }
+  if ($args[0] -eq "-C") {
+    if ($args[1] -like "*ungoogled-chromium-windows") { $env:MOCK_WINDOWS } else { $env:MOCK_CORE }
+  }
+  $global:LASTEXITCODE = 0
 }
-"""
-        run_parser = r"""
-$tokens = $null
-$errors = $null
-[Management.Automation.Language.Parser]::ParseInput($env:WORKFLOW_RUN, [ref]$tokens, [ref]$errors) | Out-Null
-if ($errors.Count -gt 0) {
-  $errors | ForEach-Object { Write-Error $_.Message }
-  exit 1
+& $env:MOCK_SCRIPT -Root $env:MOCK_WORK -Repo $env:MOCK_REPO
+''')
+        self.env = {**os.environ, "MOCK_CALLS": str(self.calls), "MOCK_PYTHON": sys.executable,
+                    "MOCK_CORE": self.pins["UngoogledCommit"], "MOCK_WINDOWS": self.pins["UngoogledWindowsCommit"],
+                    "MOCK_SCRIPT": str(self.script), "MOCK_WORK": str(self.work), "MOCK_REPO": str(self.repo)}
+
+    @staticmethod
+    def put(path, content):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    def prepare_build_fixture(self):
+        from tools import prepare_restored_build as helper
+        from tools import restore_upstream_cache as restore
+
+        identity, _, manifest = restore.identities(REPO, "windows", "x64")
+        version = "\n".join(f"{key}={value}" for key, value in zip(
+            ("MAJOR", "MINOR", "BUILD", "PATCH"), identity["chromium_version"].split(".")))
+        self.put(self.src / "chrome/VERSION", version)
+        self.put(self.src / "BUILD.gn", "# fixture\n")
+        self.out = self.src / "out/Default"
+        self.put(self.out / "args.gn", 'target_cpu = "x64"\nis_debug = true\n'
+                 'extra_literal = ["upstream", "with spaces"]\ncommon_override = "donor"\n'
+                 'windows_override = "donor"\n')
+        self.put(self.out / "build.ninja", "# fixture\n")
+        self.put(self.out / ".ninja_log", "# ninja log v5\n")
+        self.put(self.src / "include/local.h", "local header")
+        records = {"obj/retained.obj": ["../../include/local.h"],
+                   "obj/sdk.obj": [r"C:\Program Files\Windows Kits\10\Include\external.h"]}
+        paths = list(dict.fromkeys(path for output, inputs in records.items() for path in (output, *inputs)))
+        deps = bytearray(b"# ninjadeps\n\x04\0\0\0")
+        for index, path in enumerate(paths):
+            payload = path.encode()
+            payload += b"\0" * (-len(payload) % 4) + struct.pack("<I", ~index & 0xffffffff)
+            deps += struct.pack("<I", len(payload)) + payload
+        for output, inputs in records.items():
+            values = [paths.index(output), 1, 0] + [paths.index(path) for path in inputs]
+            payload = struct.pack(f"<{len(values)}I", *values)
+            deps += struct.pack("<I", 0x80000000 | len(payload)) + payload
+        (self.out / ".ninja_deps").write_bytes(deps)
+        receipt = {"schema_version": 1, "owner": restore.OWNER, "status": "restored", "valid": True,
+                   "extraction_scope": restore.fetcher.SOURCE_SCOPE, "identity": identity, "manifest": manifest,
+                   "platform": "windows", "arch": "x64", "external_symlink_paths": [],
+                   "original_args": restore.source_args(self.src, identity)}
+        self.put(self.src / restore.MARKER, json.dumps(receipt))
+        self.put(self.out / "obj/sdk.obj", "external SDK object")
+        for name in ("chrome.exe", "chrome.dll", "chrome_elf.dll"):
+            self.put(self.out / name, "upstream final product")
+        for name, relative in helper.tool_paths("windows", "x64").items():
+            if name == "bindgen":
+                continue
+            path = self.src / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            header = bytearray(64)
+            header[:2] = b"MZ"
+            struct.pack_into("<I", header, 60, 64)
+            header.extend(b"PE\0\0" + struct.pack("<H", 0xAA64 if name == "gn" else 0x8664))
+            path.write_bytes(header)
+        self.put(self.root / "probe.py", '''import os, sys
+print('fixture ' + sys.argv[1])
+raise SystemExit(1 if os.environ.get('MOCK_PROBE_FAILURE') == sys.argv[1] else 0)
+''')
+        # Real receipt/header checks and invalidation; only native execution is a tiny stub.
+        self.put(self.repo / "tools/prepare_restored_build.py", f'''import os, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, {str(REPO)!r})
+from tools import prepare_restored_build as helper
+root = Path(os.environ['MOCK_WORK'])
+paths = {{root / 'src' / path for path in helper.tool_paths('windows', 'x64').values()}}
+run = subprocess.run
+def probe(command, **kwargs):
+    assert Path(command[0]) in paths, command
+    assert len(command) == 2 and command[1] in ('--version', '/?', '/help', '--help'), command
+    return run([sys.executable, {str(self.root / 'probe.py')!r}, Path(command[0]).stem, command[1]], **kwargs)
+helper.host_identity = lambda: ('windows', 'x64')
+helper.subprocess.run = probe
+with open(os.environ['MOCK_CALLS'], 'a') as output:
+    output.write(sys.argv[sys.argv.index('--phase') + 1] + '\\n')
+raise SystemExit(helper.main())
+''')
+
+    def run_prep(self):
+        return subprocess.run([shutil.which("pwsh"), "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.wrapper)],
+                              env=self.env, capture_output=True, text=True, timeout=30)
+
+
+@unittest.skipUnless(shutil.which("pwsh") and shutil.which("patch"), "PowerShell and GNU patch required")
+class WindowsRestoredPreparationMockTest(WindowsRestoredPreparationFixture, unittest.TestCase):
+    def test_verified_restore_applies_real_patch_then_resumes_without_source_mutation(self):
+        object_file = self.src / "out/Default/obj/retained.obj"
+        object_time = object_file.stat().st_mtime_ns
+        result = self.run_prep()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.src / "sample.cc").read_text(), "blocked.test Chromix\n")
+        self.assertEqual(self.calls.read_text().splitlines()[0], "verify")
+        self.assertTrue((self.src / ".chromix-restored-patches.json").is_file())
+        for name in (".chromix-source-ready", ".chromix-toolchain-ready", ".chromix-domain-substituted"):
+            self.assertTrue((self.src / name).is_file())
+        modified = (self.src / "sample.cc").stat().st_mtime_ns
+        resumed = self.run_prep()
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertIn('"status": "checked"', resumed.stdout)
+        self.assertEqual((self.src / "sample.cc").stat().st_mtime_ns, modified)
+        self.assertEqual(self.calls.read_text().splitlines().count("inspect"), 2)
+        self.assertEqual(object_file.stat().st_mtime_ns, object_time)
+        self.assertFalse((self.src / "out/Chromix").exists())
+
+    def test_invalid_receipt_or_missing_tool_cannot_stamp_ready(self):
+        receipt = (self.src / ".chromix-upstream-restored.json").read_text()
+        for failure in ("receipt", "tool"):
+            with self.subTest(failure=failure):
+                if failure == "receipt":
+                    self.put(self.src / ".chromix-upstream-restored.json", '{}')
+                else:
+                    self.put(self.src / ".chromix-upstream-restored.json", receipt)
+                    (self.src / "third_party/rust-toolchain/bin/cargo.exe").unlink()
+                result = self.run_prep()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((self.src / ".chromix-source-ready").exists())
+                self.assertEqual((self.src / "sample.cc").read_text(), "blocked.test upstream\n")
+
+    def test_ready_marker_never_bypasses_partial_patch_or_changed_output(self):
+        good = self.run_prep()
+        self.assertEqual(good.returncode, 0, good.stdout + good.stderr)
+        self.put(self.src / "sample.cc", "tampered source\n")
+        tampered = self.run_prep()
+        self.assertNotEqual(tampered.returncode, 0)
+        self.assertIn("completed source changed", tampered.stderr)
+        for marker in (".chromix-layer-in-progress", ".chromix-domain-substitution-in-progress",
+                       ".chromix-restored-patches-in-progress"):
+            with self.subTest(marker=marker):
+                self.put(self.src / marker, "incomplete")
+                failed = self.run_prep()
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertRegex(failed.stderr, "interrupted|in progress")
+                (self.src / marker).unlink()
+
+    def test_ready_without_patch_receipt_or_layer_marker_is_rejected(self):
+        good = self.run_prep()
+        self.assertEqual(good.returncode, 0, good.stdout + good.stderr)
+        patch_receipt = self.src / ".chromix-restored-patches.json"
+        saved = patch_receipt.read_bytes()
+        patch_receipt.unlink()
+        failed = self.run_prep()
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("completion marker is missing", failed.stderr)
+        patch_receipt.write_bytes(saved)
+        (self.src / ".chromix-ungoogled-core").unlink()
+        failed = self.run_prep()
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("layer marker is missing or mismatched", failed.stderr)
+
+    def test_failed_patch_or_stale_ready_key_never_replays_upstream_preparation(self):
+        self.put(self.src / "sample.cc", "unexpected base\n")
+        failed = self.run_prep()
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("patch failed", failed.stderr)
+        self.assertFalse((self.src / ".chromix-source-ready").exists())
+        self.assertTrue((self.src / ".chromix-restored-patches-in-progress").is_file())
+        (self.src / ".chromix-restored-patches-in-progress").unlink()
+        self.put(self.src / ".chromix-source-ready", "old pins")
+        failed = self.run_prep()
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("prepared source key", failed.stderr)
+
+
+@unittest.skipUnless(shutil.which("pwsh") and shutil.which("patch"), "PowerShell and GNU patch required")
+class WindowsRestoredBuildStageTest(WindowsRestoredPreparationFixture, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.put(self.repo / "tools/merge_gn_args.py", (REPO / "tools/merge_gn_args.py").read_text())
+        self.put(self.repo / "tools/upstream_script_identity.py", (REPO / "tools/upstream_script_identity.py").read_text())
+        self.put(self.work / "tooling/ungoogled-chromium/flags.gn",
+                 'common_override = "core"\nwindows_override = "core"\nis_debug = true\n')
+        self.put(self.work / "tooling/ungoogled-chromium-windows/flags.windows.gn",
+                 'windows_override = "windows"\nis_debug = true\n')
+        self.put(self.repo / "build/args.windows.gn", (REPO / "build/args.windows.gn").read_text())
+        from tools.upstream_script_identity import ENDPOINTS, RESTORED
+        for relative, keys in RESTORED.items():
+            self.put(self.src / relative, "\n".join(ENDPOINTS[key][0] for key in keys))
+        self.put(self.src / "tools/rust/build_bindgen.py", '''import os, struct
+from pathlib import Path
+with open(os.environ['MOCK_CALLS'], 'a') as output:
+    output.write('bindgen\\n')
+assert (Path.cwd() / '.chromix-restored-build-inspection.json').is_file()
+if os.environ.get('MOCK_BINDGEN_FAILURE') == '1':
+    raise SystemExit(1)
+header = bytearray(64)
+header[:2] = b'MZ'
+struct.pack_into('<I', header, 60, 64)
+header.extend(b'PE\\0\\0' + struct.pack('<H', 0x8664))
+rust = Path('third_party/rust-toolchain/bin')
+(rust / 'bindgen.exe').write_bytes(header)
+(rust / 'libclang.dll').write_text('fixture runtime')
+''')
+        self.put(self.src / "tools/gn/bootstrap/bootstrap.py", '''import json, os, struct, sys
+from pathlib import Path
+with open(os.environ['MOCK_CALLS'], 'a') as output:
+    output.write('gn-bootstrap\\n')
+report = json.loads((Path(os.environ['MOCK_WORK']) / 'upstream-cache-preparation.json').read_text())
+assert report['phase'] == 'finish' and report['ready_for_gn']
+gn = Path(sys.argv[sys.argv.index('-o') + 1])
+assert not gn.exists(), 'finish must remove incompatible GN before bootstrap'
+header = bytearray(64)
+header[:2] = b'MZ'
+struct.pack_into('<I', header, 60, 64)
+header.extend(b'PE\\0\\0' + struct.pack('<H', 0x8664))
+gn.write_bytes(header)
+''')
+        self.put(self.root / "prepare-ungoogled.ps1", self.script.read_text())
+        stage = STAGE.read_text()
+        start = stage.index('$domainProgress = Join-Path $Src')
+        end = stage.index('\nif ($ValidateOnly) {', start)
+        body = stage[start:end]
+        # PE execution is stubbed on Linux; PowerShell control flow and Python helpers are real.
+        body = body.replace('& $gn gen $OutDir --fail-on-unused-args',
+                            'Invoke-FixtureGn gen $OutDir --fail-on-unused-args')
+        body = body.replace('& (Join-Path $Src "third_party\\ninja\\ninja.exe") -C $OutDir -n chrome',
+                            'Invoke-FixtureNinja -C $OutDir -n chrome')
+        self.put(self.wrapper, self.wrapper.read_text().split('& $env:MOCK_SCRIPT', 1)[0] + r'''
+$Repo = $env:MOCK_REPO
+$WorkDir = $env:MOCK_WORK
+$Src = Join-Path $WorkDir "src"
+$OutDir = Join-Path $Src "out/Chromix"
+$RestoredUpstream = $false
+$StageIndex = [int]$env:MOCK_STAGE
+$FromArtifact = $StageIndex -gt 1
+$ValidateOnly = $false
+$UseUpstreamCache = $true
+$UpstreamRunId = ""
+$Deadline = (Get-Date).AddMinutes(250)
+$PackReserveMin = 40
+$Revisions = Import-PowerShellDataFile (Join-Path $Repo "build/ungoogled-revisions.psd1")
+function Get-RemainingMin { return 250 }
+function Save-Handoff { throw "unexpected handoff" }
+function python {
+  if ($args[0] -eq "-c") {
+    Add-Content -LiteralPath $env:MOCK_CALLS -Value "normalize"
+  }
+  $arguments = @($args)
+  $arguments[0] = $arguments[0].Replace('\', '/')
+  & $env:MOCK_PYTHON @arguments
 }
-"""
-        checks = [(stage_parser, {"STAGE_PATH": str(STAGE)})]
-        checks.extend((run_parser, {"WORKFLOW_RUN": run}) for run in self.powershell_runs)
-        for parser, values in checks:
+function Invoke-FixtureGn {
+  if (-not (Test-Path $gn)) { throw "GN is missing" }
+  $report = Get-Content (Join-Path $WorkDir "upstream-cache-preparation.json") -Raw | ConvertFrom-Json
+  if (-not $report.ready_for_gn -or $report.phase -ne "finish") { throw "GN before finish" }
+  Add-Content -LiteralPath $env:MOCK_CALLS -Value "gn-gen"
+  $global:LASTEXITCODE = 0
+}
+function Invoke-FixtureNinja {
+  Add-Content -LiteralPath $env:MOCK_CALLS -Value "ninja-plan"
+  $global:LASTEXITCODE = 0
+}
+''' + body)
+        self.env["MOCK_STAGE"] = "1"
+
+    def phases(self):
+        return [line for line in self.calls.read_text().splitlines() if not line.startswith("git ")]
+
+    def report(self):
+        return json.loads((self.work / "upstream-cache-preparation.json").read_text())
+
+    def test_missing_bindgen_then_finish_invalidates_before_gn_and_resume_reinspects(self):
+        first = self.run_prep()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(self.phases(), ["verify", "verify", "inspect", "normalize", "bindgen", "finish",
+                                         "gn-bootstrap", "gn-gen", "ninja-plan"])
+        report = self.report()
+        self.assertEqual((report["platform"], report["arch"], report["phase"]), ("windows", "x64", "finish"))
+        self.assertTrue(report["ready_for_gn"])
+        self.assertGreater(report["counters"]["toolchain_invalidated_outputs"], 0)
+        self.assertFalse((self.out / "obj/retained.obj").exists())
+        self.assertFalse((self.out / "obj/sdk.obj").exists())
+        for name in ("chrome.exe", "chrome.dll", "chrome_elf.dll"):
+            self.assertFalse((self.out / name).exists())
+        for name in ("args.gn", "build.ninja", ".ninja_deps", ".ninja_log"):
+            self.assertTrue((self.out / name).is_file())
+        self.assertFalse((self.src / ".chromix-restored-build-inspection.json").exists())
+        args = (self.out / "args.gn").read_text()
+        self.assertIn('extra_literal = ["upstream", "with spaces"]', args)
+        self.assertIn('common_override = "core"', args)
+        self.assertIn('windows_override = "windows"', args)
+        self.assertEqual(args.count('is_debug ='), 1)
+        self.assertIn('is_debug = false', args)
+        self.assertFalse((self.src / "out/Chromix").exists())
+        self.put(self.out / "obj/retained.obj", "new object")
+        self.put(self.out / "chrome.exe", "Chromix product")
+        times = {name: (self.out / name).stat().st_mtime_ns for name in ("obj/retained.obj", "chrome.exe", "gn.exe")}
+        self.calls.unlink()
+        self.env["MOCK_STAGE"] = "2"
+        resumed = self.run_prep()
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertEqual(self.phases(), ["verify", "verify", "inspect", "finish", "gn-gen", "ninja-plan"])
+        self.assertEqual(self.report()["counters"]["toolchain_invalidated_outputs"], 0)
+        self.assertEqual(times, {name: (self.out / name).stat().st_mtime_ns for name in times})
+        self.assertEqual((self.out / "args.gn").read_text(), args)
+
+    def test_native_tools_keep_internal_objects_but_recheck_external_sdk_on_resume(self):
+        rust = self.src / "third_party/rust-toolchain/bin"
+        shutil.copyfile(rust / "cargo.exe", rust / "bindgen.exe")
+        self.put(rust / "libclang.dll", "fixture runtime")
+        shutil.copyfile(rust / "cargo.exe", self.out / "gn.exe")
+        before = (self.out / "obj/retained.obj").stat().st_mtime_ns
+        first = self.run_prep()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(self.phases(), ["verify", "verify", "inspect", "finish", "gn-gen", "ninja-plan"])
+        self.assertEqual((self.out / "obj/retained.obj").stat().st_mtime_ns, before)
+        self.assertFalse((self.out / "obj/sdk.obj").exists())
+        self.assertEqual(self.report()["dependencies"]["external_dependency_outputs"], 1)
+        self.assertEqual(self.report()["removed_final_products"], ["chrome.exe", "chrome.dll", "chrome_elf.dll"])
+        self.put(self.out / "obj/sdk.obj", "rebuilt SDK object")
+        self.calls.unlink()
+        self.env.update(MOCK_STAGE="2", WindowsSDKVersion="changed-fixture-sdk")
+        resumed = self.run_prep()
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertFalse((self.out / "obj/sdk.obj").exists())
+        self.assertEqual((self.out / "obj/retained.obj").stat().st_mtime_ns, before)
+        self.assertEqual(self.report()["counters"]["environment_rechecks"], 1)
+
+    def test_failed_tool_probe_or_bindgen_never_reaches_gn_or_claims_prepared(self):
+        for failed_tool in ("clang-cl", "node", "bindgen", "builder"):
+            with self.subTest(failed_tool=failed_tool):
+                self.env["MOCK_PROBE_FAILURE"] = failed_tool
+                self.env["MOCK_BINDGEN_FAILURE"] = "1" if failed_tool == "builder" else "0"
+                bindgen = self.src / "third_party/rust-toolchain/bin/bindgen.exe"
+                bindgen.unlink(missing_ok=True)
+                self.calls.unlink(missing_ok=True)
+                result = self.run_prep()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("inspect", self.phases())
+                self.assertIn("bindgen", self.phases())
+                self.assertNotIn("gn-bootstrap", self.phases())
+                self.assertNotIn("gn-gen", self.phases())
+                self.assertNotIn("ninja-plan", self.phases())
+                self.assertFalse((self.work / "upstream-cache-preparation.json").exists())
+                self.assertTrue((self.out / "chrome.exe").exists())
+                self.assertTrue((self.src / ".chromix-restored-build-inspection.json").exists())
+
+
+@unittest.skipUnless(shutil.which("pwsh"), "PowerShell required")
+class WindowsRestoreStageMockTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="windows restore stage ")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.work = self.root / "work"
+        self.src = self.work / "src"
+        self.work.mkdir()
+        self.calls = self.root / "calls"
+        self.env = {**os.environ, "MOCK_ROOT": str(self.root), "MOCK_CALLS": str(self.calls),
+                    "MOCK_STAGE": "1", "MOCK_USE": "1", "MOCK_ARTIFACT": "0", "MOCK_VALIDATE": "0",
+                    "MOCK_FETCH_RC": "0", "MOCK_RESTORE": "hit", "MOCK_MINUTES": "250"}
+        stage = STAGE.read_text()
+        start = stage.index('$domainProgress = Join-Path $Src')
+        end = stage.index('\n$UngoogledTooling =', start)
+        self.script = self.root / "stage.ps1"
+        self.script.write_text(r'''
+$ErrorActionPreference = "Stop"
+$Repo = $env:MOCK_ROOT
+$WorkDir = Join-Path $Repo "work"
+$Src = Join-Path $WorkDir "src"
+$OutDir = Join-Path $Src "out/Chromix"
+$RestoredUpstream = $false
+$StageIndex = [int]$env:MOCK_STAGE
+$ValidateOnly = $env:MOCK_VALIDATE -eq "1"
+$FromArtifact = $env:MOCK_ARTIFACT -eq "1"
+$UseUpstreamCache = $env:MOCK_USE -eq "1"
+$UpstreamRunId = ""
+$UpstreamCacheDir = Join-Path $Repo "cache"
+$Deadline = (Get-Date).AddMinutes(250)
+$PackReserveMin = 40
+$Revisions = @{ ChromiumVersion = "fixture"; UngoogledCommit = "core" }
+function Get-RemainingMin { return [int]$env:MOCK_MINUTES }
+function Save-Handoff { param($Mode); Add-Content -LiteralPath $env:MOCK_CALLS -Value "handoff:$Mode" }
+function Invoke-Tracked {
+  param($File, $ArgList, $Cwd, $TimeoutSec)
+  Add-Content -LiteralPath $env:MOCK_CALLS -Value "fetch"
+  return [int]$env:MOCK_FETCH_RC
+}
+function python {
+  if ($args -contains "restore") {
+    Add-Content -LiteralPath $env:MOCK_CALLS -Value "restore"
+    if ($env:MOCK_RESTORE -ne "miss") {
+      New-Item -ItemType Directory -Force -Path $Src | Out-Null
+      if ($env:MOCK_RESTORE -ne "no-receipt") {
+        Set-Content -LiteralPath (Join-Path $Src ".chromix-upstream-restored.json") -Value "valid"
+      }
+    }
+  } elseif ($args -contains "verify") {
+    Add-Content -LiteralPath $env:MOCK_CALLS -Value "verify"
+    if ((Get-Content (Join-Path $Src ".chromix-upstream-restored.json") -Raw).Trim() -ne "valid") {
+      $global:LASTEXITCODE = 1
+      return
+    }
+    if ($args -contains "--cache-dir") { throw "verify must not depend on the cache" }
+  } else { throw "unexpected Python invocation" }
+  $global:LASTEXITCODE = 0
+}
+''' + stage[start:end] + r'''
+Set-Content -LiteralPath (Join-Path $Repo "out-dir") -Value $OutDir
+''', encoding="utf-8")
+        (self.root / "prepare-ungoogled.ps1").write_text(r'''
+param($Root, $Repo, $DeadlineEpoch, $ReserveMinutes)
+Add-Content -LiteralPath $env:MOCK_CALLS -Value "prepare"
+$Src = Join-Path $Root "src"
+New-Item -ItemType Directory -Force -Path $Src | Out-Null
+if (Test-Path (Join-Path $Src ".chromix-upstream-restored.json")) {
+  python (Join-Path $Repo "tools/restore_upstream_cache.py") --phase verify --platform windows --arch x64 --workdir $Root
+  if ($LASTEXITCODE -ne 0) { throw "mock prepare receipt verification failed" }
+}
+$ready = Join-Path $Src ".chromix-source-ready"
+if ((Test-Path $ready) -and (Get-Content $ready -Raw).Trim() -ne "fixture|core|windows|patches") {
+  throw "prepared source key mismatch"
+}
+Set-Content -LiteralPath $ready -Value "fixture|core|windows|patches"
+''', encoding="utf-8")
+        (self.root / "update-restored-source.ps1").write_text(r'''
+param($Src, $OutDir)
+Add-Content -LiteralPath $env:MOCK_CALLS -Value "migrate"
+''', encoding="utf-8")
+
+    def run_stage(self, **values):
+        return subprocess.run([shutil.which("pwsh"), "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.script)],
+                              env={**self.env, **values}, capture_output=True, text=True, timeout=20)
+
+    def logged(self):
+        return self.calls.read_text().splitlines() if self.calls.exists() else []
+
+    def test_fresh_hit_then_stage_two_uses_default_and_revalidates_without_fetch(self):
+        first = self.run_stage()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(self.logged(), ["fetch", "restore", "prepare", "verify"])
+        self.assertTrue((self.root / "out-dir").read_text().strip().replace('\\', '/').endswith('/src/out/Default'))
+        self.assertFalse((self.work / "upstream-cache-preparation.json").exists())
+        self.calls.unlink()
+        resumed = self.run_stage(MOCK_STAGE="2", MOCK_ARTIFACT="1")
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        self.assertEqual(self.logged(), ["verify", "prepare", "verify"])
+        self.assertTrue((self.root / "out-dir").read_text().strip().replace('\\', '/').endswith('/src/out/Default'))
+
+    def test_miss_and_timeout_use_normal_source_and_chromix_out(self):
+        missed = self.run_stage(MOCK_RESTORE="miss")
+        self.assertEqual(missed.returncode, 0, missed.stdout + missed.stderr)
+        self.assertEqual(self.logged(), ["fetch", "restore", "prepare"])
+        self.assertTrue((self.root / "out-dir").read_text().strip().replace('\\', '/').endswith('/src/out/Chromix'))
+        shutil.rmtree(self.src)
+        self.calls.unlink()
+        timed = self.run_stage(MOCK_FETCH_RC="124")
+        self.assertEqual(timed.returncode, 0, timed.stdout + timed.stderr)
+        self.assertEqual(self.logged(), ["fetch", "prepare"])
+
+    def test_validate_no_opt_in_and_existing_source_never_fetch(self):
+        for values in ({"MOCK_VALIDATE": "1"}, {"MOCK_USE": "0"}, {}):
             with self.subTest(values=values):
-                result = subprocess.run(
-                    [shutil.which("pwsh"), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", parser],
-                    env={**os.environ, **values},
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    check=False,
-                )
+                result = self.run_stage(**values)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.logged(), ["prepare"])
+                self.calls.unlink()
+
+    def test_unreceipted_restore_and_corrupt_resume_fail_before_preparation(self):
+        failed = self.run_stage(MOCK_RESTORE="no-receipt")
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual(self.logged(), ["fetch", "restore"])
+        (self.src / ".chromix-upstream-restored.json").write_text("invalid")
+        self.calls.unlink()
+        failed = self.run_stage(MOCK_STAGE="2", MOCK_ARTIFACT="1")
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual(self.logged(), ["verify"])
+
+    def test_stage_budget_and_ready_mismatch_cannot_bypass_preparation_checks(self):
+        low = self.run_stage(MOCK_MINUTES="60")
+        self.assertEqual(low.returncode, 0, low.stdout + low.stderr)
+        self.assertEqual(self.logged(), ["handoff:Unsynced"])
+        self.calls.unlink()
+        self.src.mkdir()
+        (self.src / ".chromix-source-ready").write_text("fixture|wrong-pins")
+        failed = self.run_stage(MOCK_STAGE="2", MOCK_ARTIFACT="1")
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual(self.logged(), ["prepare"])
 
 
 if __name__ == "__main__":
