@@ -58,6 +58,7 @@ MAX_SELECTED = 30 * 1024**3
 DISK_HEADROOM = 4 * 1024**3
 SOURCE_SCOPE = "source-and-objects"
 TOOLCHAIN_SCOPE = "toolchains-and-args"
+PROGRESS_SECONDS = 30
 MAX_MEMBERS = 3_000_000
 SOURCES = {
     "linux": ("portablelinux", "UngoogledLinuxCommit", ["build/src"]),
@@ -346,8 +347,41 @@ def report_progress(destination, result, phase):
     result["phase"] = phase
     result["disk_free_bytes"] = shutil.disk_usage(destination).free
     write_result(destination, result)
-    print(f"upstream cache: phase={phase}; free_bytes={result['disk_free_bytes']}",
+    print(f"upstream cache: phase={phase}; free_bytes={result['disk_free_bytes']}; "
+          f"duration_seconds={result.get('duration_seconds', 0)}; "
+          f"members={result.get('members', 0)}; extracted_bytes={result.get('extracted_bytes', 0)}",
           file=sys.stderr, flush=True)
+
+
+class FetchProgress:
+    """Persist bounded progress outside the extracted tree, including partial writes."""
+
+    def __init__(self, destination, result, started):
+        self.destination = destination
+        self.result = result
+        self.started = started
+        self.phase_started = started
+        self.next_report = started
+
+    def phase(self, name):
+        now = time.monotonic()
+        previous = self.result.get("phase")
+        if previous:
+            self.result.setdefault("phase_seconds", {})[previous] = round(now - self.phase_started, 3)
+        self.result["phase"] = name
+        self.phase_started = now
+        self(force=True)
+
+    def __call__(self, values=None, *, force=False):
+        if values:
+            self.result.update(values)
+        now = time.monotonic()
+        if not force and now < self.next_report:
+            return
+        self.result["duration_seconds"] = round(now - self.started, 3)
+        self.result["phase_duration_seconds"] = round(now - self.phase_started, 3)
+        report_progress(self.destination, self.result, self.result["phase"])
+        self.next_report = now + PROGRESS_SECONDS
 
 
 class SourceSelection:
@@ -429,9 +463,10 @@ def unpack_outer(outer, inner, expected_name):
 class Extractor:
     """Create regular files first and links last; never traverse archive links."""
 
-    def __init__(self, root, selection=None):
+    def __init__(self, root, selection=None, progress=None):
         self.root = root
         self.selection = selection
+        self.progress = progress
         self.posix = isinstance(selection, SourceSelection) and selection.posix and os.name == "posix"
         platform = getattr(selection, "platform", None)
         self.case_insensitive = platform in ("windows", "macos") or os.name == "nt" or sys.platform == "darwin"
@@ -446,6 +481,25 @@ class Extractor:
         self.skipped = 0
         self.external_symlinks = []
         self.remapped_symlinks = {}
+        self.current_member = None
+        self.created_parents = set()
+
+    def ensure_parent(self, path):
+        # path() still checks every ancestor before using a previously created directory.
+        parent = path.parent
+        if parent not in self.created_parents:
+            parent.mkdir(parents=True, exist_ok=True)
+            self.created_parents.add(parent)
+
+    def report(self, *, force=False):
+        if self.progress is not None:
+            self.progress({"members": len(self.names), "extracted_bytes": self.written_bytes,
+                           "archive_bytes": self.archive_bytes,
+                           "extraction_member": self.current_member}, force=force)
+
+    def report_step(self, name):
+        if self.progress is not None:
+            self.progress({"extraction_step": name}, force=True)
 
     def safe_name(self, name):
         return safe_name(name, posix=self.posix)
@@ -464,15 +518,29 @@ class Extractor:
     def selected(self, name, kind="file"):
         return self.selection is None or self.selection(name, kind)
 
+    @staticmethod
+    def is_link(path):
+        try:
+            metadata = path.lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        return (stat.S_ISLNK(metadata.st_mode) or
+                bool(getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT))
+
     def path(self, name):
         path = self.root / name
         for parent in path.parents:
             if parent == self.root:
                 break
-            require(not parent.is_symlink(), "archive_link_parent")
+            require(not self.is_link(parent), "archive_link_parent")
         return path
 
+    def begin_member(self, name):
+        self.current_member = name
+        self.report()
+
     def add(self, name, kind, size, mode, mtime_ns, stream=None, target=None):
+        self.begin_member(name)
         name = self.safe_name(name)
         if not name:
             require(kind == "dir", "empty_archive_path")
@@ -486,6 +554,8 @@ class Extractor:
             require(self.names.get(parent, "dir") == "dir", "archive_link_parent")
             self.parents.add(parent)
         self.names[name] = kind
+        self.current_member = name
+        self.report()
         if kind == "file":
             self.archive_bytes += size
             require(self.archive_bytes <= MAX_EXTRACTED, "archive_too_large")
@@ -495,10 +565,11 @@ class Extractor:
         if not self.selected(name, kind):
             return
         path = self.path(name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        require(not path.is_symlink(), "archive_link_parent")
+        self.ensure_parent(path)
+        require(not self.is_link(path), "archive_link_parent")
         if kind == "dir":
             path.mkdir(exist_ok=True)
+            self.created_parents.add(path)
             self.directories[name] = (mode, mtime_ns)
         else:
             self.bytes += size
@@ -520,6 +591,7 @@ class Extractor:
                     output.write(chunk)
                     self.written_bytes += len(chunk)
                     remaining -= len(chunk)
+                    self.report()
             self.metadata(path, mode, mtime_ns)
 
     @staticmethod
@@ -534,6 +606,8 @@ class Extractor:
         hardlinks = {}
         resolved_symlinks = {}
         for name, kind, target, _, _ in self.links:
+            self.current_member = name
+            self.report()
             require(isinstance(target, str) and target and not any(ord(c) < 32 for c in target), "unsafe_link")
             if kind == "sym" and isinstance(self.selection, SourceSelection):
                 remapped = self.selection.remap_absolute(name, target)
@@ -547,6 +621,8 @@ class Extractor:
                 hardlinks[name] = self.safe_name(target)
                 require(hardlinks[name], "unsafe_link")
         for name, target in symlinks.items():
+            self.current_member = name
+            self.report()
             retained = self.selection is not None and self.selected(name)
             if target.startswith("/"):
                 require(not retained or isinstance(self.selection, SourceSelection), "excluded_link_target")
@@ -581,6 +657,8 @@ class Extractor:
                 require(target_name in self.names or target_name in self.parents, "missing_internal_symlink_target")
             resolved_symlinks[name] = target_name
         for name, target in hardlinks.items():
+            self.current_member = name
+            self.report()
             seen = {name}
             while True:
                 require(target not in seen, "unresolved_hardlink")
@@ -598,9 +676,14 @@ class Extractor:
         return resolved_symlinks
 
     def finish(self):
+        self.report(force=True)
+        self.report_step("validate_links")
         resolved_symlinks = self.validate_links()
+        self.report_step("create_links")
         hard = []
         for name, kind, target, mode, mtime_ns in self.links:
+            self.current_member = name
+            self.report()
             target = self.remapped_symlinks.get(name, target)
             if kind == "sym" and target.startswith("/"):
                 self.skipped += 1
@@ -610,7 +693,7 @@ class Extractor:
             if not self.selected(name):
                 continue
             path = self.path(name)
-            path.parent.mkdir(parents=True, exist_ok=True)
+            self.ensure_parent(path)
             require(not path.exists() and not path.is_symlink(), "archive_link_collision")
             if kind == "hard":
                 target_name = self.safe_name(target)
@@ -633,18 +716,24 @@ class Extractor:
                 os.link(target, path)
             require(len(pending) < len(hard), "unresolved_hardlink")
             hard = pending
+        self.report_step("directory_metadata")
         for name in sorted(self.directories, key=lambda n: n.count("/"), reverse=True):
+            self.current_member = name
+            self.report()
             self.metadata(self.path(name), *self.directories[name])
+        self.report(force=True)
         return {"extracted_bytes": self.bytes, "members": len(self.names),
                 "skipped_external_symlinks": self.skipped,
                 "external_symlink_paths": self.external_symlinks,
                 "remapped_internal_symlinks": len(self.remapped_symlinks)}
 
 
-def extract_tar(stream, tree, selection=None):
-    extractor = Extractor(tree, selection)
+def extract_tar(stream, tree, selection=None, progress=None):
+    extractor = Extractor(tree, selection, progress)
+    extractor.report_step("members")
     with tarfile.open(fileobj=stream, mode="r|", bufsize=CHUNK) as archive:
         for info in archive:
+            extractor.begin_member(info.name)
             if info.isdir():
                 kind = "dir"
             elif info.issym():
@@ -662,10 +751,13 @@ def extract_tar(stream, tree, selection=None):
     return extractor.finish()
 
 
-def extract_zip(inner, tree, selection=None):
-    extractor = Extractor(tree, selection)
+def extract_zip(inner, tree, selection=None, progress=None):
+    extractor = Extractor(tree, selection, progress)
+    extractor.report_step("zip_index")
     with zipfile.ZipFile(inner) as archive:
+        extractor.report_step("members")
         for info in archive.infolist():
+            extractor.begin_member(info.filename)
             mode = info.external_attr >> 16
             kind = stat.S_IFMT(mode)
             require(kind in (0, stat.S_IFDIR, stat.S_IFREG, stat.S_IFLNK)
@@ -683,16 +775,16 @@ def extract_zip(inner, tree, selection=None):
     return extractor.finish()
 
 
-def extract_inner(inner, tree, zstd=None, selection=None):
+def extract_inner(inner, tree, zstd=None, selection=None, progress=None):
     tree.mkdir()
     if selection:
         require_space(tree)
     if zstd is None:
-        return extract_zip(inner, tree, selection)
+        return extract_zip(inner, tree, selection, progress)
     with subprocess.Popen([zstd, "-d", "-c", "--", str(inner)], stdout=subprocess.PIPE,
                           stderr=subprocess.DEVNULL, cwd=inner.parent) as process:
         try:
-            result = extract_tar(process.stdout, tree, selection)
+            result = extract_tar(process.stdout, tree, selection, progress)
             while process.stdout.read(CHUNK):
                 pass
             require(process.wait(timeout=TIMEOUT) == 0, "zstd_failed")
@@ -790,6 +882,7 @@ def fetch(platform, arch, destination, run_id=None, root=ROOT, client=None):
               "skipped_external_symlinks": 0, "remapped_internal_symlinks": 0,
               "duration_seconds": 0,
               "extraction_scope": scope}
+    progress = FetchProgress(destination, result, started)
     try:
         if previous is None:
             write_result(destination, result)
@@ -811,7 +904,7 @@ def fetch(platform, arch, destination, run_id=None, root=ROOT, client=None):
                 zstd = str(Path(zstd).resolve())
                 require(not Path(zstd).is_relative_to(destination), "unsafe_decompressor")
             client = client or GitHub()
-            report_progress(destination, result, "metadata")
+            progress.phase("metadata")
             base = f"/repos/{pin['repository']}/actions"
             run = client.json(f"{base}/runs/{pin['run_id']}")
             artifact = client.json(f"{base}/artifacts/{pin['artifact']['id']}")
@@ -819,19 +912,19 @@ def fetch(platform, arch, destination, run_id=None, root=ROOT, client=None):
             require_space(destination, 2 * pin["artifact"]["size_in_bytes"])
             outer, inner = destination / ".download.zip", destination / ".inner"
             # Download verifies the pinned outer ZIP digest before opening either archive.
-            report_progress(destination, result, "download")
+            progress.phase("download")
             result["download_bytes"] = client.download(pin, outer)
-            report_progress(destination, result, "unpack_outer")
+            progress.phase("unpack_outer")
             result["inner_bytes"] = unpack_outer(outer, inner, pin["artifact"]["inner_archive"])
             outer.unlink()
-            report_progress(destination, result, "extract_source_and_objects")
+            progress.phase("extract_source_and_objects")
             result.update(extract_inner(inner, destination / "tree", zstd,
-                                        SourceSelection(pin["source_roots"], platform=platform)))
+                                        SourceSelection(pin["source_roots"], platform=platform), progress))
             inner.unlink()
-            report_progress(destination, result, "verify_source")
+            progress.phase("verify_source")
             result["source"] = str(source_path(destination / "tree", pin))
+            progress.phase("complete")
             result["status"] = "hit"
-            result["phase"] = "complete"
         except CacheMiss as exc:
             result["reason"] = str(exc)
             result.update(exc.details)
@@ -840,7 +933,14 @@ def fetch(platform, arch, destination, run_id=None, root=ROOT, client=None):
                 NotImplementedError, subprocess.SubprocessError) as exc:
             result["reason"] = "cache_unusable_" + type(exc).__name__
         if result["status"] == "miss":
+            result["source"] = None
+            result["cleanup_in_progress"] = True
+            result["duration_seconds"] = round(time.monotonic() - started, 3)
+            write_result(destination, result)
+            print(f"upstream cache: miss={result['reason']}; cleanup_in_progress=true",
+                  file=sys.stderr, flush=True)
             cleanup(destination)
+            result.pop("cleanup_in_progress")
         result["duration_seconds"] = round(time.monotonic() - started, 3)
         write_result(destination, result)
         return result

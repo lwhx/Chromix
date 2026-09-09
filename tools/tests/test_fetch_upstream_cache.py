@@ -63,6 +63,7 @@ def zip_bytes(entries):
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, kind, data in entries:
             info = zipfile.ZipInfo(name + ("/" if kind == "dir" else ""))
+            info.compress_type = zipfile.ZIP_DEFLATED
             info.create_system = 3
             info.external_attr = {"file": stat.S_IFREG | 0o755, "dir": stat.S_IFDIR | 0o755,
                                   "sym": stat.S_IFLNK | 0o777}[kind] << 16
@@ -665,6 +666,148 @@ class FetchUpstreamCacheTest(unittest.TestCase):
             self.assertIn("phase=" + phase, output.getvalue())
         self.assertNotIn("fixture-token", output.getvalue())
         self.assertEqual(json.loads((self.destination / "result.json").read_text())["phase"], "complete")
+
+    def test_zip_fixture_really_uses_deflate(self):
+        data = zip_bytes([("src/a", "file", b"fixture" * 100)])
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            info = archive.getinfo("src/a")
+            self.assertEqual(info.compress_type, zipfile.ZIP_DEFLATED)
+            self.assertLess(info.compress_size, info.file_size)
+
+    def test_same_parent_is_created_once_without_skipping_link_checks(self):
+        tree = self.root / "parent-cache"
+        (tree / "src/out").mkdir(parents=True)
+        extractor = cache.Extractor(tree, cache.SourceSelection(["src"], platform="windows"))
+        original = Path.mkdir
+        calls = []
+
+        def mkdir(path, *args, **kwargs):
+            calls.append(path)
+            return original(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "mkdir", new=mkdir):
+            for index in range(100):
+                extractor.add(f"src/out/obj/file{index}.o", "file", 1, 0o644, MTIME, io.BytesIO(b"o"))
+        self.assertEqual(calls.count(tree / "src/out/obj"), 1)
+        # An existing cache entry must not let a newly introduced link redirect writes.
+        original_link = extractor.is_link
+        with mock.patch.object(extractor, "is_link", side_effect=lambda path: (
+                path == tree / "src/out/obj" or original_link(path))):
+            with self.assertRaisesRegex(cache.CacheMiss, "archive_link_parent"):
+                extractor.add("src/out/obj/rejected.o", "file", 1, 0o644, MTIME, io.BytesIO(b"x"))
+        self.assertFalse((tree / "src/out/obj/rejected.o").exists())
+
+    def test_parent_junction_is_rejected_even_when_cached(self):
+        tree = self.root / "junction-cache"
+        tree.mkdir()
+        extractor = cache.Extractor(tree, cache.SourceSelection(["src"], platform="windows"))
+        extractor.add("src/out/first.o", "file", 1, 0o644, MTIME, io.BytesIO(b"o"))
+        original_stat = Path.lstat
+
+        def lstat(path, *args, **kwargs):
+            if path == tree / "src/out":
+                return mock.Mock(st_mode=stat.S_IFDIR | 0o755,
+                                 st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT)
+            return original_stat(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "lstat", new=lstat):
+            with self.assertRaisesRegex(cache.CacheMiss, "archive_link_parent"):
+                extractor.add("src/out/second.o", "file", 1, 0o644, MTIME, io.BytesIO(b"o"))
+        self.assertFalse((tree / "src/out/second.o").exists())
+
+    def test_extraction_progress_survives_interruption_with_partial_bytes(self):
+        client = self.fixture_client()
+        snapshots = []
+        original = cache.write_result
+
+        def interrupt(destination, result):
+            original(destination, result)
+            snapshots.append(copy.deepcopy(result))
+            if result.get("phase") == "extract_source_and_objects" and result.get("extracted_bytes", 0) > 0:
+                raise KeyboardInterrupt
+
+        with mock.patch.object(cache, "PROGRESS_SECONDS", 0), \
+                mock.patch.object(cache, "write_result", side_effect=interrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            cache.fetch("windows", "x64", self.destination, root=self.root, client=client)
+        saved = json.loads((self.destination / "result.json").read_text())
+        self.assertEqual(saved["phase"], "extract_source_and_objects")
+        self.assertEqual(saved["extraction_member"], "src/BUILD.gn")
+        self.assertEqual(saved["extracted_bytes"], len(b"build"))
+        self.assertGreater(saved["members"], 0)
+        self.assertGreater(saved["duration_seconds"], 0)
+        self.assertGreaterEqual(saved["phase_duration_seconds"], 0)
+        self.assertEqual(set(saved["phase_seconds"]), {"metadata", "download", "unpack_outer"})
+        self.assertEqual(saved["status"], "miss")
+
+    def test_progress_is_throttled_but_records_latest_values_on_force(self):
+        self.destination.mkdir()
+        result = {"status": "miss"}
+        now = [0.0]
+        with mock.patch.object(cache.time, "monotonic", side_effect=lambda: now[0]), \
+                mock.patch.object(cache, "report_progress", wraps=cache.report_progress) as report:
+            progress = cache.FetchProgress(self.destination, result, 0)
+            progress.phase("extract_source_and_objects")
+            for tick in range(1, 30):
+                now[0] = float(tick)
+                progress({"members": tick, "extracted_bytes": tick * 10})
+            self.assertEqual(report.call_count, 1)
+            now[0] = 30.0
+            progress({"members": 30, "extracted_bytes": 300})
+            self.assertEqual(report.call_count, 2)
+            now[0] = 31.0
+            progress({"members": 31, "extracted_bytes": 310}, force=True)
+            self.assertEqual(report.call_count, 3)
+        saved = json.loads((self.destination / "result.json").read_text())
+        self.assertEqual(saved["duration_seconds"], 31.0)
+        self.assertEqual(saved["members"], 31)
+        self.assertEqual(saved["extracted_bytes"], 310)
+
+    def test_failure_reason_is_written_before_potentially_slow_cleanup(self):
+        client = self.fixture_client()
+        original = cache.cleanup
+        observed = []
+
+        def inspect_cleanup(destination):
+            saved = json.loads((destination / "result.json").read_text())
+            if saved.get("cleanup_in_progress"):
+                observed.append(saved)
+            original(destination)
+
+        with mock.patch.object(cache, "source_path", side_effect=cache.CacheMiss("source_version_mismatch")), \
+                mock.patch.object(cache, "cleanup", side_effect=inspect_cleanup):
+            result = cache.fetch("windows", "x64", self.destination, root=self.root, client=client)
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0]["reason"], "source_version_mismatch")
+        self.assertEqual(observed[0]["phase"], "verify_source")
+        self.assertGreater(observed[0]["extracted_bytes"], 0)
+        self.assertNotIn("cleanup_in_progress", result)
+
+    def test_invalid_member_report_names_the_failing_member(self):
+        for name, kind, payload, reason in (
+                ("src/CON", "file", b"bad", "unsafe_archive_path"),
+                ("src/BUILD.gn", "file", b"duplicate", "duplicate_archive_path"),
+                ("src/large-link", "sym", "x" * 4097, "oversized_link")):
+            with self.subTest(name=name):
+                client = self.fixture_client(extra=[(name, kind, payload)])
+                result = cache.fetch("windows", "x64", self.destination, root=self.root, client=client)
+                self.assertEqual(result["reason"], reason)
+                self.assertEqual(result["extraction_member"], name)
+
+    def test_failed_final_progress_cannot_publish_hit(self):
+        client = self.fixture_client()
+        original = cache.report_progress
+
+        def fail_complete(destination, result, phase):
+            if phase == "complete":
+                raise OSError("fixture progress failure")
+            return original(destination, result, phase)
+
+        with mock.patch.object(cache, "report_progress", side_effect=fail_complete):
+            result = cache.fetch("windows", "x64", self.destination, root=self.root, client=client)
+        self.assertEqual(result["status"], "miss")
+        self.assertEqual(result["reason"], "cache_unusable_OSError")
+        self.assertEqual({path.name for path in self.destination.iterdir()}, {"result.json"})
 
     def test_result_owned_stale_tree_cleanup_and_lock(self):
         client = self.fixture_client()

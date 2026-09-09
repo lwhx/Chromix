@@ -101,6 +101,27 @@ class WindowsUpstreamCacheRegressionTest(unittest.TestCase):
                                                          if step.get("name") == "Ensure build tree snapshot"))
         self.assertNotIn("upstream-reuse", self.validate)
 
+    def test_snapshot_outputs_fail_closed_but_keep_small_diagnostics(self):
+        import yaml
+
+        self.assertIn("Write-OutVar snapshot_safe true\nAssert-CiScripts", self.stage)
+        tracked_start = self.stage.index("function Invoke-Tracked {")
+        tracked_end = self.stage.index("function Get-FreeGB", tracked_start)
+        tracked = self.stage[tracked_start:tracked_end]
+        self.assertLess(tracked.index("Write-OutVar snapshot_safe false"),
+                        tracked.index("$tracked = Start-TrackedProcess"))
+        self.assertNotIn("snapshot_safe true", tracked[tracked.rindex("  } catch {"):])
+        jobs = yaml.safe_load(self.workflow)["jobs"]
+        for number in range(1, 13):
+            steps = jobs[f"build-{number}"]["steps"]
+            for step in steps:
+                name = step.get("name", "")
+                if name == "Ensure build tree snapshot" or name.startswith("Upload tree part "):
+                    self.assertIn("steps.stage.outputs.snapshot_safe == 'true'", step["if"])
+                    self.assertNotIn("snapshot_safe != 'false'", step["if"])
+                elif name in ("Upload upstream cache diagnostics", "Upload restored reuse evidence"):
+                    self.assertEqual(step["if"], "${{ always() }}")
+
     def test_reuse_hooks_wrap_only_actual_chrome_and_precede_packaging_or_throw(self):
         before = self.stage.index('restored_reuse_evidence.py") --phase before')
         built = self.stage.index('$rc = Invoke-Tracked -File $Ninja')
@@ -185,15 +206,15 @@ class WindowsUpstreamCacheRegressionTest(unittest.TestCase):
         self.assertNotRegex(self.cache, r'Set-Content|Set-Marker|Copy-Item|Move-Item|Expand-Archive')
 
     def test_required_miss_timeout_and_budget_fail_before_preparation(self):
-        self.assertIn('throw "required upstream cache fetch timed out"', self.cache)
+        self.assertIn('throw "required upstream cache fetch timed out; $(Get-UpstreamTimeoutSummary)"', self.cache)
         self.assertNotIn('continuing with normal source preparation', self.cache)
         self.assertIn('restore receipt missing after restore', self.cache)
         self.assertIn('throw "upstream restore helper failed (exit $LASTEXITCODE)"', self.cache)
         self.assertIn('throw "required upstream cache: insufficient stage budget for restore"', self.cache)
-        self.assertIn('$fetchTimeoutSec = [Math]::Min(3600, ((Get-RemainingMin) - $PackReserveMin - 30) * 60)', self.cache)
+        self.assertIn('$fetchTimeoutSec = [Math]::Min(10800, ((Get-RemainingMin) - $PackReserveMin - 30) * 60)', self.cache)
         self.assertIn('if ($fetchTimeoutSec -lt 60)', self.cache)
         self.assertIn('-ArgList $fetchCommandLine -Cwd $Repo -TimeoutSec $fetchTimeoutSec', self.cache)
-        self.assertIn('$StageMinutes = if ($ValidateOnly) { 140 } else { 300 }', self.stage)
+        self.assertIn('$StageMinutes = if ($ValidateOnly) { 230 } else { 300 }', self.stage)
         self.assertIn('$PackReserveMin = if ($ValidateOnly) { 15 } else { 40 }', self.stage)
 
     def test_workflow_requires_cache_in_validation_and_every_resume(self):
@@ -292,9 +313,11 @@ ConvertTo-Json -Compress -InputObject @($rows)
 ''')
         self.assertEqual(result.returncode, 0, result.stderr)
         rows = json.loads(result.stdout)
-        self.assertEqual(rows, [{"validate": True, "minutes": 140, "reserve": 15},
+        self.assertEqual(rows, [{"validate": True, "minutes": 230, "reserve": 15},
                                 {"validate": False, "minutes": 300, "reserve": 40}])
         jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+        self.assertEqual(jobs["validate"]["timeout-minutes"], 240)
+        self.assertTrue(all(jobs[f"build-{number}"]["timeout-minutes"] == 355 for number in range(1, 13)))
         self.assertLessEqual(rows[0]["minutes"], jobs["validate"]["timeout-minutes"] - 10)
         self.assertLess(rows[1]["minutes"], jobs["build-1"]["timeout-minutes"])
 
@@ -320,7 +343,7 @@ ConvertTo-Json -Compress -InputObject @($values)
 function Get-RemainingMin { return $left }
 $rows = foreach ($ValidateOnly in @($true, $false)) {
 ''' + stage_budget_source() + r'''
-  foreach ($left in @(140, 130, 100, 75, 71, 70, 46, 45, 0)) {
+  foreach ($left in @(300, 251, 250, 249, 230, 226, 225, 224, 220, 140, 71, 70, 46, 45, 0, -1)) {
     try {
 ''' + self.stage[start:end] + r'''
       @{ validate = $ValidateOnly; left = $left; reserve = $PackReserveMin; seconds = $fetchTimeoutSec }
@@ -333,12 +356,26 @@ ConvertTo-Json -Compress -InputObject @($rows)
 ''')
         self.assertEqual(result.returncode, 0, result.stderr)
         for row in json.loads(result.stdout):
-            expected = min(3600, (row["left"] - row["reserve"] - 30) * 60)
+            expected = min(10800, (row["left"] - row["reserve"] - 30) * 60)
             if expected < 60:
                 self.assertIn("insufficient stage budget", row["error"])
             else:
                 self.assertEqual(row["seconds"], expected)
                 self.assertLessEqual(row["seconds"] / 60 + row["reserve"] + 30, row["left"])
+
+    def test_initial_validation_extraction_budget_is_about_175_minutes_after_setup(self):
+        start = self.stage.index("  $fetchTimeoutSec =")
+        end = self.stage.index("  $fetchArgs =", start)
+        result = self.run_ps(r'''
+function Get-Date { return [datetime]"2026-09-09T00:00:00Z" }
+$ValidateOnly = $true
+''' + stage_budget_source() + r'''
+function Get-RemainingMin { return $StageMinutes - 10 }
+''' + self.stage[start:end] + r'''
+Write-Output $fetchTimeoutSec
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(int(result.stdout), 175 * 60)
 
     def test_actual_torque_call_is_bounded_and_insufficient_time_fails(self):
         start = self.stage.rindex("\nif ($ValidateOnly) {")
@@ -402,7 +439,8 @@ function Get-RemainingMin { return [int]$env:TEST_MINUTES }
 function Invoke-Tracked {
   param($File, $ArgList, $Cwd, $TimeoutSec)
   Add-Content $env:CALL_LOG "fetch"
-  if ($TimeoutSec -gt 3600 -or $TimeoutSec -lt 60 -or
+  if ($env:TEST_TRACKED_ERROR) { throw $env:TEST_TRACKED_ERROR }
+  if ($TimeoutSec -gt 10800 -or $TimeoutSec -lt 60 -or
       $TimeoutSec -gt ((Get-RemainingMin) - $PackReserveMin - 30) * 60) { throw "unbounded fetch" }
   return [int]$env:FETCH_RC
 }
@@ -411,20 +449,23 @@ function python {
   & $env:TEST_PYTHON @args
   $global:LASTEXITCODE = $LASTEXITCODE
 }
-''' + stage_budget_source() + policy + "\n" + stage[start:end] + r'''
+''' + stage_budget_source() + policy + "\n" +
+                               stage[stage.index("function Get-UpstreamTimeoutSummary {"):
+                                     stage.index("function Invoke-Tracked {")] + stage[start:end] + r'''
 Add-Content $env:CALL_LOG "prepare"
 Add-Content $env:CALL_LOG ("ninja:" + $OutDir.Replace('\', '/'))
 ''')
 
     def run_stage(self, *, enabled=True, validate=False, resume=False, stage=1,
-                  minutes=300, fetch_rc=0, switch=False, run_id=""):
+                  minutes=300, fetch_rc=0, switch=False, run_id="", tracked_error=""):
         fixture = self.fixture
         env = {**fixture.env, "TEST_REPO": str(REPO), "TEST_WORK": str(fixture.work),
                "TEST_CACHE": str(fixture.cache), "TEST_PYTHON": sys.executable,
                "TEST_STAGE": str(stage), "TEST_RESUME": str(int(resume)),
                "TEST_SWITCH": str(int(switch)), "TEST_RUN_ID": run_id,
                "TEST_VALIDATE": str(int(validate)), "TEST_MINUTES": str(minutes),
-               "FETCH_RC": str(fetch_rc), "CHROMIX_USE_UPSTREAM_CACHE": str(int(enabled))}
+               "FETCH_RC": str(fetch_rc), "TEST_TRACKED_ERROR": tracked_error,
+               "CHROMIX_USE_UPSTREAM_CACHE": str(int(enabled))}
         return subprocess.run([self.powershell, "-NoLogo", "-NoProfile", "-NonInteractive",
                                "-File", str(self.script)], env=env, capture_output=True, text=True, timeout=20)
 
@@ -455,6 +496,59 @@ Add-Content $env:CALL_LOG ("ninja:" + $OutDir.Replace('\', '/'))
         self.assertNotIn("restore receipt missing", failed.stderr)
         self.assertEqual(self.fixture.called(), ["fetch"])
         self.assertFalse((self.fixture.work / "src").exists())
+
+    def test_tracked_timeout_reports_only_safe_progress_fields_before_restore(self):
+        report = self.fixture.cache / "result.json"
+        for elapsed in ({"duration_seconds": 3600.25}, {"elapsed_seconds": 3600.25, "duration_seconds": 0}):
+            with self.subTest(elapsed=elapsed):
+                self.fixture.put(report, json.dumps({"phase": "extract_source_and_objects", "members": 1234,
+                                                    "extracted_bytes": 15011844651, **elapsed,
+                                                    "manifest": {"token": "SECRET_DO_NOT_PRINT"}}))
+                result = self.run_stage(validate=True, fetch_rc=124, minutes=220)
+                self.assertNotEqual(result.returncode, 0)
+                combined = result.stdout + result.stderr
+                for text in ("required upstream cache fetch timed out", "phase=extract_source_and_objects",
+                             "members=1234", "extracted_bytes=15011844651", "elapsed_seconds=3600.25"):
+                    self.assertIn(text, combined)
+                self.assertNotIn("SECRET_DO_NOT_PRINT", combined)
+                self.assertNotIn("manifest", combined)
+                self.assertEqual(self.fixture.called(), ["fetch"])
+                self.assertFalse((self.fixture.work / "src").exists())
+                self.fixture.calls.unlink()
+
+    def test_failed_tracked_cleanup_preserves_error_and_reports_phase(self):
+        self.fixture.put(self.fixture.cache / "result.json", json.dumps({"phase": "extract_source_and_objects",
+                                                                       "members": 51, "duration_seconds": 3600}))
+        message = "tracked process is still running after taskkill; refusing safe snapshot"
+        result = self.run_stage(validate=True, tracked_error=message)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("tracked process is still running after taskkill", result.stderr)
+        self.assertIn("phase=extract_source_and_objects", result.stdout)
+        self.assertIn("members=51", result.stdout)
+        self.assertIn("elapsed_seconds=3600", result.stdout)
+        self.assertEqual(self.fixture.called(), ["fetch"])
+        self.assertFalse((self.fixture.work / "src").exists())
+
+    def test_timeout_summary_tolerates_missing_partial_oversized_and_unsafe_reports(self):
+        report = self.fixture.cache / "result.json"
+        cases = (None, "not-json SECRET_DO_NOT_PRINT", "{}", "null",
+                 json.dumps({"phase": "extract\nSECRET_DO_NOT_PRINT", "members": {"token": "SECRET_DO_NOT_PRINT"},
+                             "extracted_bytes": -1, "elapsed_seconds": "SECRET_DO_NOT_PRINT"}),
+                 json.dumps({"phase": "SECRET_DO_NOT_PRINT", "padding": "x" * 65536}))
+        for content in cases:
+            with self.subTest(content=None if content is None else content[:80]):
+                report.unlink(missing_ok=True)
+                if content is not None:
+                    self.fixture.put(report, content)
+                result = self.run_stage(validate=True, fetch_rc=124)
+                self.assertNotEqual(result.returncode, 0)
+                combined = result.stdout + result.stderr
+                self.assertIn("required upstream cache fetch timed out", combined)
+                for key in ("phase", "members", "extracted_bytes", "elapsed_seconds"):
+                    self.assertIn(f"{key}=unknown", combined)
+                self.assertNotIn("SECRET_DO_NOT_PRINT", combined)
+                self.assertEqual(self.fixture.called(), ["fetch"])
+                self.fixture.calls.unlink()
 
     def test_missing_invalid_or_incomplete_fetch_report_fails_before_restore(self):
         for content in (None, "not json", "{}", "null"):

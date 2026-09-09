@@ -27,8 +27,8 @@ $RestoredUpstream = $false
 $RequireUpstreamCache = $UseUpstreamCache -or $UpstreamRunId -or ($env:CHROMIX_USE_UPSTREAM_CACHE -eq "1")
 $PartsDir = "C:\parts"
 $UpstreamCacheDir = "C:\u"
-# Validation runs in a 150-minute job and does not upload a build-tree snapshot.
-$StageMinutes = if ($ValidateOnly) { 140 } else { 300 }
+# Validation runs in a 240-minute job and does not upload a build-tree snapshot.
+$StageMinutes = if ($ValidateOnly) { 230 } else { 300 }
 $Deadline = (Get-Date).AddMinutes($StageMinutes)
 $PackReserveMin = if ($ValidateOnly) { 15 } else { 40 }
 
@@ -43,6 +43,95 @@ function Get-RemainingMin {
 
 function Test-LastStage { return $StageIndex -ge $MaxStages }
 
+function Start-TrackedProcess {
+  param([string]$File, [string]$Arguments, [string]$Cwd, [string]$Stdout, [string]$Stderr)
+  if (-not ("Chromix.TrackedProcess" -as [type])) {
+    Add-Type -TypeDefinition @'
+namespace Chromix {
+  public sealed class TrackedProcess : System.IDisposable {
+    public readonly System.Diagnostics.Process Process;
+    private readonly System.Threading.Tasks.Task logs;
+
+    private static async System.Threading.Tasks.Task CopyLog(System.IO.Stream input, System.IO.Stream output) {
+      // The copy task owns its streams until EOF, even if the parent exits first.
+      using (input)
+      using (output) {
+        byte[] buffer = new byte[8192];
+        int count;
+        while ((count = await input.ReadAsync(buffer, 0, buffer.Length).ConfigureAwait(false)) != 0) {
+          await output.WriteAsync(buffer, 0, count).ConfigureAwait(false);
+          await output.FlushAsync().ConfigureAwait(false);
+        }
+      }
+    }
+
+    public TrackedProcess(string file, string arguments, string cwd, string stdout, string stderr) {
+      var info = new System.Diagnostics.ProcessStartInfo(file, arguments);
+      info.WorkingDirectory = cwd;
+      info.UseShellExecute = false;
+      info.CreateNoWindow = true;
+      info.RedirectStandardOutput = true;
+      info.RedirectStandardError = true;
+      Process = new System.Diagnostics.Process();
+      Process.StartInfo = info;
+      System.IO.FileStream output = null, error = null;
+      try {
+        output = new System.IO.FileStream(stdout, System.IO.FileMode.Create, System.IO.FileAccess.Write, System.IO.FileShare.Read);
+        error = new System.IO.FileStream(stderr, System.IO.FileMode.Create, System.IO.FileAccess.Write, System.IO.FileShare.Read);
+        if (!Process.Start()) throw new System.InvalidOperationException("tracked process did not start");
+      } catch {
+        if (output != null) output.Dispose();
+        if (error != null) error.Dispose();
+        Process.Dispose();
+        throw;
+      }
+      logs = System.Threading.Tasks.Task.WhenAll(CopyLog(Process.StandardOutput.BaseStream, output),
+                                                CopyLog(Process.StandardError.BaseStream, error));
+    }
+
+    public bool Drain(int timeoutMs) { return logs.Wait(timeoutMs); }
+
+    public void Dispose() {
+      // Do not close a pipe or writer while a descendant still owns the other end.
+      logs.ContinueWith(task => {
+        if (task.IsFaulted) System.Console.Error.WriteLine("tracked log copy failed: " + task.Exception.GetBaseException().Message);
+        Process.Dispose();
+      }, System.Threading.Tasks.TaskScheduler.Default);
+    }
+  }
+}
+'@
+  }
+  return [Chromix.TrackedProcess]::new($File, $Arguments, $Cwd, $Stdout, $Stderr)
+}
+
+function Wait-TrackedDrain {
+  param($Tracked, [int]$TimeoutMs = 10000)
+  return $Tracked.Drain($TimeoutMs)
+}
+
+function Get-UpstreamTimeoutSummary {
+  $values = [ordered]@{ phase = "unknown"; members = "unknown"; extracted_bytes = "unknown"; elapsed_seconds = "unknown" }
+  try {
+    $path = Join-Path $UpstreamCacheDir "result.json"
+    if ((Get-Item -LiteralPath $path -ErrorAction Stop).Length -gt 64KB) { throw "oversized report" }
+    $report = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if ($report.phase -is [string] -and $report.phase -cmatch '\A[a-zA-Z0-9_-]{1,80}\z') {
+      $values.phase = $report.phase
+    }
+    foreach ($key in @("members", "extracted_bytes", "elapsed_seconds")) {
+      $value = $report.$key
+      if ($key -eq "elapsed_seconds" -and $null -eq $value) { $value = $report.duration_seconds }
+      $text = [string]$value
+      $pattern = if ($key -eq "elapsed_seconds") { '\A[0-9]+(?:\.[0-9]+)?\z' } else { '\A[0-9]+\z' }
+      if ($text.Length -le 32 -and $text -cmatch $pattern) { $values[$key] = $text }
+    }
+  } catch {
+    # Missing or partially written diagnostics must not hide the timeout.
+  }
+  return ($values.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join "; "
+}
+
 function Invoke-Tracked {
   param(
     [string]$File,
@@ -52,8 +141,8 @@ function Invoke-Tracked {
     [switch]$Quiet,
     [switch]$FullFailureOutput
   )
-  $log = "$env:TEMP\ci-tracked.log"
-  $err = "$env:TEMP\ci-tracked.err"
+  $log = Join-Path $env:TEMP "ci-tracked.log"
+  $err = Join-Path $env:TEMP "ci-tracked.err"
   $wrapperName = "ci-tracked-$PID-$([Guid]::NewGuid().ToString('N'))"
   $wrapper = Join-Path $env:TEMP "$wrapperName.cmd"
   $status = Join-Path $env:TEMP "$wrapperName.exit"
@@ -70,28 +159,114 @@ function Invoke-Tracked {
     "exit /b %ci_tracked_exit%"
   )
 
+  $writeFailureOutput = {
+    param([switch]$ProducerMayBeRunning)
+    if ($ProducerMayBeRunning) {
+      Write-Host "==> tracked cleanup incomplete; bounded log excerpts (up to 64 KiB and 200 lines per stream)"
+      foreach ($path in @($log, $err)) {
+        $stream = $null
+        try {
+          $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+          $length = $stream.Length
+          $count = [int][Math]::Min(65536, $length)
+          $null = $stream.Seek($length - $count, [IO.SeekOrigin]::Begin)
+          $buffer = New-Object byte[] $count
+          $read = 0
+          while ($read -lt $count) {
+            $chunk = $stream.Read($buffer, $read, $count - $read)
+            if ($chunk -eq 0) { break }
+            $read += $chunk
+          }
+          $text = [Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+          $lines = $text -split "`r?`n"
+          $start = [Math]::Max(0, $lines.Length - 200)
+          for ($index = $start; $index -lt $lines.Length; $index++) {
+            $line = $lines[$index]
+            if ($line.Length -gt 500) { $line = $line.Substring(0, 500) + "..." }
+            Write-Host "  ! | $line"
+          }
+        } catch {
+          Write-Host "==> bounded tracked log excerpt unavailable"
+        } finally {
+          if ($null -ne $stream) { $stream.Dispose() }
+        }
+      }
+      return
+    }
+    if (Test-Path $log) {
+      if ($FullFailureOutput) {
+        Write-Host "==> tracked process stdout (complete)"
+        Get-Content $log -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  ! | $_" }
+      } else {
+        Get-Content $log -Tail 200 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  ! | $_" }
+      }
+    }
+    if (Test-Path $err) {
+      Get-Content $err -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  ! | $_" }
+    }
+  }
+  $tracked = $null
   try {
     [IO.File]::WriteAllLines($wrapper, $wrapperLines, [Text.Encoding]::ASCII)
-    $process = Start-Process -FilePath $env:COMSPEC `
-      -ArgumentList "/d /s /c `"`"$wrapper`"`"" -WorkingDirectory $Cwd `
-      -PassThru -WindowStyle Hidden -RedirectStandardOutput $log -RedirectStandardError $err
+    Write-OutVar snapshot_safe false
+    $tracked = Start-TrackedProcess -File $env:COMSPEC `
+      -Arguments "/d /s /c `"`"$wrapper`"`"" -Cwd $Cwd -Stdout $log -Stderr $err
+    $process = $tracked.Process
     $stopwatch = [Diagnostics.Stopwatch]::StartNew()
     $tick = 0
+    $lastTail = @{}
     while (-not $process.HasExited) {
       if ($stopwatch.Elapsed.TotalSeconds -gt $TimeoutSec) {
         Write-Host "==> timeout after $([int]$stopwatch.Elapsed.TotalMinutes) min; killing process tree"
-        try { & taskkill.exe /PID $process.Id /T /F 2>&1 | Out-Null } catch {}
-        $process.WaitForExit()
-        Start-Sleep -Seconds 2
+        $killer = $null
+        try {
+          $killer = Start-Process -FilePath (Join-Path $env:SystemRoot "System32\taskkill.exe") `
+            -ArgumentList "/PID $($process.Id) /T /F" -PassThru -WindowStyle Hidden
+          $null = $killer.Handle
+          if (-not $killer.WaitForExit(10000)) {
+            try { $killer.Kill() } catch {}
+            throw "tracked process tree cleanup timed out; refusing safe snapshot"
+          }
+          if ($killer.ExitCode -ne 0) {
+            throw "tracked process tree cleanup failed; refusing safe snapshot"
+          }
+          if (-not $process.WaitForExit(10000)) {
+            throw "tracked process is still running after taskkill; refusing safe snapshot"
+          }
+          if (-not (Wait-TrackedDrain -Tracked $tracked -TimeoutMs 10000)) {
+            throw "tracked process log drain timed out after taskkill; refusing safe snapshot"
+          }
+        } finally {
+          if ($null -ne $killer) { $killer.Dispose() }
+        }
+        & $writeFailureOutput
+        Write-OutVar snapshot_safe true
         return 124
       }
       Start-Sleep -Seconds 10
       $tick++
-      if (-not $Quiet -and ($tick % 6) -eq 0 -and (Test-Path $log)) {
-        Get-Content $log -Tail 3 | ForEach-Object { Write-Host "    | $_" }
+      if (-not $Quiet -and ($tick % 6) -eq 0) {
+        Write-Host "==> tracked process heartbeat: $([int]$stopwatch.Elapsed.TotalSeconds)s elapsed"
+        foreach ($path in @($log, $err)) {
+          if (-not (Test-Path $path)) { continue }
+          $tail = @(Get-Content -LiteralPath $path -Tail 3 -ErrorAction SilentlyContinue |
+            ForEach-Object { if ($_.Length -gt 500) { $_.Substring(0, 500) + "..." } else { $_ } })
+          $text = $tail -join "`n"
+          if ($text -and $lastTail[$path] -cne $text) {
+            $label = if ($path -eq $err) { "stderr |" } else { "|" }
+            $tail | ForEach-Object { Write-Host "    $label $_" }
+            $lastTail[$path] = $text
+          }
+        }
       }
     }
-    $process.WaitForExit()
+    if (-not $process.WaitForExit(10000)) {
+      throw "tracked process exit wait timed out; refusing safe snapshot"
+    }
+    if (-not (Wait-TrackedDrain -Tracked $tracked -TimeoutMs 10000)) {
+      throw "tracked process log drain timed out; refusing safe snapshot"
+    }
+    Write-OutVar snapshot_safe true
 
     $code = 1
     if (-not (Test-Path -LiteralPath $status -PathType Leaf)) {
@@ -109,20 +284,14 @@ function Invoke-Tracked {
         Write-Host "==> tracked process exit code: $code"
       }
     }
-    if ($code -ne 0) {
-      if (Test-Path $log) {
-        if ($FullFailureOutput) {
-          Write-Host "==> tracked process stdout (complete)"
-          Get-Content $log | ForEach-Object { Write-Host "  ! | $_" }
-        } else {
-          Get-Content $log -Tail 200 | ForEach-Object { Write-Host "  ! | $_" }
-        }
-      }
-      if (Test-Path $err) { Get-Content $err | ForEach-Object { Write-Host "  ! | $_" } }
-    }
+    if ($code -ne 0) { & $writeFailureOutput }
     return $code
+  } catch {
+    & $writeFailureOutput -ProducerMayBeRunning
+    throw
   } finally {
     Remove-Item $wrapper, $status -ErrorAction SilentlyContinue
+    if ($null -ne $tracked) { $tracked.Dispose() }
   }
 }
 
@@ -358,6 +527,7 @@ function Verify-FinalBundle {
 Write-Host "==> Chromix CI stage $StageIndex | Chromium $($Revisions.ChromiumVersion) | remaining $(Get-RemainingMin) min"
 Write-OutVar finished false
 Write-OutVar upload_parts false
+Write-OutVar snapshot_safe true
 Assert-CiScripts
 Free-Disk
 Initialize-VisualStudio
@@ -430,7 +600,7 @@ if ($FromArtifact -and -not $RestoredUpstream) {
 if ($StageIndex -eq 1 -and -not $FromArtifact -and
     -not (Test-Path $Src) -and $RequireUpstreamCache) {
   # Leave the stage reserve and at least 30 minutes for restore/preparation.
-  $fetchTimeoutSec = [Math]::Min(3600, ((Get-RemainingMin) - $PackReserveMin - 30) * 60)
+  $fetchTimeoutSec = [Math]::Min(10800, ((Get-RemainingMin) - $PackReserveMin - 30) * 60)
   if ($fetchTimeoutSec -lt 60) {
     throw "required upstream cache: insufficient stage budget for restore"
   }
@@ -441,10 +611,15 @@ if ($StageIndex -eq 1 -and -not $FromArtifact -and
   if ($UpstreamRunId) { $fetchArgs += @("--run-id", $UpstreamRunId) }
   # Bound download/extraction by both the cap and this job's remaining deadline.
   $fetchCommandLine = ($fetchArgs | ForEach-Object { "`"$_`"" }) -join " "
-  $fetchRc = Invoke-Tracked -File (Get-Command python -ErrorAction Stop).Source `
-    -ArgList $fetchCommandLine -Cwd $Repo -TimeoutSec $fetchTimeoutSec
+  try {
+    $fetchRc = Invoke-Tracked -File (Get-Command python -ErrorAction Stop).Source `
+      -ArgList $fetchCommandLine -Cwd $Repo -TimeoutSec $fetchTimeoutSec
+  } catch {
+    Write-Host "==> upstream cache progress: $(Get-UpstreamTimeoutSummary)"
+    throw
+  }
   if ($fetchRc -eq 124) {
-    throw "required upstream cache fetch timed out"
+    throw "required upstream cache fetch timed out; $(Get-UpstreamTimeoutSummary)"
   } elseif ($fetchRc -ne 0) {
     throw "upstream cache fetch helper failed (exit $fetchRc)"
   }

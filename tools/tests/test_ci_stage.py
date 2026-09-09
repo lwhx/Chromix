@@ -1,4 +1,10 @@
+import json
+import os
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -72,19 +78,18 @@ class InvokeTrackedRegressionTest(unittest.TestCase):
         self.assertIn('$status.Replace("%", "%%")', source)
         self.assertRegex(
             source,
-            r'Start-Process -FilePath \$env:COMSPEC\s+`\n'
-            r'\s+-ArgumentList "/d /s /c `"`"\$wrapper`"`""',
+            r'Start-TrackedProcess -File \$env:COMSPEC\s+`\n'
+            r'\s+-Arguments "/d /s /c `"`"\$wrapper`"`""',
         )
+        self.assertNotIn("-RedirectStandardOutput", source)
+        self.assertNotIn("-RedirectStandardError", source)
 
     def test_waits_before_strictly_parsing_status_file(self):
         source = invoke_tracked_source()
-        self.assertEqual(source.count("$process.WaitForExit()"), 2)
-        self.assertRegex(
-            source,
-            r"\n    \}\n    \$process\.WaitForExit\(\)\n\n"
-            r"    \$code = 1\n"
-            r"    if \(-not \(Test-Path -LiteralPath \$status -PathType Leaf\)\)",
-        )
+        self.assertNotIn("$process.WaitForExit()", source)
+        self.assertIn("$process.WaitForExit(10000)", source)
+        self.assertEqual(source.count("Wait-TrackedDrain -Tracked $tracked -TimeoutMs 10000"), 2)
+        self.assertLess(source.rindex("Wait-TrackedDrain"), source.index("$code = 1"))
         self.assertIn("$statusValue -notmatch '^-?\\d+$'", source)
         self.assertIn("[int]::TryParse($statusValue, [ref]$parsedCode)", source)
 
@@ -107,8 +112,8 @@ class InvokeTrackedRegressionTest(unittest.TestCase):
         source = invoke_tracked_source()
         self.assertRegex(
             source,
-            r"(?s)taskkill\.exe /PID \$process\.Id /T /F.*?"
-            r"\$process\.WaitForExit\(\).*?return 124",
+            r'(?s)System32\\taskkill\.exe.*?\$killer\.WaitForExit\(10000\).*?'
+            r'\$process\.WaitForExit\(10000\).*?& \$writeFailureOutput.*?return 124',
         )
 
     def test_failure_output_keeps_long_stdout_tail_and_full_stderr(self):
@@ -116,7 +121,7 @@ class InvokeTrackedRegressionTest(unittest.TestCase):
         stdout_tails = re.findall(r"Get-Content \$log -Tail (\d+)", source)
         self.assertTrue(stdout_tails)
         self.assertGreaterEqual(max(map(int, stdout_tails)), 100)
-        self.assertIn("Get-Content $err | ForEach-Object", source)
+        self.assertIn("Get-Content $err -ErrorAction SilentlyContinue | ForEach-Object", source)
         self.assertNotRegex(source, r"Get-Content \$err -Tail \d+")
 
     def test_can_emit_complete_stdout_on_failure(self):
@@ -126,8 +131,354 @@ class InvokeTrackedRegressionTest(unittest.TestCase):
             source,
             r"if \(\$FullFailureOutput\) \{\s+Write-Host "
             r'"==> tracked process stdout \(complete\)"\s+'
-            r"Get-Content \$log \| ForEach-Object",
+            r"Get-Content \$log -ErrorAction SilentlyContinue \| ForEach-Object",
         )
+
+
+class InvokeTrackedPowerShellTest(unittest.TestCase):
+    def setUp(self):
+        self.powershell = shutil.which("pwsh") or "/opt/pwsh/pwsh"
+        if not Path(self.powershell).is_file():
+            self.skipTest("pwsh is unavailable")
+        self.temp = tempfile.TemporaryDirectory(prefix="tracked process ")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def run_ps(self, code, **env):
+        script = self.root / "fixture.ps1"
+        script.write_text('$ErrorActionPreference = "Stop"\n' + code, encoding="utf-8")
+        return subprocess.run(
+            [self.powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)],
+            env={**os.environ, "TEMP": str(self.root), "SystemRoot": str(self.root),
+                 "COMSPEC": "fixture-cmd.exe", "TEST_PYTHON": sys.executable,
+                 "GITHUB_OUTPUT": str(self.root / "github-output"), **env},
+            capture_output=True, text=True, timeout=20,
+        )
+
+    def tracked(self, **options):
+        env = {"TEST_MODE": "normal", "TEST_STATUS": "7", "TEST_TREE_WAIT": "1",
+               "TEST_TREE_EXIT": "0", "TEST_PROCESS_WAIT": "1", "TEST_DRAIN": "1",
+               "TEST_TREE_START_FAIL": "0", "TEST_FULL": "0", "TEST_QUIET": "0",
+               "TEST_LOG_FAILURE": "0", **options}
+        stage = CI_STAGE.read_text(encoding="utf-8")
+        output_helper = stage[stage.index("function Write-OutVar("):stage.index("function Get-RemainingMin {")]
+        (self.root / "github-output").unlink(missing_ok=True)
+        result = self.run_ps(output_helper + invoke_tracked_source() + r'''
+$script:events = [Collections.Generic.List[string]]::new()
+$script:sleeps = 0
+function Start-Sleep {
+  param($Seconds)
+  if ($Seconds -ne 10) { throw "unexpected heartbeat interval" }
+  $script:sleeps++
+  if ($script:sleeps -eq 12) {
+    Add-Content (Join-Path $env:TEMP "ci-tracked.err") "phase=verify_source"
+  }
+}
+function Start-Process {
+  param($FilePath, $ArgumentList, $WorkingDirectory, [switch]$PassThru, $WindowStyle,
+        $RedirectStandardOutput, $RedirectStandardError)
+  if ($FilePath -like "*taskkill.exe") {
+    $script:events.Add("taskkill:$ArgumentList")
+    if ($env:TEST_TREE_START_FAIL -eq "1") { throw "taskkill startup failed" }
+    $killer = [pscustomobject]@{ Handle = [IntPtr]43; ExitCode = [int]$env:TEST_TREE_EXIT }
+    $killer | Add-Member ScriptMethod WaitForExit {
+      if ($args.Count -ne 1 -or $args[0] -le 0 -or $args[0] -gt 10000) { throw "unbounded killer wait" }
+      $script:events.Add("tree-wait:" + $args[0])
+      return $env:TEST_TREE_WAIT -eq "1"
+    }
+    $killer | Add-Member ScriptMethod Kill { $script:events.Add("kill-killer") }
+    $killer | Add-Member ScriptMethod Dispose { $script:events.Add("dispose-killer") }
+    return $killer
+  }
+  throw "only taskkill may use Start-Process"
+}
+function Start-TrackedProcess {
+  param($File, $Arguments, $Cwd, $Stdout, $Stderr)
+  if ($File -ne $env:COMSPEC -or $Arguments -notlike '* /c *') { throw "wrapper not launched" }
+  if (-not (Test-Path $wrapper)) { throw "wrapper missing" }
+  if ($env:TEST_STATUS -ne "missing") { Set-Content -LiteralPath $status -Value $env:TEST_STATUS }
+  1..250 | ForEach-Object { "stdout-line-$_" } | Set-Content $Stdout
+  Set-Content $Stderr @("stderr-first", ("x" * 2000), "phase=extract_source_and_objects")
+  $script:events.Add("start")
+  $process = [pscustomobject]@{ Id = 4242 }
+  $process | Add-Member ScriptProperty HasExited {
+    return $env:TEST_MODE -eq "normal" -or ($env:TEST_MODE -eq "heartbeat" -and $script:sleeps -ge 18)
+  }
+  $process | Add-Member ScriptProperty ExitCode { throw "must use wrapper status, not Process.ExitCode" }
+  $process | Add-Member ScriptMethod WaitForExit {
+    if ($args.Count -ne 1 -or $args[0] -le 0 -or $args[0] -gt 10000) { throw "unbounded process wait" }
+    $script:events.Add("process-wait:" + $args[0])
+    return $env:TEST_PROCESS_WAIT -eq "1"
+  }
+  $tracked = [pscustomobject]@{ Process = $process }
+  $tracked | Add-Member ScriptMethod Dispose { $script:events.Add("dispose-process") }
+  return $tracked
+}
+function Wait-TrackedDrain {
+  param($Tracked, $TimeoutMs)
+  if ($TimeoutMs -le 0 -or $TimeoutMs -gt 10000) { throw "unbounded drain" }
+  $script:events.Add("drain:$TimeoutMs")
+  if ($env:TEST_LOG_FAILURE -eq "1") { throw "tracked log copy failed" }
+  Add-Content (Join-Path $env:TEMP "ci-tracked.log") "stdout-drained"
+  Add-Content (Join-Path $env:TEMP "ci-tracked.err") "stderr-drained"
+  return $env:TEST_DRAIN -eq "1"
+}
+try {
+  $timeout = if ($env:TEST_MODE -eq "timeout") { -1 } else { 30 }
+  $rc = Invoke-Tracked -File "fixture program.exe" -ArgList "argument" -Cwd $env:TEMP `
+    -TimeoutSec $timeout -FullFailureOutput:($env:TEST_FULL -eq "1") -Quiet:($env:TEST_QUIET -eq "1")
+  Write-Host "RETURN:$rc"
+} catch {
+  Write-Host "THROW:$($_.Exception.Message)"
+}
+Write-Host ("EVENTS:" + (ConvertTo-Json -Compress -InputObject @($script:events.ToArray())))
+''', **env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(list(self.root.glob("ci-tracked-*.cmd")))
+        self.assertFalse(list(self.root.glob("ci-tracked-*.exit")))
+        events = json.loads(next(line[7:] for line in result.stdout.splitlines() if line.startswith("EVENTS:")))
+        return result.stdout, events
+
+    def test_cleanup_failure_freezes_log_length_and_bounds_excerpt(self):
+        source = invoke_tracked_source()
+        start = source.index("  $writeFailureOutput = {")
+        end = source.index("  $tracked = $null", start)
+        result = self.run_ps(source[start:end] + r'''
+$log = Join-Path $env:TEMP "growing.log"
+$err = Join-Path $env:TEMP "growing.err"
+[IO.File]::WriteAllText($log, "initial-line`n")
+[IO.File]::WriteAllText($err, "stderr-line`n" + ("x" * 100000))
+$script:captured = [Collections.Generic.List[string]]::new()
+function Write-Host {
+  param($Object)
+  $script:captured.Add([string]$Object)
+  if ([string]$Object -like "*initial-line*") {
+    [IO.File]::AppendAllText($log, "late-line`n" * 10000)
+  }
+}
+& $writeFailureOutput -ProducerMayBeRunning
+[Console]::WriteLine((ConvertTo-Json -Compress -InputObject @($script:captured.ToArray())))
+''')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        lines = json.loads(result.stdout)
+        self.assertTrue(any("initial-line" in line for line in lines))
+        self.assertTrue(any("bounded log excerpts" in line for line in lines))
+        self.assertFalse(any("late-line" in line for line in lines))
+        self.assertLessEqual(len(lines), 401)
+        self.assertTrue(all(len(line) <= 510 for line in lines))
+
+    def test_timeout_logs_stdout_tail_and_full_stderr_before_124(self):
+        output, events = self.tracked(TEST_MODE="timeout", TEST_STATUS="0")
+        self.assertIn("RETURN:124", output)
+        self.assertNotIn("tracked process exit code:", output)
+        self.assertIn("stdout-line-250", output)
+        self.assertNotIn("stdout-line-1\n", output)
+        for line in ("stderr-first", "phase=extract_source_and_objects", "stdout-drained", "stderr-drained"):
+            self.assertIn(line, output)
+            self.assertLess(output.index(line), output.index("RETURN:124"))
+        self.assertIn("x" * 2000, output)
+        self.assertEqual(events, ["start", "taskkill:/PID 4242 /T /F", "tree-wait:10000",
+                                  "process-wait:10000", "drain:10000", "dispose-killer", "dispose-process"])
+
+    def test_full_failure_output_also_applies_to_timeout(self):
+        output, _ = self.tracked(TEST_MODE="timeout", TEST_FULL="1")
+        self.assertIn("stdout (complete)", output)
+        self.assertIn("stdout-line-1\n", output)
+        self.assertIn("RETURN:124", output)
+
+    def test_failed_cleanup_or_drain_throws_instead_of_safe_timeout(self):
+        cases = [({"TEST_PROCESS_WAIT": "0"}, "still running after taskkill"),
+                 ({"TEST_TREE_WAIT": "0"}, "tree cleanup timed out"),
+                 ({"TEST_TREE_EXIT": "1"}, "tree cleanup failed"),
+                 ({"TEST_TREE_START_FAIL": "1"}, "taskkill startup failed"),
+                 ({"TEST_DRAIN": "0"}, "log drain timed out after taskkill")]
+        for options, message in cases:
+            with self.subTest(options=options):
+                output, events = self.tracked(TEST_MODE="timeout", **options)
+                self.assertIn(message, output)
+                self.assertIn("THROW:", output)
+                self.assertNotIn("RETURN:", output)
+                self.assertIn("stdout-line-250", output)
+                self.assertIn("stderr-first", output)
+                self.assertEqual(events[-1], "dispose-process")
+                if "TEST_TREE_WAIT" in options:
+                    self.assertIn("kill-killer", events)
+                if "TEST_DRAIN" not in options:
+                    self.assertNotIn("drain:10000", events)
+
+    def test_normal_exit_drains_before_logs_or_status_and_fails_if_drain_stalls(self):
+        output, events = self.tracked(TEST_STATUS="7")
+        self.assertIn("RETURN:7", output)
+        self.assertIn("stdout-drained", output)
+        self.assertIn("stderr-drained", output)
+        self.assertEqual(events, ["start", "process-wait:10000", "drain:10000", "dispose-process"])
+        output, _ = self.tracked(TEST_STATUS="0", TEST_DRAIN="0")
+        self.assertIn("log drain timed out", output)
+        self.assertNotIn("RETURN:", output)
+        self.assertNotIn("tracked process exit code:", output)
+        self.assertIn("stderr-drained", output)
+
+    def snapshot_outputs(self):
+        return dict(line.split("=", 1) for line in (self.root / "github-output").read_text().splitlines())
+
+    def assert_workflow_snapshot(self, safe):
+        import yaml
+
+        outputs = {"upload_parts": "false", **self.snapshot_outputs()}
+        self.assertEqual(outputs["snapshot_safe"], str(safe).lower())
+        jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+        for number in range(1, 13):
+            steps = jobs[f"build-{number}"]["steps"]
+            guarded = [step for step in steps if step.get("name", "").startswith("Upload tree part ")
+                       or step.get("name") == "Ensure build tree snapshot"]
+            self.assertEqual(len(guarded), 5)
+            for step in guarded:
+                expression = step["if"]
+                self.assertIn("steps.stage.outputs.snapshot_safe == 'true'", expression)
+                expression = expression.removeprefix("${{ ").removesuffix(" }}")
+                expression = expression.replace("always()", "True").replace("&&", "and")
+                for key, value in outputs.items():
+                    expression = expression.replace(f"steps.stage.outputs.{key}", repr(value))
+                self.assertEqual(eval(expression, {"__builtins__": {}}), safe, step["name"])
+
+    def test_kill_or_drain_failure_disables_all_workflow_snapshots_and_tree_uploads(self):
+        for options in ({"TEST_TREE_WAIT": "0"}, {"TEST_TREE_EXIT": "1"},
+                        {"TEST_TREE_START_FAIL": "1"}, {"TEST_PROCESS_WAIT": "0"}, {"TEST_DRAIN": "0"}):
+            with self.subTest(options=options):
+                output, _ = self.tracked(TEST_MODE="timeout", **options)
+                self.assertIn("THROW:", output)
+                self.assert_workflow_snapshot(False)
+        self.tracked(TEST_STATUS="0", TEST_DRAIN="0")
+        self.assert_workflow_snapshot(False)
+        for mode in ("normal", "timeout"):
+            output, _ = self.tracked(TEST_MODE=mode, TEST_LOG_FAILURE="1")
+            self.assertIn("THROW:tracked log copy failed", output)
+            self.assertIn("stderr-first", output)
+            self.assert_workflow_snapshot(False)
+
+    def test_exited_compile_failure_and_clean_timeout_allow_diagnostic_snapshots(self):
+        for options, rc in (({"TEST_STATUS": "7"}, 7), ({"TEST_MODE": "timeout"}, 124)):
+            with self.subTest(options=options):
+                output, _ = self.tracked(**options)
+                self.assertIn(f"RETURN:{rc}", output)
+                self.assert_workflow_snapshot(True)
+                states = (self.root / "github-output").read_text().splitlines()
+                self.assertEqual(states, ["snapshot_safe=false", "snapshot_safe=true"])
+
+    def test_actual_wrapper_status_parsing_is_strict(self):
+        cases = [("0", 0), (" 7\r\n", 7), ("-9", -9), ("2147483647", 2147483647),
+                 ("missing", 1), ("", 1), ("1\n0", 1), ("0 trailing", 1),
+                 ("2147483648", 1), ("+0", 1)]
+        for status, expected in cases:
+            with self.subTest(status=status):
+                output, _ = self.tracked(TEST_STATUS=status)
+                self.assertIn(f"RETURN:{expected}\n", output)
+                if expected == 1:
+                    self.assertRegex(output, "status (file is missing|is invalid)")
+                    self.assertIn("stderr-first", output)
+
+    def test_heartbeat_shows_bounded_changed_stderr_and_deduplicates_idle_tail(self):
+        output, _ = self.tracked(TEST_MODE="heartbeat", TEST_STATUS="0")
+        self.assertEqual(output.count("tracked process heartbeat:"), 3)
+        self.assertEqual(output.count("stderr | stderr-first"), 1)
+        self.assertEqual(output.count("stderr | phase=extract_source_and_objects"), 2)
+        self.assertEqual(output.count("stderr | phase=verify_source"), 1)
+        self.assertEqual(output.count("| stdout-line-250"), 1)
+        self.assertNotIn("x" * 501, output)
+        self.assertIn("x" * 500 + "...", output)
+        quiet, _ = self.tracked(TEST_MODE="heartbeat", TEST_STATUS="0", TEST_QUIET="1")
+        self.assertNotIn("heartbeat:", quiet)
+        self.assertNotIn("stderr |", quiet)
+
+    def test_real_async_redirect_drain_is_bounded_and_flushes_tiny_process(self):
+        stage = CI_STAGE.read_text(encoding="utf-8")
+        helper = stage[stage.index("function Start-TrackedProcess {"):stage.index("function Get-UpstreamTimeoutSummary {")]
+        child = self.root / "child.py"
+        child.write_text('import time\nprint("tiny stdout", flush=True)\ntime.sleep(1)\n', encoding="utf-8")
+        result = self.run_ps(helper + r'''
+$tracked = Start-TrackedProcess -File $env:TEST_PYTHON `
+  -Arguments ('"' + (Join-Path $env:TEMP "child.py") + '"') -Cwd $env:TEMP `
+  -Stdout (Join-Path $env:TEMP "tiny.out") -Stderr (Join-Path $env:TEMP "tiny.err")
+try {
+  $watch = [Diagnostics.Stopwatch]::StartNew()
+  if (Wait-TrackedDrain -Tracked $tracked -TimeoutMs 20) { throw "live process drained unexpectedly" }
+  if ($watch.Elapsed.TotalSeconds -gt 2) { throw "drain was unbounded" }
+  if (-not $tracked.Process.WaitForExit(5000)) { throw "tiny process did not exit" }
+  if (-not (Wait-TrackedDrain -Tracked $tracked -TimeoutMs 5000)) { throw "tiny process did not drain" }
+  if ((Get-Content (Join-Path $env:TEMP "tiny.out") -Raw) -notmatch "tiny stdout") { throw "missing final log" }
+  Write-Host "tiny-drain-ok"
+} finally {
+  if (-not $tracked.Process.HasExited) { $tracked.Process.Kill() }
+  $tracked.Dispose()
+}
+''')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("tiny-drain-ok", result.stdout)
+
+
+    def test_real_exited_parent_with_inherited_redirects_cannot_block_drain(self):
+        stage = CI_STAGE.read_text(encoding="utf-8")
+        helper = stage[stage.index("function Start-TrackedProcess {"):stage.index("function Get-UpstreamTimeoutSummary {")]
+        child = self.root / "parent.py"
+        child.write_text(
+            'import subprocess, sys\n'
+            'subprocess.Popen([sys.executable, "-c", '
+            '"import sys, time; time.sleep(1); print(\\\"child stdout\\\"); print(\\\"child stderr\\\", file=sys.stderr)"])\n'
+            'print("parent exited", flush=True)\n', encoding="utf-8")
+        result = self.run_ps(helper + r'''
+$tracked = Start-TrackedProcess -File $env:TEST_PYTHON `
+  -Arguments ('"' + (Join-Path $env:TEMP "parent.py") + '"') -Cwd $env:TEMP `
+  -Stdout (Join-Path $env:TEMP "tiny.out") -Stderr (Join-Path $env:TEMP "tiny.err")
+try {
+  if (-not $tracked.Process.WaitForExit(5000) -or -not $tracked.Process.HasExited) { throw "parent has not exited" }
+  $watch = [Diagnostics.Stopwatch]::StartNew()
+  if (Wait-TrackedDrain -Tracked $tracked -TimeoutMs 20) { throw "inherited redirects drained prematurely" }
+  if ($watch.Elapsed.TotalSeconds -gt 2) { throw "exited-parent drain was unbounded" }
+  # Failure cleanup must not dispose writers that still have a live copy task.
+  $tracked.Dispose()
+  if (-not (Wait-TrackedDrain -Tracked $tracked -TimeoutMs 5000)) { throw "child did not close redirects" }
+  if ((Get-Content (Join-Path $env:TEMP "tiny.out") -Raw) -notmatch "child stdout" -or
+      (Get-Content (Join-Path $env:TEMP "tiny.err") -Raw) -notmatch "child stderr") { throw "missing redirected tail" }
+  Write-Host "inherited-drain-ok"
+} finally {
+  $tracked.Dispose()
+}
+''')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("inherited-drain-ok", result.stdout)
+
+
+    def test_real_tracking_keeps_inherited_logs_and_failed_compile_snapshot(self):
+        stage = CI_STAGE.read_text(encoding="utf-8")
+        helpers = stage[stage.index("function Write-OutVar("):stage.index("function Get-FreeGB")]
+        # Only the cmd.exe launch is adapted for the Linux fixture.
+        helpers = helpers.replace("function Start-TrackedProcess {", "function Start-FixtureProcess {")
+        child = self.root / "parent.py"
+        child.write_text(
+            'import os, pathlib, subprocess, sys\n'
+            'subprocess.Popen([sys.executable, "-c", '
+            '"import sys,time; time.sleep(0.3); print(\\\"child stdout\\\",flush=True); '
+            'print(\\\"child stderr\\\",file=sys.stderr,flush=True)"])\n'
+            'pathlib.Path(os.environ["TEST_STATUS_PATH"]).write_text("7\\n")\n'
+            'print("parent stdout",flush=True)\n', encoding="utf-8")
+        result = self.run_ps(helpers + r'''
+function Start-TrackedProcess {
+  param($File, $Arguments, $Cwd, $Stdout, $Stderr)
+  if ($File -ne $env:COMSPEC -or -not (Test-Path $wrapper)) { throw "expected cmd wrapper" }
+  $env:TEST_STATUS_PATH = $status
+  Start-FixtureProcess -File $env:TEST_PYTHON -Arguments ('"' + (Join-Path $env:TEMP "parent.py") + '"') `
+    -Cwd $Cwd -Stdout $Stdout -Stderr $Stderr
+}
+function Start-Sleep { param($Seconds); Microsoft.PowerShell.Utility\Start-Sleep -Milliseconds 10 }
+$rc = Invoke-Tracked -File "fixture.exe" -ArgList "" -Cwd $env:TEMP -TimeoutSec 5
+if ($rc -ne 7) { throw "wrapper exit status was not preserved" }
+Write-Host "RETURN:$rc"
+''')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for text in ("parent stdout", "child stdout", "child stderr", "RETURN:7"):
+            self.assertIn(text, result.stdout)
+        self.assertNotIn("ObjectDisposedException", result.stderr)
+        self.assert_workflow_snapshot(True)
 
 
 class ValidateOnlyRegressionTest(unittest.TestCase):
@@ -357,15 +708,15 @@ class ResumeWorkflowRegressionTest(unittest.TestCase):
             )
         self.assertEqual(self.source.count("Download tree from previous run"), 11)
 
-    def test_every_stage_uploads_a_tree_on_success_or_failure(self):
+    def test_every_stage_uploads_a_tree_only_after_confirmed_safe_exit(self):
         self.assertEqual(self.source.count("- name: Ensure build tree snapshot"), 12)
         self.assertEqual(
             self.source.count(
-                "if: ${{ always() && steps.stage.outputs.upload_parts != 'true' }}"
+                "if: ${{ always() && steps.stage.outputs.snapshot_safe == 'true' && steps.stage.outputs.upload_parts != 'true' }}"
             ),
             12,
         )
-        self.assertEqual(len(re.findall(r"- name: Upload tree part [1-4]\n        if: \$\{\{ always\(\) \}\}", self.source)), 48)
+        self.assertEqual(len(re.findall(r"- name: Upload tree part [1-4]\n        if: \$\{\{ always\(\) && steps.stage.outputs.snapshot_safe == 'true' \}\}", self.source)), 48)
         self.assertEqual(self.source.count("- name: Upload tree part 1"), 12)
         self.assertEqual(self.source.count("- name: Upload tree part 4"), 12)
         self.assertNotIn("if: steps.stage.outputs.upload_parts == 'true'", self.source)

@@ -165,14 +165,26 @@ Ninja can continue incrementally. Manual dispatch of
 `.github/workflows/build-win-x64-github.yml` remains available for explicit
 Windows-only retries or cross-run resume; the normal release path uses the
 Windows job nested in `build-cross-platform`. Windows validation also requires
-restoration when requested. Its internal deadline is 140 minutes within the
-150-minute job, with 15 minutes reserved for diagnostics; normal build stages
-retain a 300-minute internal deadline and 40-minute handoff reserve. Full-cache
-fetching is capped at 60 minutes and further limited by the actual remaining
-budget. The downloader's shared retry deadline is 45 minutes, leaving time for
-extraction inside that cap; the earlier 15-minute inner deadline stopped the
-15 GB Windows artifact despite the longer stage budget. Miss reports retain the
-last attempt's partial and expected byte counts separately from verified bytes.
+restoration when requested. Its internal deadline is 230 minutes within the
+240-minute job, with 15 minutes reserved for diagnostics; normal build stages
+retain a 300-minute internal deadline and 40-minute handoff reserve. Windows
+full-cache fetching is capped at 180 minutes and further limited by the actual
+remaining budget, preserving the reserve and another 30 minutes for preparation.
+The downloader's shared retry deadline remains 45 minutes. The previous 60-minute
+total cap killed a fetch after its 15 GB download and outer ZIP extraction had
+completed; it did not distinguish slow inner extraction from cleanup after an
+unreported extraction error. Extraction now records phase timings, member count,
+actual written bytes and free space at most once per 30 seconds during ordinary
+progress, plus phase boundaries. Failure reasons are persisted before cleanup.
+Windows forwards tracked stderr progress and reports the last fetch state on a
+timeout. Log-copy tasks own their pipes and output files until EOF, including
+when a child retains the parent's redirected handles. Process exit and log-drain
+waits are bounded; an unconfirmed cleanup only prints fixed-size log excerpts and
+keeps all Windows tree snapshot/upload steps disabled through `snapshot_safe`.
+These diagnostics and the revised budget still require validation on the full
+Windows runner workload. Miss reports
+retain the last download attempt's partial and expected byte counts separately
+from verified bytes.
 V8 Torque validation uses only the remaining non-reserved time. The
 validation runner currently uploads diagnostics rather than its build tree, so
 stage 1 repeats restoration on its own runner.
