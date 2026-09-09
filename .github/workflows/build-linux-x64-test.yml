@@ -17,13 +17,16 @@ permissions:
 
 jobs:
   linux-build-test:
-    uses: ./.github/workflows/build-posix-github.yml
-    with:
-      platform: linux
-      arch: x64
-      runner: ubuntu-22.04
-      artifact: chromix-linux-x64-test
-      max-stages: 1
-      build_profile: fast
-      use_upstream_cache: false
-    secrets: inherit
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip
+          python3 -m pip install --user pytest
+      - name: Validate patch set
+        run: python3 tools/check_patches.py
+      - name: Run full repository tests
+        run: python3 -m pytest -q
