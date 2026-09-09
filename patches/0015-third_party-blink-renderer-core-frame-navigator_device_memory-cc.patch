@@ -2,7 +2,7 @@ diff --git a/third_party/blink/renderer/core/frame/navigator_device_memory.cc b/
 index 05fa33e456..666154ddaa 100644
 --- a/third_party/blink/renderer/core/frame/navigator_device_memory.cc
 +++ b/third_party/blink/renderer/core/frame/navigator_device_memory.cc
-@@ -9,9 +9,29 @@
+@@ -9,9 +9,37 @@
  #include "third_party/blink/renderer/core/dom/document.h"
  #include "third_party/blink/renderer/core/frame/local_dom_window.h"
  
@@ -28,6 +28,14 @@ index 05fa33e456..666154ddaa 100644
 +        best = b;
 +    }
 +    return static_cast<float>(best);
++  }
++  // UXR: seed-pooled persona value (8GB 75% / 4GB 25%, the real 2026 desktop
++  // mix; deviceMemory buckets cap at 8). 0 = no seed -> host value.
++  {
++    const float ph_pool =
++        base::UxrConfig::GetInstance().GetSeededDeviceMemory();
++    if (ph_pool > 0.0f)
++      return ph_pool;
 +  }
    return ApproximatedDeviceMemory::GetApproximatedDeviceMemory();
  }

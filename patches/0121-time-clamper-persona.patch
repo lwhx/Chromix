@@ -1,0 +1,38 @@
+diff --git a/third_party/blink/renderer/core/timing/time_clamper.cc b/third_party/blink/renderer/core/timing/time_clamper.cc
+--- a/third_party/blink/renderer/core/timing/time_clamper.cc
++++ b/third_party/blink/renderer/core/timing/time_clamper.cc
+@@ -6,6 +6,8 @@
+ 
+ #include "base/bit_cast.h"
+ #include "base/rand_util.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/uxr_config.h"
+ 
+ #include <cmath>
+ 
+@@ -15,7 +17,24 @@
+ const int64_t kTenLowerDigitsMod = 10000000000;
+ }  // namespace
+ 
+-TimeClamper::TimeClamper() : secret_(base::RandUint64()) {}
++TimeClamper::TimeClamper() : secret_([] {
++  // A persona uses one process-stable quantizer secret so navigation, paint,
++  // event and resource timing share identical rounding boundaries. The
++  // unconfigured path retains Chromium's per-process random secret.
++  uint32_t seed = 0;
++  base::StringToUint(base::UxrConfig::GetInstance().Get("uxr-canvas-seed"),
++                     &seed);
++  if (seed != 0) {
++    uint64_t x = seed;
++    x ^= x >> 33;
++    x *= uint64_t{0xff51afd7ed558ccd};
++    x ^= x >> 33;
++    x *= uint64_t{0xc4ceb9fe1a85ec53};
++    x ^= x >> 33;
++    return x;
++  }
++  return base::RandUint64();
++}()) {}
+ 
+ // This is using int64 for timestamps, because https://bit.ly/doubles-are-bad
+ base::TimeDelta TimeClamper::ClampTimeResolution(

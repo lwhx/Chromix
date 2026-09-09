@@ -1,0 +1,34 @@
+diff --git a/third_party/blink/renderer/modules/webaudio/audio_context.cc b/third_party/blink/renderer/modules/webaudio/audio_context.cc
+--- a/third_party/blink/renderer/modules/webaudio/audio_context.cc
++++ b/third_party/blink/renderer/modules/webaudio/audio_context.cc
+@@ -11,6 +11,8 @@
+ #include "base/metrics/histogram_functions.h"
+ #include "base/metrics/histogram_macros.h"
+ #include "base/strings/strcat.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/uxr_config.h"
+ #include "base/strings/to_string.h"
+ #include "base/trace_event/trace_event.h"
+ #include "build/build_config.h"
+@@ -1270,6 +1272,10 @@
+   DCHECK_CALLED_ON_VALID_SEQUENCE(main_thread_sequence_checker_);
+   DCHECK(destination());
+ 
++  double value = 0.0;
++  const std::string configured = base::UxrConfig::GetInstance().Get("uxr-audio-base-latency");
++  if (!configured.empty() && base::StringToDouble(configured, &value) && value >= 0.0)
++    return value;
+   return base_latency_;
+ }
+ 
+@@ -1279,6 +1285,10 @@
+ 
+   DeferredTaskHandler::GraphAutoLocker locker(GetDeferredTaskHandler());
+ 
++  double value = 0.0;
++  const std::string configured = base::UxrConfig::GetInstance().Get("uxr-audio-output-latency");
++  if (!configured.empty() && base::StringToDouble(configured, &value) && value >= 0.0)
++    return value;
+   double factor = GetOutputLatencyQuantizingFactor();
+   return std::round(output_position_.hardware_output_latency / factor) * factor;
+ }

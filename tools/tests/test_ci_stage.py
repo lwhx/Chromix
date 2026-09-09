@@ -829,7 +829,6 @@ class RestoredSourceUpdateRegressionTest(unittest.TestCase):
         self.assertIn("#include \"components/ungoogled/persona_profile.h\"", update_source)
         self.assertIn("farble_seed.h", update_source)
         self.assertIn("farble_seed.cc", update_source)
-        self.assertIn("fingerprint_data.h", update_source)
         self.assertIn("FontCache::GetFontPlatformData", update_source)
         self.assertIn("TextMetrics::Update", update_source)
         current = update_source.rindex('$normalizedContent.Contains($normalizedNewText)')

@@ -29,7 +29,7 @@ index bc4c0c6ca0..f6e8ff99cf 100644
  
    // We don't need to copy anything if a) the buffer offset is past the end of
    // the AudioBuffer or b) the internal `Data()` of is a zero-length
-@@ -342,4 +348,34 @@ void SharedAudioBuffer::Zero() {
+@@ -342,4 +348,37 @@ void SharedAudioBuffer::Zero() {
    }
  }
  
@@ -57,6 +57,9 @@ index bc4c0c6ca0..f6e8ff99cf 100644
 +      st ^= st << 13;
 +      st ^= st >> 17;
 +      st ^= st << 5;
++      if ((st & 7u) >= 3u)
++        continue;  // sparse (3/8): mimics real mixer-chain variance instead
++                   // of a uniform per-sample dither signature
 +      float r = (st & 0xFFFFFFu) / static_cast<float>(0x1000000);
 +      data[i] += (r - 0.5f) * 2.0e-7f;  // sub-perceptual, deterministic per seed
 +    }

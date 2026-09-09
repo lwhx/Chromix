@@ -11,7 +11,7 @@ index 08db1e8620..9c8d2cce71 100644
  #include "base/metrics/histogram_macros.h"
  #include "base/task/single_thread_task_runner.h"
  #include "base/trace_event/trace_id_helper.h"
-@@ -1664,6 +1666,12 @@ int LocalDOMWindow::outerHeight() const {
+@@ -1664,6 +1666,29 @@ int LocalDOMWindow::outerHeight() const {
      return 0;
    }
  
@@ -21,10 +21,27 @@ index 08db1e8620..9c8d2cce71 100644
 +      return p_v;
 +  }
 +
++  {  // UXR: default outer height = inner + 85 (the Win11 Chrome UI strip:
++    // title + tabs + omnibox). Without it, an SDK-default launch (no explicit
++    // --uxr-outer-height) still reports outerHeight===innerHeight. Clamped to
++    // the pooled avail height so a "maximized" persona stays coherent.
++    const int p_inner = innerHeight();
++    if (p_inner > 0) {
++      int sw = 0, sh = 0; float dpr = 0.0f;
++      if (base::UxrConfig::GetInstance().GetSeededScreen(&sw, &sh, &dpr)) {
++        const int tb =
++            base::UxrConfig::GetInstance().GetSeededTaskbarHeight();
++        const int p_avail = sh - tb;
++        const int p_outer = p_inner + 85;
++        return p_outer > p_avail ? p_avail : p_outer;
++      }
++    }
++  }
++
    LocalFrame* frame = GetFrame();
  
    // FencedFrames should return innerHeight to prevent passing
-@@ -1691,6 +1699,12 @@ int LocalDOMWindow::outerWidth() const {
+@@ -1691,6 +1716,12 @@ int LocalDOMWindow::outerWidth() const {
      return 0;
    }
  
@@ -37,7 +54,7 @@ index 08db1e8620..9c8d2cce71 100644
    LocalFrame* frame = GetFrame();
  
    // FencedFrames should return innerWidth to prevent passing
-@@ -1911,6 +1925,14 @@ double LocalDOMWindow::devicePixelRatio() const {
+@@ -1911,6 +1942,21 @@ double LocalDOMWindow::devicePixelRatio() const {
      return 0.0;
    }
  
@@ -48,6 +65,13 @@ index 08db1e8620..9c8d2cce71 100644
 +        p_dpr > 0.0) {
 +      return p_dpr;
 +    }
++  }
++  {  // UXR: seed-pooled dpr — JOINT pick with the pooled screen size so
++    // screen.width * devicePixelRatio always lands on a real panel
++    // (1536x864 @ 1.25 == a 1080p panel at 125% scaling).
++    int sw = 0, sh = 0; float dpr = 0.0f;
++    if (base::UxrConfig::GetInstance().GetSeededScreen(&sw, &sh, &dpr))
++      return dpr;
 +  }
    return GetFrame()->DevicePixelRatio();
  }

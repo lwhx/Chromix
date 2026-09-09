@@ -11,7 +11,7 @@ index 976a3c8c36..1ce616d597 100644
  
  #include <algorithm>
  
-@@ -133,6 +135,12 @@ V8EffectiveConnectionType NetworkInformation::effectiveType() {
+@@ -133,6 +135,19 @@ V8EffectiveConnectionType NetworkInformation::effectiveType() {
  
  uint32_t NetworkInformation::rtt() {
    MaybeShowWebHoldbackConsoleMsg();
@@ -21,10 +21,17 @@ index 976a3c8c36..1ce616d597 100644
 +      return GetNetworkStateNotifier().RoundRtt(  // UXR P0-M: 50ms buckets
 +          Host(), base::Milliseconds(p_v));
 +  }
++  {  // UXR: seed-pooled rtt (50/100/150 weighted) when no explicit override;
++    // a server hosting a desktop persona often measures ~0ms.
++    const int ph_rtt = base::UxrConfig::GetInstance().GetSeededNetRttMs();
++    if (ph_rtt > 0)
++      return GetNetworkStateNotifier().RoundRtt(
++          Host(), base::Milliseconds(ph_rtt));
++  }
    std::optional<base::TimeDelta> override_rtt =
        GetNetworkStateNotifier().GetWebHoldbackHttpRtt();
    if (override_rtt) {
-@@ -149,6 +157,14 @@ uint32_t NetworkInformation::rtt() {
+@@ -149,6 +164,14 @@ uint32_t NetworkInformation::rtt() {
  
  double NetworkInformation::downlink() {
    MaybeShowWebHoldbackConsoleMsg();

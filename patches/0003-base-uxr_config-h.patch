@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000000..6eead77d0f
 --- /dev/null
 +++ b/base/uxr_config.h
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,61 @@
 +// Copyright 2026. Process-global persona config delivered to the renderer over
 +// IPC (NOT the command line) so persona values + seeds never appear in the
 +// renderer's /proc/cmdline. Populated once at renderer init; read-only after.
@@ -37,6 +37,21 @@ index 0000000000..6eead77d0f
 +  std::string Get(const std::string& key) const;
 +  // Parses the value as an int; returns false if absent or unparseable.
 +  bool GetInt(const std::string& key, int* out) const;
++
++  // Seed-pooled hardware/display persona, derived from "uxr-canvas-seed".
++  // Weights follow the real 2026 desktop installed base (Steam HW Survey
++  // blended with general-web telemetry). Every method returns 0/false when
++  // no seed is configured so the caller falls back to the host value
++  // (fail-closed); explicit per-surface CLI overrides (--uxr-hw-concurrency,
++  // --uxr-screen-width, --uxr-net-rtt, ...) are checked by callers and win.
++  int GetSeededHwConcurrency() const;    // 4/6/8/12/16 cores, weighted
++  float GetSeededDeviceMemory() const;   // 4 or 8 GB (deviceMemory buckets)
++  // Joint (logical w/h, dpr) pick so width*dpr always lands on a real panel.
++  bool GetSeededScreen(int* w, int* h, float* dpr) const;
++  // Taskbar height paired with the persona OS: 48px (Win11, ~68%) or 40px
++  // (Win10, ~26% of desktops per Steam 2026). availHeight = height - this.
++  int GetSeededTaskbarHeight() const;
++  int GetSeededNetRttMs() const;         // 50/100/150 ms, weighted
 +
 + private:
 +  friend class NoDestructor<UxrConfig>;

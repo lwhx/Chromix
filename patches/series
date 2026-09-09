@@ -109,3 +109,14 @@ patches/0107-components-ungoogled-fingerprint_data.patch
 patches/0108-webgl-gpu-fingerprint-integration.patch
 patches/0109-webgl-BUILD-gpu-files.patch
 patches/0110-webgl-query-hot-path.patch
+patches/0111-global-privacy-control.patch
+patches/0112-layout-theme-system-fonts.patch
+patches/0113-webgl-translated-source.patch
+patches/0114-webgpu-preferred-canvas-format.patch
+patches/0115-battery-persona.patch
+patches/0116-audio-persona.patch
+patches/0117-realtime-persona.patch
+patches/0118-font-fallback-persona.patch
+patches/0119-time-clamper-persona.patch
+patches/0120-media-devices-persona.patch
+patches/0121-time-clamper-persona.patch

@@ -1,0 +1,31 @@
+diff --git a/third_party/blink/renderer/modules/mediastream/media_devices.cc b/third_party/blink/renderer/modules/mediastream/media_devices.cc
+--- a/third_party/blink/renderer/modules/mediastream/media_devices.cc
++++ b/third_party/blink/renderer/modules/mediastream/media_devices.cc
+@@ -3,6 +3,7 @@
+ // found in the LICENSE file.
+ 
+ #include "third_party/blink/renderer/modules/mediastream/media_devices.h"
++#include "base/uxr_config.h"
+ 
+ #include <algorithm>
+ #include <utility>
+@@ -1457,6 +1458,19 @@
+       mojom::blink::MediaDeviceType device_type =
+           static_cast<mojom::blink::MediaDeviceType>(i);
+       WebMediaDeviceInfo device_info = enumeration[i][j];
++      // UXR: persona devices use deterministic opaque identifiers.  Keep
++      // labels empty before permission; after permission expose stable generic
++      // names without leaking host device metadata.
++      if (base::UxrConfig::GetInstance().Has("uxr-media-devices")) {
++        const char* kind = device_type == mojom::blink::MediaDeviceType::kMediaVideoInput
++                               ? "videoinput"
++                               : device_type == mojom::blink::MediaDeviceType::kMediaAudioOutput
++                                     ? "audiooutput" : "audioinput";
++        device_info.device_id = base::StringPrintf("uxr-%s-%zu", kind, j);
++        device_info.group_id = base::StringPrintf("uxr-group-%zu", j);
++        if (!device_info.label.empty())
++          device_info.label = base::StringPrintf("%s %zu", kind, j + 1);
++      }
+       String device_label = String::FromUtf8(device_info.label);
+       if (device_type == mojom::blink::MediaDeviceType::kMediaAudioInput ||
+           device_type == mojom::blink::MediaDeviceType::kMediaVideoInput) {

@@ -10,22 +10,50 @@ index 891a81543b..8877525be3 100644
  #include "build/build_config.h"
  #include "third_party/blink/public/common/thread_safe_browser_interface_broker_proxy.h"
  #include "third_party/blink/public/platform/browser_interface_broker_proxy.h"
-@@ -95,6 +96,19 @@ void SpeechSynthesis::OnSetVoiceList(
+@@ -95,6 +96,47 @@ void SpeechSynthesis::OnSetVoiceList(
  const HeapVector<Member<SpeechSynthesisVoice>>& SpeechSynthesis::getVoices() {
    // Kick off initialization here to ensure voice list gets populated.
    std::ignore = TryEnsureMojomSynthesis();
-+  // UXR: inject coherent OS voices when empty (headless getVoices()==[] tell).
-+  if (voice_list_.empty() &&
-+      base::UxrConfig::GetInstance().Has("uxr-voices")) {
-+    auto p_add = [&](const char* uri, const char* lang, bool def) {
-+      auto v = mojom::blink::SpeechSynthesisVoice::New(
-+          String(uri), String(uri), String(lang), true, def);
-+      voice_list_.push_back(
-+          MakeGarbageCollected<SpeechSynthesisVoice>(std::move(v)));
-+    };
-+    p_add("Microsoft David Desktop - English (United States)", "en-US", true);
-+    p_add("Microsoft Zira Desktop - English (United States)", "en-US", false);
-+    p_add("Microsoft Mark - English (United States)", "en-US", false);
++  // UXR: persona voice list, REPLACING the host SAPI set (the host list
++  // leaks the real machine: installed language packs, third-party voices).
++  // The voice set follows the persona language (--uxr-languages, or a locale
++  // passed as --uxr-voices=zh-CN) so a zh-CN persona does not report
++  // en-US-only voices. Re-injected lazily whenever the real SAPI list arrived
++  // in between (OnSetVoiceList) and clobbered the persona set; the first
++  // voiceURI doubles as the coherence marker.
++  if (base::UxrConfig::GetInstance().Has("uxr-voices")) {
++    std::string p_lang = base::UxrConfig::GetInstance().Get("uxr-voices");
++    if (p_lang.empty() || p_lang == "1" || p_lang == "true") {
++      const std::string p_langs =
++          base::UxrConfig::GetInstance().Get("uxr-languages");
++      p_lang = p_langs.substr(0, p_langs.find(','));
++    }
++    const bool p_zh = p_lang.rfind("zh", 0) == 0;
++    const char* p_first = p_zh
++        ? "Microsoft Huihui Desktop - Chinese (Simplified, PRC)"
++        : "Microsoft David Desktop - English (United States)";
++    if (voice_list_.empty() ||
++        voice_list_.front()->voiceURI() != p_first) {
++      voice_list_.clear();
++      auto p_add = [&](const char* uri, const char* lang, bool def) {
++        auto v = mojom::blink::SpeechSynthesisVoice::New(
++            String(uri), String(uri), String(lang), true, def);
++        voice_list_.push_back(
++            MakeGarbageCollected<SpeechSynthesisVoice>(std::move(v)));
++      };
++      if (p_zh) {
++        p_add("Microsoft Huihui Desktop - Chinese (Simplified, PRC)",
++              "zh-CN", true);
++        p_add("Microsoft Yaoyao - Chinese (Simplified, PRC)", "zh-CN", false);
++        p_add("Microsoft Kangkang - Chinese (Simplified, PRC)", "zh-CN",
++              false);
++      } else {
++        p_add("Microsoft David Desktop - English (United States)", "en-US",
++              true);
++        p_add("Microsoft Zira Desktop - English (United States)", "en-US",
++              false);
++      }
++    }
 +  }
    return voice_list_;
  }

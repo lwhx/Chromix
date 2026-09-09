@@ -59,6 +59,18 @@ release_channel, user_agent, viewport, color_scheme`) match CloakBrowser
 name-for-name; `**kwargs` passes through to `playwright.chromium.launch()` /
 `browser.new_context()`.
 
+### Custom font directory
+
+`fonts_dir="path/to/fonts"` makes the browser use exactly the fonts inside
+that directory: the SDK parses every `.ttf` / `.otf` / `.ttc` name table and
+passes the discovered families as `--uxr-font-whitelist`, and on Linux the
+directory replaces the bundled Fontconfig set so those fonts truly render.
+An explicit `--uxr-font-whitelist` in `args` still wins.
+
+```python
+browser = launch(fonts_dir="C:/fontsets/win11-segoe-only")
+```
+
 ## Env vars
 
 - `CLOAKBROWSER_BINARY_PATH` — use a local chrome binary instead of downloading

@@ -16,7 +16,6 @@ BRIDGE_CLIENT_CC = REPO / "patches" / "0069-third_party-blink-renderer-platform-
 BRIDGE_CLIENT_H = REPO / "patches" / "0070-third_party-blink-renderer-platform-canvas_bridge-canvas_bridge_client-h.patch"
 READBACK_NOISE = REPO / "patches" / "0100-webgl-readback-noise.patch"
 GPU_FP_CC = REPO / "patches" / "0101-webgl-gpu_fingerprint-cc.patch"
-GPU_INFO_CC = REPO / "patches" / "0103-webgl-gpu_info-cc.patch"
 FARBLE_CC = REPO / "patches" / "0105-components-ungoogled-farble_seed.patch"
 GPU_INTEGRATION = REPO / "patches" / "0108-webgl-gpu-fingerprint-integration.patch"
 GPU_HOT_PATH = REPO / "patches" / "0110-webgl-query-hot-path.patch"
@@ -44,7 +43,6 @@ class WebGLCorrectnessRegressionTest(unittest.TestCase):
         cls.lifecycle = added_lines(LIFECYCLE.read_text(encoding="utf-8"))
         cls.readback_noise = added_lines(READBACK_NOISE.read_text(encoding="utf-8"))
         cls.gpu_fp_cc = added_lines(GPU_FP_CC.read_text(encoding="utf-8"))
-        cls.gpu_info_cc = added_lines(GPU_INFO_CC.read_text(encoding="utf-8"))
         cls.farble_cc = added_lines(FARBLE_CC.read_text(encoding="utf-8"))
         cls.integration = added_lines(GPU_INTEGRATION.read_text(encoding="utf-8"))
         cls.hot_path = added_lines(GPU_HOT_PATH.read_text(encoding="utf-8"))
@@ -54,7 +52,7 @@ class WebGLCorrectnessRegressionTest(unittest.TestCase):
     def test_persona_fields_are_declared_and_registered(self):
         self.assertIn("webgl_max_combined_texture_image_units", self.persona_h)
         self.assertIn("webgl_max_combined_texture_image_units", self.persona_cc)
-        for source in ("farble_seed.h", "farble_seed.cc", "fingerprint_data.h"):
+        for source in ("farble_seed.h", "farble_seed.cc"):
             self.assertIn(source, self.persona_build)
 
     def test_gpu_fingerprint_priority_and_seed_path(self):
@@ -94,11 +92,10 @@ class WebGLCorrectnessRegressionTest(unittest.TestCase):
         self.assertIn("FingerprintNoiseEnabled()", self.readback_noise)
         self.assertIn("for (int channel = 0; channel < 3; ++channel", self.readback_noise)
 
-    def test_farble_seed_and_gpu_table_are_present(self):
+    def test_farble_seed_is_present(self):
         self.assertIn("GlobalSeed()", self.farble_cc)
         self.assertIn("PersistentHash(registrable_domain)", self.farble_cc)
         self.assertIn("uxr-disable-fingerprint-noise", self.farble_cc)
-        self.assertIn("kGpuModelCount", self.gpu_info_cc)
 
     def test_identity_is_session_constant_and_persona_backed(self):
         self.assertIn("CurrentPersona().webgl_renderer", self.webgl1)

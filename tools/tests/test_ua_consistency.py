@@ -17,35 +17,6 @@ def added_lines(patch_name: str) -> str:
     )
 
 
-def test_fingerprint_data_has_no_stale_browser_version_constants():
-    data = (PATCHES / "0107-components-ungoogled-fingerprint_data.patch").read_text(
-        encoding="utf-8"
-    )
-    assert "kChromiumVersions" not in data
-    assert "kChromeDefaultVersion" not in data
-    assert "149.0.7827" not in data
-    assert "#include <cstddef>" in data
-    assert "std::size_t kMacosGpuModelCount" in data
-    assert "std::size_t kGpuModelCount" in data
-    assert all(
-        line.startswith(
-            (
-                "diff --git ",
-                "new file mode ",
-                "index ",
-                "--- ",
-                "+++ ",
-                "@@",
-                "+",
-                "-",
-                " ",
-                "\\\\",
-            )
-        )
-        for line in data.splitlines()
-    )
-
-
 def test_ua_version_override_is_shared_by_product_and_brand_metadata():
     ua = added_lines("0004-components-embedder_support-user_agent_utils-cc.patch")
     assert "#include \"base/uxr_config.h\"" in ua

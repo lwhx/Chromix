@@ -23,7 +23,20 @@ import {
   VERSION as BROWSER_VERSION, CHANNELS, CACHE, hostFor, resolvePlatform, ensureNative,
   binaryPath, bundleComplete,
 } from "./_binary.js";
-import { fontLaunchEnv } from "./_fonts.js";
+import { fontLaunchEnv, fontDirWhitelistArg } from "./_fonts.js";
+import { ensurePersonaGeometry } from "./_persona.js";
+
+// One geometry pick per options object, shared by buildLaunchOptions and
+// buildContextOptions (launchPersistentContext calls them separately).
+const _personaGeoCache = new WeakMap();
+function personaGeometryFor(options) {
+  let entry = _personaGeoCache.get(options);
+  if (!entry) {
+    entry = ensurePersonaGeometry(options?.args);
+    _personaGeoCache.set(options, entry);
+  }
+  return entry;
+}
 
 export const VERSION = "0.1.0";
 export const CHROMIUM_VERSION = "152";
@@ -273,9 +286,18 @@ export function buildContextOptions(options = {}) {
   const { locale, timezoneId, ...ctx } = options.contextOptions || {};
   if (locale !== undefined || timezoneId !== undefined)
     console.warn("[chromix] contextOptions.locale/timezoneId ignored — use top-level locale/timezone (binary flag)");
+  // Viewport must match the persona screen: inner = screen - taskbar - Chrome
+  // UI strip, and deviceScaleFactor keeps canvas backing stores consistent
+  // with the spoofed devicePixelRatio.
+  const persona = personaGeometryFor(options).geometry;
+  const personaViewport = {
+    width: persona.width,
+    height: persona.innerHeight,
+    ...(persona.dpr !== 1 ? { deviceScaleFactor: persona.dpr } : {}),
+  };
   const viewport = options.viewport !== undefined
     ? options.viewport
-    : headless ? DEFAULT_VIEWPORT : null;
+    : headless ? personaViewport : null;
   return {
     ...ctx,
     ...(options.userAgent ? { userAgent: options.userAgent } : {}),
@@ -296,6 +318,27 @@ export async function buildLaunchOptions(options = {}) {
     const cdm = findWidevineCdm();
     if (cdm) args = [...(args || []), `--uxr-widevine-cdm=${cdm}`];
   }
+  // Custom font directory: whitelist exactly the families it contains.
+  // Injected before user args so an explicit --uxr-font-whitelist still wins.
+  if (options.fontsDir) {
+    const whitelist = fontDirWhitelistArg(options.fontsDir);
+    if (whitelist) args = [whitelist, ...(args || [])];
+    else console.warn(`[chromix] fontsDir=${options.fontsDir}: no parseable fonts found`);
+  }
+  // Coherent screen persona: one pick drives screen/avail/outer/viewport
+  // (innerWidth > screen.width is an instant tell).
+  const persona = personaGeometryFor(options);
+  args = [
+    ...persona.switches.filter(
+      (s) => !(args || []).some((u) => u.split("=", 1)[0] === s.split("=", 1)[0])),
+    ...(args || []),
+  ];
+  // Headed: size the real window to the persona so native inner* geometry
+  // agrees with the spoofed outer*/screen values. buildArgs skips
+  // --start-maximized when --window-size is present.
+  if (!headless && !args.some((a) => a.startsWith("--window-size"))) {
+    args = [`--window-size=${persona.geometry.width},${persona.geometry.availHeight}`, ...args];
+  }
   const chromeArgs = buildArgs({
     stealthArgs: options.stealthArgs ?? true,
     extraArgs: args,
@@ -304,7 +347,7 @@ export async function buildLaunchOptions(options = {}) {
     startMaximized: options.startMaximized ?? true,
   });
   const proxy = splitProxy(options.proxy);
-  const env = fontLaunchEnv(binary, options.launchOptions?.env);
+  const env = fontLaunchEnv(binary, options.launchOptions?.env, options.fontsDir);
   return {
     executablePath: binary,
     headless,

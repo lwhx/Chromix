@@ -3,9 +3,13 @@ new file mode 100644
 index 0000000000..cac1a6896b
 --- /dev/null
 +++ b/base/uxr_config.cc
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,143 @@
 +// Copyright 2026.
 +#include "base/uxr_config.h"
++
++#include <array>
++#include <cstdint>
++#include <random>
 +
 +#include "base/no_destructor.h"
 +#include "base/strings/string_number_conversions.h"
@@ -44,6 +48,102 @@ index 0000000000..cac1a6896b
 +    return false;
 +  }
 +  return StringToInt(it->second, out);
++}
++
++namespace {
++
++uint32_t SeedFromCanvasKey(const UxrConfig& cfg) {
++  uint32_t seed = 0;
++  const std::string raw = cfg.Get("uxr-canvas-seed");
++  if (raw.empty() || !base::StringToUint(raw, &seed))
++    return 0u;
++  return seed;
++}
++
++template <typename T, size_t N>
++const T& PickSeeded(const std::array<T, N>& pool, uint64_t seed,
++                    double T::*weight_field) {
++  std::mt19937_64 rng(seed);
++  std::array<double, N> weights;
++  for (size_t i = 0; i < N; ++i)
++    weights[i] = pool[i].*weight_field;
++  std::discrete_distribution<size_t> dist(weights.begin(), weights.end());
++  return pool[dist(rng)];
++}
++
++}  // namespace
++
++int UxrConfig::GetSeededHwConcurrency() const {
++  const uint32_t seed = SeedFromCanvasKey(*this);
++  if (seed == 0u)
++    return 0;
++  // Real captured distribution (camoufox fingerprint-presets, n=75 Windows
++  // desktops): 8:31% 4:23% 12:16% 16:13% 20:7% 6:4% 24:3% 2:3% 14:1%.
++  struct E { int cores; double w; };
++  static constexpr std::array<E, 9> kPool = {{
++      {8, 0.30}, {4, 0.22}, {12, 0.16}, {16, 0.13}, {20, 0.07},
++      {6, 0.05}, {24, 0.03}, {2, 0.02}, {14, 0.02}}};
++  return PickSeeded(kPool, seed ^ 0x6877636f6e63ULL, &E::w).cores;
++}
++
++float UxrConfig::GetSeededDeviceMemory() const {
++  const uint32_t seed = SeedFromCanvasKey(*this);
++  if (seed == 0u)
++    return 0.0f;
++  // deviceMemory buckets cap at 8: every 16GB/32GB machine reports 8.
++  struct E { float gb; double w; };
++  static constexpr std::array<E, 2> kPool = {{{8.0f, 0.75}, {4.0f, 0.25}}};
++  return PickSeeded(kPool, seed ^ 0x6465766d656dULL, &E::w).gb;
++}
++
++bool UxrConfig::GetSeededScreen(int* w, int* h, float* dpr) const {
++  const uint32_t seed = SeedFromCanvasKey(*this);
++  if (seed == 0u)
++    return false;
++  // Joint (logical size, dpr) pick: screen.width * devicePixelRatio must land
++  // on a real panel. 1536x864@1.25 = 1080p at 125% scaling; 2560x1440@1.5 =
++  // 4K at 150% — the two most common scaled Windows setups.
++  struct E { int w; int h; float dpr; double wgt; };
++  static constexpr std::array<E, 11> kPool = {{
++      {1920, 1080, 1.0f, 0.42},
++      {1366, 768, 1.0f, 0.14},
++      {2560, 1440, 1.0f, 0.12},
++      {1536, 864, 1.25f, 0.11},
++      {1440, 900, 1.0f, 0.05},
++      {1680, 1050, 1.0f, 0.05},
++      {1280, 720, 1.0f, 0.03},
++      {1600, 900, 1.0f, 0.03},
++      {1920, 1200, 1.0f, 0.02},
++      {2560, 1440, 1.5f, 0.02},
++      {1280, 800, 1.0f, 0.01},
++  }};
++  const E& e = PickSeeded(kPool, seed ^ 0x73637265656eULL, &E::wgt);
++  if (w) *w = e.w;
++  if (h) *h = e.h;
++  if (dpr) *dpr = e.dpr;
++  return true;
++}
++
++int UxrConfig::GetSeededTaskbarHeight() const {
++  const uint32_t seed = SeedFromCanvasKey(*this);
++  if (seed == 0u)
++    return 0;
++  // Win11 taskbar is 48 logical px, Win10 is 40px; Steam 2026 OS split is
++  // ~68/26, captured availHeight deltas confirm (height-48 vs height-40).
++  struct E { int px; double w; };
++  static constexpr std::array<E, 2> kPool = {{{48, 0.70}, {40, 0.30}}};
++  return PickSeeded(kPool, seed ^ 0x7461736b626172ULL, &E::w).px;
++}
++
++int UxrConfig::GetSeededNetRttMs() const {
++  const uint32_t seed = SeedFromCanvasKey(*this);
++  if (seed == 0u)
++    return 0;
++  // Desktop wired/Wi-Fi RTT distribution after Chrome's 50ms bucketing.
++  struct E { int ms; double w; };
++  static constexpr std::array<E, 3> kPool = {{
++      {50, 0.55}, {100, 0.30}, {150, 0.15}}};
++  return PickSeeded(kPool, seed ^ 0x6e6574727474ULL, &E::w).ms;
 +}
 +
 +}  // namespace base

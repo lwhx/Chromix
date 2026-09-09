@@ -2,7 +2,7 @@ diff --git a/third_party/blink/renderer/core/frame/navigator_concurrent_hardware
 index f5c0db2d1b..782fd4d61a 100644
 --- a/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
 +++ b/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
-@@ -6,9 +6,22 @@
+@@ -6,9 +6,31 @@
  
  #include "base/system/sys_info.h"
  
@@ -21,6 +21,15 @@ index f5c0db2d1b..782fd4d61a 100644
 +            base::UxrConfig::GetInstance().Get("uxr-hw-concurrency"), &v) &&
 +        v > 0)
 +      return static_cast<unsigned>(v > 128 ? 128 : v);
++  }
++  // UXR: seed-pooled desktop core count (4/6/8/12/16, weighted like the real
++  // 2026 base). Without it a 64-core server hosting a "desktop Chrome"
++  // persona is an instant tell. 0 = no seed -> host value.
++  {
++    const int ph_pool =
++        base::UxrConfig::GetInstance().GetSeededHwConcurrency();
++    if (ph_pool > 0)
++      return static_cast<unsigned>(ph_pool);
 +  }
    return static_cast<unsigned>(base::SysInfo::NumberOfProcessors());
  }

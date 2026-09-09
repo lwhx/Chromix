@@ -174,3 +174,51 @@ def test_humanizer_zero_sleep_fast_path():
     t0 = time.monotonic()
     h.type("abc").click(10, 10)
     assert time.monotonic() - t0 < 1.0
+
+
+def test_persona_geometry_is_complete_coherent_and_idempotent():
+    from chromix._persona import SCREEN_POOL, ensure_persona_geometry
+    import random
+    args, g = ensure_persona_geometry(None, random.Random(42))
+    keys = {a.split("=", 1)[0] for a in args}
+    for k in ("--uxr-screen-width", "--uxr-screen-height",
+              "--uxr-device-pixel-ratio", "--uxr-taskbar-height",
+              "--uxr-outer-width", "--uxr-outer-height"):
+        assert k in keys, k
+    assert g["avail_height"] == g["height"] - g["taskbar"]
+    assert g["inner_height"] == g["avail_height"] - 85
+    assert g["inner_height"] >= 580
+    assert (g["width"], g["dpr"]) in [(s[0], s[2]) for s in SCREEN_POOL]
+    # idempotent — re-ensuring adds nothing
+    args2, g2 = ensure_persona_geometry(args, random.Random(1))
+    assert args2 == args and g2 == g
+
+
+def test_persona_geometry_respects_explicit_user_values():
+    from chromix._persona import ensure_persona_geometry
+    import random
+    args, g = ensure_persona_geometry(
+        ["--uxr-screen-width=1366", "--uxr-screen-height=768"], random.Random(7))
+    assert g["width"] == 1366 and g["height"] == 768
+    assert not any(a.startswith("--uxr-screen-width=") and a != "--uxr-screen-width=1366"
+                   for a in args)
+    # missing pieces completed from one pick
+    assert g["dpr"] in (1.0, 1.25, 1.5) and g["taskbar"] in (40, 48)
+
+
+def test_split_context_kwargs_viewport_matches_persona_geometry():
+    geometry = {"width": 1536, "height": 864, "dpr": 1.25, "taskbar": 48,
+                "avail_height": 816, "inner_height": 731}
+    ctx = api._split_context_kwargs(api._VIEWPORT_UNSET, None, None, None, {},
+                                    geometry=geometry)
+    assert ctx["viewport"] == {"width": 1536, "height": 731}
+    assert ctx["device_scale_factor"] == 1.25
+    # dpr=1.0 omits device_scale_factor (native default)
+    geometry["dpr"] = 1.0
+    ctx = api._split_context_kwargs(api._VIEWPORT_UNSET, None, None, None, {},
+                                    geometry=geometry)
+    assert "device_scale_factor" not in ctx
+    # explicit viewport still wins
+    ctx = api._split_context_kwargs({"width": 800, "height": 600}, None, None,
+                                    None, {}, geometry=geometry)
+    assert ctx["viewport"] == {"width": 800, "height": 600}

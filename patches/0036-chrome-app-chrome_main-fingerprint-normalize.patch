@@ -2,15 +2,18 @@ diff --git a/chrome/app/chrome_main.cc b/chrome/app/chrome_main.cc
 index b5cc00e4c8..3cc7963afa 100644
 --- a/chrome/app/chrome_main.cc
 +++ b/chrome/app/chrome_main.cc
-@@ -7,6 +7,7 @@
+@@ -7,6 +7,10 @@
  #include <stdint.h>
  
  #include <iostream>
 +#include <vector>
++#include "base/rand_util.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"  // UXR: EqualsCaseInsensitiveASCII
  #include <memory>
  #include <optional>
  
-@@ -161,6 +162,121 @@ int ChromeMain(int argc, const char** argv) {
+@@ -161,6 +163,155 @@ int ChromeMain(int argc, const char** argv) {
  
    base::CommandLine* command_line(base::CommandLine::ForCurrentProcess());
  
@@ -19,6 +22,19 @@ index b5cc00e4c8..3cc7963afa 100644
 +  // Only the browser process (no --process-type) performs normalization;
 +  // child processes inherit the already-converted switches.
 +  if (!command_line->HasSwitch(switches::kProcessType)) {
++    // Generate one launch-stable seed before renderer processes are spawned.
++    const bool persona_enabled =
++        command_line->HasSwitch("fingerprint") &&
++        command_line->GetSwitchValueASCII("fingerprint") != "off";
++    if (persona_enabled && !command_line->HasSwitch("uxr-canvas-seed") &&
++        !(command_line->HasSwitch("fingerprint-noise") &&
++          command_line->GetSwitchValueASCII("fingerprint-noise") == "false")) {
++      uint64_t seed = base::RandUint64();
++      if (seed == 0)
++        seed = 1;
++      command_line->AppendSwitchASCII("uxr-canvas-seed",
++                                      base::NumberToString(seed));
++    }
 +    struct Alias { const char* fp; const char* uxr; };
 +    static constexpr Alias kAliases[] = {
 +      {"fingerprint-gpu-vendor",          "uxr-webgl-vendor"},
@@ -65,18 +81,39 @@ index b5cc00e4c8..3cc7963afa 100644
 +    if (command_line->HasSwitch("fingerprint-platform")) {
 +      const std::string p =
 +          command_line->GetSwitchValueASCII("fingerprint-platform");
-+      command_line->AppendSwitchASCII("uxr-platform", p);
-+      if (p == "Win32") {
-+        command_line->AppendSwitchASCII("uxr-ua-platform", "Windows");
-+        command_line->AppendSwitchASCII("uxr-ua-os",
-+            "Windows NT 10.0; Win64; x64");
-+      } else if (p == "MacIntel") {
-+        command_line->AppendSwitchASCII("uxr-ua-platform", "macOS");
-+        command_line->AppendSwitchASCII("uxr-ua-os",
-+            "Macintosh; Intel Mac OS X 10_15_7");
-+      } else if (p == "Linux x86_64") {
-+        command_line->AppendSwitchASCII("uxr-ua-platform", "Linux");
-+        command_line->AppendSwitchASCII("uxr-ua-os", "Linux x86_64");
++      // UXR: accept both SDK tokens ("windows"/"macos"/"linux", any case) and
++      // raw navigator.platform tokens; always emit real-Chrome spellings so
++      // navigator.platform, Sec-CH-UA-Platform and the UA string stay coherent
++      // (P0: the SDKs passed "windows" verbatim; navigator.platform reported
++      // "windows" instead of "Win32" and ua-platform/ua-os were never set).
++      if (base::EqualsCaseInsensitiveASCII(p, "windows") ||
++          base::EqualsCaseInsensitiveASCII(p, "win32")) {
++        if (!command_line->HasSwitch("uxr-platform"))
++          command_line->AppendSwitchASCII("uxr-platform", "Win32");
++        if (!command_line->HasSwitch("uxr-ua-platform"))
++          command_line->AppendSwitchASCII("uxr-ua-platform", "Windows");
++        if (!command_line->HasSwitch("uxr-ua-os"))
++          command_line->AppendSwitchASCII("uxr-ua-os",
++              "Windows NT 10.0; Win64; x64");
++      } else if (base::EqualsCaseInsensitiveASCII(p, "macos") ||
++                 base::EqualsCaseInsensitiveASCII(p, "macintel")) {
++        if (!command_line->HasSwitch("uxr-platform"))
++          command_line->AppendSwitchASCII("uxr-platform", "MacIntel");
++        if (!command_line->HasSwitch("uxr-ua-platform"))
++          command_line->AppendSwitchASCII("uxr-ua-platform", "macOS");
++        if (!command_line->HasSwitch("uxr-ua-os"))
++          command_line->AppendSwitchASCII("uxr-ua-os",
++              "Macintosh; Intel Mac OS X 10_15_7");
++      } else if (base::EqualsCaseInsensitiveASCII(p, "linux") ||
++                 base::EqualsCaseInsensitiveASCII(p, "linux x86_64")) {
++        if (!command_line->HasSwitch("uxr-platform"))
++          command_line->AppendSwitchASCII("uxr-platform", "Linux x86_64");
++        if (!command_line->HasSwitch("uxr-ua-platform"))
++          command_line->AppendSwitchASCII("uxr-ua-platform", "Linux");
++        if (!command_line->HasSwitch("uxr-ua-os"))
++          command_line->AppendSwitchASCII("uxr-ua-os", "Linux x86_64");
++      } else if (!p.empty() && !command_line->HasSwitch("uxr-platform")) {
++        command_line->AppendSwitchASCII("uxr-platform", p);
 +      }
 +    }
 +

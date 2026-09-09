@@ -2,7 +2,7 @@ diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_c
 index fd13b97510..f740bf11b8 100644
 --- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
 +++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
-@@ -2,8 +2,17 @@
+@@ -2,8 +2,18 @@
  // Use of this source code is governed by a BSD-style license that can be
  // found in the LICENSE file.
  
@@ -13,6 +13,7 @@ index fd13b97510..f740bf11b8 100644
  #include "third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.h"
  
 +#include <cstdlib>  // UXR
++#include <cstring>  // UXR: memcpy for half-float bits
 +#include "base/command_line.h"  // UXR
 +#include "base/strings/string_number_conversions.h"  // UXR
 +#include "base/uxr_config.h"
@@ -20,7 +21,7 @@ index fd13b97510..f740bf11b8 100644
  #include <cmath>
  #include <cstdint>
  #include <cstdlib>
-@@ -513,6 +522,46 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
+@@ -513,6 +523,110 @@ ImageData* BaseRenderingContext2D::getImageDataInternal(
      }
    }
  
@@ -30,7 +31,38 @@ index fd13b97510..f740bf11b8 100644
 +    uint32_t ph_seed = 0u;
 +    // UXR canvas noise (audit P0-G/I/J + P2-C): unified StringToUint parse,
 +    // FAIL-CLOSED on invalid/zero (no golden-constant fingerprint), value-dependent
-+    // + per-channel (defeats the 2025 flat-field pixel-recovery), 8-bit-only.
++    // + per-channel (defeats the 2025 flat-field pixel-recovery). Applied
++    // SPARSELY (3/8 of channels, the same hash picks which) to mimic real
++    // rasterization variance instead of a uniform per-pixel dither signature.
++    // The float16 readback path (getImageData({pixelFormat:'float16'})) gets
++    // the same treatment in the float domain — otherwise a single float16
++    // read exposes both the noise-free pixels and the fact that 8-bit reads
++    // were dithered (cross-format noise detector).
++    auto ph_half_to_float = [](uint16_t h) -> float {
++      const uint32_t e = (h >> 10) & 0x1Fu;
++      const uint32_t m = h & 0x3FFu;
++      float val;
++      if (e == 0)
++        val = std::ldexp(static_cast<float>(m), -24);
++      else if (e == 31)
++        val = m ? NAN : INFINITY;
++      else
++        val = std::ldexp(static_cast<float>(m | 0x400u),
++                         static_cast<int>(e) - 25);
++      return (h & 0x8000u) ? -val : val;
++    };
++    auto ph_float_to_half = [](float f) -> uint16_t {
++      uint32_t x;
++      std::memcpy(&x, &f, sizeof(x));
++      const uint32_t sign = (x >> 16) & 0x8000u;
++      const int e = static_cast<int>((x >> 23) & 0xFFu) - 127 + 15;
++      if (e <= 0)
++        return static_cast<uint16_t>(sign);
++      if (e >= 31)
++        return static_cast<uint16_t>(sign | 0x7BFFu);
++      return static_cast<uint16_t>(sign | (static_cast<uint32_t>(e) << 10) |
++                                   ((x & 0x7FFFFFu) >> 13));
++    };
 +    if (base::StringToUint(
 +            base::UxrConfig::GetInstance().Get("uxr-canvas-seed"), &ph_seed) &&
 +        ph_seed != 0u) {
@@ -54,9 +86,42 @@ index fd13b97510..f740bf11b8 100644
 +                           (v * 2654435761u);
 +              z ^= z >> 16; z *= 0x85ebca6bu; z ^= z >> 13; z *= 0xc2b2ae35u;
 +              z ^= z >> 16;
++              if (((z >> 1) & 7u) >= 3u)
++                continue;  // sparse: this channel keeps the true value
 +              const int nv = static_cast<int>(v) + ((z & 1u) ? 1 : -1);
 +              ph_row[ph_x * 4 + ch] =
 +                  static_cast<uint8_t>(nv < 0 ? 0 : (nv > 255 ? 255 : nv));
++            }
++          }
++        }
++      } else if (ph_px && ph_ct == kRGBA_F16_SkColorType) {
++        // Float16 ImageData: quantize to the 8-bit domain for the noise
++        // DECISION (same z as an 8-bit read of the same pixel), apply the
++        // +-1/255 step in the float domain.
++        const int ph_w = ph_pm.width();
++        const int ph_h = ph_pm.height();
++        const size_t ph_rb = ph_pm.rowBytes();
++        for (int ph_y = 0; ph_y < ph_h; ++ph_y) {
++          uint16_t* ph_row =
++              reinterpret_cast<uint16_t*>(ph_px + ph_y * ph_rb);
++          for (int ph_x = 0; ph_x < ph_w; ++ph_x) {
++            const uint32_t ax = static_cast<uint32_t>(sx + ph_x);
++            const uint32_t ay = static_cast<uint32_t>(sy + ph_y);
++            for (int ch = 0; ch < 3; ++ch) {
++              uint16_t* ph_hp = ph_row + ph_x * 4 + ch;
++              const float ph_fv = ph_half_to_float(*ph_hp);
++              const float ph_q = ph_fv * 255.0f + 0.5f;
++              const uint32_t v = static_cast<uint32_t>(
++                  ph_q < 0.0f ? 0.0f : (ph_q > 255.0f ? 255.0f : ph_q));
++              uint32_t z = ph_seed ^ (ax * 374761393u) ^ (ay * 668265263u) ^
++                           (static_cast<uint32_t>(ch) * 0x9e3779b9u) ^
++                           (v * 2654435761u);
++              z ^= z >> 16; z *= 0x85ebca6bu; z ^= z >> 13; z *= 0xc2b2ae35u;
++              z ^= z >> 16;
++              if (((z >> 1) & 7u) >= 3u)
++                continue;
++              *ph_hp = ph_float_to_half(
++                  ph_fv + (((z & 1u) ? 1.0f : -1.0f) / 255.0f));
 +            }
 +          }
 +        }

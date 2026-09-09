@@ -2,7 +2,7 @@ diff --git a/components/ungoogled/persona_profile.cc b/components/ungoogled/pers
 new file mode 100644
 --- /dev/null
 +++ b/components/ungoogled/persona_profile.cc
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,359 @@
 +// Copyright 2026.
 +#include "components/ungoogled/persona_profile.h"
 +
@@ -21,24 +21,185 @@ new file mode 100644
 +struct WebGLGPU {
 +  const char* vendor;
 +  const char* renderer;
++  int max_texture_size;
++  int max_cube_map_texture_size;
++  int max_renderbuffer_size;
 +  double weight;
 +};
 +
-+// Clearcote's desktop GPU pool, selected once from the launch fingerprint.
-+// The selected identity is shared by WebGL 1, WebGL 2, and WebGPU.
-+constexpr std::array<WebGLGPU, 3> kWebGLGPUs = {{
++// Desktop D3D11 GPU pool (Windows persona), selected once per launch from the
++// fingerprint seed. Renderer strings and device IDs are verbatim field samples
++// (iovation fp library, deviceandbrowserinfo, checkproxy GPU db); weights
++// follow the Steam Hardware Survey May-Jul 2026 blended with JPR total-PC
++// share (Steam over-samples discrete GPUs; real Chrome users are ~42% Intel
++// iGPU). RTX 50-series (Blackwell, 2025) included — its combined Steam share
++// passed 13% by mid-2026, so its absence would date the persona.
++//
++// Texture caps are UNIFORM across the pool on purpose: ANGLE's D3D11 backend
++// reports the feature-level limit (16384) for every GPU — field-measured
++// MAX_TEXTURE_SIZE on a real RTX 4060 Chrome is 16384, not 32768. The struct
++// keeps the triple so per-GPU overrides stay possible, but the values must
++// all stay 16384 or detector databases flag the mismatch.
++constexpr std::array<WebGLGPU, 39> kWebGLGPUs = {{
++    // ---- Intel (~42%; iGPU-heavy real-user base) ----
++    {"Google Inc. (Intel)",
++     "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics (0x00009A49) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.100},
 +    {"Google Inc. (Intel)",
 +     "ANGLE (Intel, Intel(R) UHD Graphics 770 (0x0000A780) Direct3D11 "
 +     "vs_5_0 ps_5_0, D3D11)",
-+     0.50},
++     16384, 16384, 16384, 0.080},
++    {"Google Inc. (Intel)",
++     "ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E9B) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.070},
++    {"Google Inc. (Intel)",
++     "ANGLE (Intel, Intel(R) UHD Graphics (0x0000A78B) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.040},
++    {"Google Inc. (Intel)",
++     "ANGLE (Intel, Intel(R) UHD Graphics (0x00009BC4) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.030},
++    {"Google Inc. (Intel)",
++     "ANGLE (Intel, Intel(R) UHD Graphics 770 (0x00004680) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.030},
++    {"Google Inc. (Intel)",
++     "ANGLE (Intel, Intel(R) UHD Graphics 730 (0x00004C8B) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.030},
++    {"Google Inc. (Intel)",
++     "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics (0x000046A8) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.020},
++    {"Google Inc. (Intel)",
++     "ANGLE (Intel, Intel(R) UHD Graphics 620 (0x00005917) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.020},
++    // ---- NVIDIA (~45%) ----
 +    {"Google Inc. (NVIDIA)",
-+     "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, "
-+     "D3D11)",
-+     0.35},
++     "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 (0x00002504) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.045},
++    {"Google Inc. (NVIDIA)",
++     "ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 (0x00002882) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.042},
++    {"Google Inc. (NVIDIA)",
++     "ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 Laptop GPU (0x000028E0) "
++     "Direct3D11 vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.042},
++    {"Google Inc. (NVIDIA)",
++     "ANGLE (NVIDIA, NVIDIA GeForce RTX 3050 (0x00002507) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.033},
++    {"Google Inc. (NVIDIA)",
++     "ANGLE (NVIDIA, NVIDIA GeForce RTX 5070 (0x00002F04) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.028},
++    {"Google Inc. (NVIDIA)",
++     "ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 (0x00001F0A) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.028},
++    {"Google Inc. (NVIDIA)",
++     "ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 Ti (0x00002803) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.024},
++    {"Google Inc. (NVIDIA)",
++     "ANGLE (NVIDIA, NVIDIA GeForce RTX 5060 (0x00002D05) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.022},
++    {"Google Inc. (NVIDIA)",
++     "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Ti (0x00002489) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.022},
++    {"Google Inc. (NVIDIA)",
++     "ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 (0x00002484) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.019},
++    {"Google Inc. (NVIDIA)",
++     "ANGLE (NVIDIA, NVIDIA GeForce RTX 5060 Ti (0x00002D04) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.017},
++    {"Google Inc. (NVIDIA)",
++     "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Laptop GPU (0x00002520) "
++     "Direct3D11 vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.017},
++    {"Google Inc. (NVIDIA)",
++     "ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 (0x00002786) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.016},
++    {"Google Inc. (NVIDIA)",
++     "ANGLE (NVIDIA, NVIDIA GeForce RTX 2060 (0x00001F08) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.016},
++    {"Google Inc. (NVIDIA)",
++     "ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER (0x000021C4) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.014},
++    {"Google Inc. (NVIDIA)",
++     "ANGLE (NVIDIA, NVIDIA GeForce RTX 4050 Laptop GPU (0x000028A1) "
++     "Direct3D11 vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.013},
++    {"Google Inc. (NVIDIA)",
++     "ANGLE (NVIDIA, NVIDIA GeForce GTX 1060 6GB (0x00001B83) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.012},
++    {"Google Inc. (NVIDIA)",
++     "ANGLE (NVIDIA, NVIDIA GeForce RTX 3080 (0x00002206) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.010},
++    {"Google Inc. (NVIDIA)",
++     "ANGLE (NVIDIA, NVIDIA GeForce GTX 1050 Ti (0x00001C82) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.010},
++    {"Google Inc. (NVIDIA)",
++     "ANGLE (NVIDIA, NVIDIA GeForce RTX 5070 Ti (0x00002C05) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.009},
++    {"Google Inc. (NVIDIA)",
++     "ANGLE (NVIDIA, NVIDIA GeForce RTX 5080 (0x00002C02) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.007},
++    {"Google Inc. (NVIDIA)",
++     "ANGLE (NVIDIA, NVIDIA GeForce RTX 4090 (0x00002684) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.005},
++    // ---- AMD (~13%) ----
 +    {"Google Inc. (AMD)",
-+     "ANGLE (AMD, AMD Radeon(TM) Graphics (0x000015D8) Direct3D11 vs_5_0 "
-+     "ps_5_0, D3D11)",
-+     0.15},
++     "ANGLE (AMD, AMD Radeon(TM) Graphics (0x000015D8) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.030},
++    {"Google Inc. (AMD)",
++     "ANGLE (AMD, AMD Radeon(TM) Graphics (0x00001636) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.022},
++    {"Google Inc. (AMD)",
++     "ANGLE (AMD, AMD Radeon 780M Graphics (0x00001900) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.020},
++    {"Google Inc. (AMD)",
++     "ANGLE (AMD, AMD Radeon(TM) Graphics (0x00001681) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.018},
++    {"Google Inc. (AMD)",
++     "ANGLE (AMD, AMD Radeon RX 6600 (0x000073FF) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.014},
++    {"Google Inc. (AMD)",
++     "ANGLE (AMD, AMD Radeon (TM) RX 580 (0x000067DF) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.011},
++    {"Google Inc. (AMD)",
++     "ANGLE (AMD, AMD Radeon RX 9070 XT (0x00007550) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.009},
++    {"Google Inc. (AMD)",
++     "ANGLE (AMD, AMD Radeon RX 6750 XT (0x000073DF) Direct3D11 "
++     "vs_5_0 ps_5_0, D3D11)",
++     16384, 16384, 16384, 0.005},
 +}};
 +
 +uint64_t SeedFromConfig(const base::UxrConfig& config) {
@@ -55,9 +216,11 @@ new file mode 100644
 +    return kWebGLGPUs[0];
 +
 +  std::mt19937_64 rng(seed);
-+  const std::array<double, 3> weights = {0.50, 0.35, 0.15};
++  std::array<double, kWebGLGPUs.size()> weights;
++  for (size_t i = 0; i < kWebGLGPUs.size(); ++i)
++    weights[i] = kWebGLGPUs[i].weight;
 +  std::discrete_distribution<size_t> distribution(weights.begin(),
-+                                                   weights.end());
++                                                  weights.end());
 +  return kWebGLGPUs[distribution(rng)];
 +}
 +
@@ -66,8 +229,13 @@ new file mode 100644
 +  if (profile->webgl_real || profile->webgl_identity_explicit)
 +    return;
 +  const WebGLGPU& gpu = SelectSeededWebGLGPU(config);
++  // The renderer string and its real capability triple are written as a unit;
++  // explicit --uxr-webgl-max-* switches applied afterwards still win.
 +  profile->webgl_vendor = gpu.vendor;
 +  profile->webgl_renderer = gpu.renderer;
++  profile->webgl_max_texture_size = gpu.max_texture_size;
++  profile->webgl_max_cube_map_texture_size = gpu.max_cube_map_texture_size;
++  profile->webgl_max_renderbuffer_size = gpu.max_renderbuffer_size;
 +}
 +
 +void OverrideInt(const base::UxrConfig& config, const char* key, int* value) {
