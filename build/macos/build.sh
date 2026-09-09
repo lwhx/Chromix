@@ -4,6 +4,11 @@ set -euo pipefail
 unset -- "${!DYLD_@}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$REPO/build/posix/upstream-cache.sh"
+BUILD_PROFILE="${CHROMIX_BUILD_PROFILE:-release}"
+case "$BUILD_PROFILE" in
+  fast|release) ;;
+  *) echo "CHROMIX_BUILD_PROFILE must be fast or release" >&2; exit 2 ;;
+esac
 WORK="${1:-$REPO/.chromix-build-mac}"
 HOST_ARCH="$(uname -m)"
 [ "$HOST_ARCH" = x86_64 ] && HOST_ARCH=x64
@@ -59,7 +64,8 @@ GN_INPUTS=("$WORK/tooling/ungoogled-chromium/flags.gn"
 if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
   GN_INPUTS=("$OUT/args.gn" "${GN_INPUTS[@]}")
 fi
-python3 "$REPO/tools/merge_gn_args.py" "$OUT/args.gn" "${GN_INPUTS[@]}"
+printf '==> Build profile: %s\n' "$BUILD_PROFILE"
+python3 "$REPO/tools/merge_gn_args.py" --build-profile "$BUILD_PROFILE" "$OUT/args.gn" "${GN_INPUTS[@]}"
 python3 "$REPO/tools/bootstrap_gn.py" --src "$SRC" --out "$OUT"
 "$OUT/gn" gen "$OUT" --fail-on-unused-args
 chromix_report_upstream_plan chrome

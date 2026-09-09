@@ -53,6 +53,7 @@ case "$PARTS_DIR" in
     ;;
 esac
 # Disable tar recursion so only the pruned, NUL-delimited entries are archived.
+# POSIX pax preserves nanosecond mtimes with both GNU and BSD tar.
 # Repeat directory metadata last, children before parents, for BSD re-restores.
 # Keep the initial traversal order for GNU tar's deferred symlink restoration.
 (
@@ -60,7 +61,7 @@ esac
   find . \( "${find_excludes[@]}" \) -prune -o -print0
   find . \( "${find_excludes[@]}" \) -prune -o -type d -print0 |
     TMPDIR="$stage_dir" LC_ALL=C sort -zr
-) | tar -cpf - --no-recursion --null -C "$ROOT" -T - |
+) | tar --format=pax -cpf - --no-recursion --null -C "$ROOT" -T - |
   zstd -f -T0 -3 -o "$archive"
 
 total="$(stat -c %s "$archive" 2>/dev/null || stat -f %z "$archive")"

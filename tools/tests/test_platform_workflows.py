@@ -38,7 +38,15 @@ class PlatformWorkflowTest(unittest.TestCase):
                 self.assertEqual(workflow['name'], name)
                 self.assertEqual(set(events(workflow)), {'push', 'workflow_dispatch'})
                 self.assertEqual(events(workflow)['push']['branches'], ['main'])
-                self.assertTrue(events(workflow)['workflow_dispatch']['inputs']['use_upstream_cache']['default'])
+                dispatch = events(workflow)['workflow_dispatch']['inputs']
+                self.assertTrue(dispatch['use_upstream_cache']['default'])
+                for key, choices, default in (
+                    ('build_profile', ['fast', 'release'], 'fast'),
+                    ('build_mode', ['staged', 'single'], 'staged'),
+                ):
+                    self.assertEqual(dispatch[key]['type'], 'choice')
+                    self.assertEqual(dispatch[key]['options'], choices)
+                    self.assertEqual(dispatch[key]['default'], default)
                 self.assertFalse(workflow['concurrency']['cancel-in-progress'])
                 groups.add(workflow['concurrency']['group'])
                 self.assertEqual(set(workflow['jobs']), {'build'})
@@ -50,7 +58,8 @@ class PlatformWorkflowTest(unittest.TestCase):
                 inputs = job['with']
                 self.assertEqual((inputs['platform'], inputs['arch'], inputs['artifact']),
                                  (platform, arch, artifact))
-                self.assertEqual(inputs['max-stages'], 8)
+                self.assertEqual(inputs['max-stages'], "${{ inputs.build_mode == 'single' && 1 || 8 }}")
+                self.assertEqual(inputs['build_profile'], "${{ inputs.build_profile || 'fast' }}")
                 self.assertIn("github.event_name != 'workflow_dispatch' || inputs.use_upstream_cache",
                               inputs['use_upstream_cache'])
                 if runner:

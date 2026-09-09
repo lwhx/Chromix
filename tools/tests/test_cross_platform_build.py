@@ -68,6 +68,43 @@ class CrossPlatformBuildRegressionTest(unittest.TestCase):
         self.assertIn("8-stage snapshot/resume", source)
         self.assertIn(".github/workflows/build-posix-github.yml", source)
 
+    def test_posix_generator_is_deterministic(self):
+        import subprocess
+        import sys
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="chromix workflow ") as temp:
+            output = Path(temp) / ".github/workflows/build-posix-github.yml"
+            output.parent.mkdir(parents=True)
+            for _ in range(2):
+                subprocess.run([sys.executable, str(REPO / "tools/gen_posix_workflow.py")],
+                               cwd=temp, check=True, capture_output=True)
+                self.assertEqual(output.read_bytes(), (WORKFLOWS / output.name).read_bytes())
+
+    def test_posix_stages_pin_host_node_and_go(self):
+        import yaml
+
+        source = (WORKFLOWS / "build-posix-github.yml").read_text()
+        workflow = yaml.safe_load(source)
+        self.assertNotIn("go.dev/VERSION", source)
+        self.assertNotIn("/usr/local/go/bin", source)
+        for index in range(1, 9):
+            with self.subTest(stage=index):
+                steps = workflow["jobs"][f"posix-{index}"]["steps"]
+                node = next(step for step in steps if step.get("uses") == "actions/setup-node@v4")
+                go = next(step for step in steps if step.get("uses") == "actions/setup-go@v5")
+                verify = next(step for step in steps if step.get("name") == "Verify Go version")
+                stage = next(step for step in steps if step.get("id") == "stage")
+                self.assertEqual(node["with"]["node-version"], "24.20.0")
+                self.assertEqual(go["with"], {"go-version": "1.27.1", "cache": False})
+                self.assertNotIn("if", go)
+                self.assertLess(steps.index(go), steps.index(verify))
+                self.assertLess(steps.index(verify), steps.index(stage))
+                self.assertIn("go version", verify["run"])
+                self.assertIn('test "$(go env GOVERSION)" = go1.27.1', verify["run"])
+                mac_tools = next(step for step in steps if step.get("name") == "Install macOS build tools")
+                self.assertEqual(mac_tools["run"], "brew install ninja coreutils gpatch zstd")
+
     def test_linux_arm64_cross_build_requires_same_run_native_verification(self):
         import yaml
 

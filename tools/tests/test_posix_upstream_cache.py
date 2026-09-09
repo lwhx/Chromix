@@ -55,7 +55,7 @@ class PosixUpstreamCacheTest(unittest.TestCase):
 
     def run_restored_builder(self, platform, arch, *, fail_tools=False, host_arch=None,
                              restored=True, system=None, missing_gn=False, incompatible_gn=False,
-                             incomplete_tools=False):
+                             incomplete_tools=False, build_profile=None):
         with tempfile.TemporaryDirectory(prefix="restored build ") as directory:
             root = Path(directory)
             repo, work, binaries = root / "repo", root / "work", root / "bin"
@@ -158,6 +158,9 @@ path.chmod(0o755)
                    "CHROMIX_SKIP_DEPS": "1", "CHROMIX_JOBS": "2", "CALL_LOG": str(log),
                    "SELECTED_NINJA": str(selected_ninja), "TARGET_ARCH": arch}
             env.pop("CHROMIX_UPSTREAM_CACHE_DIR", None)
+            env.pop("CHROMIX_BUILD_PROFILE", None)
+            if build_profile is not None:
+                env["CHROMIX_BUILD_PROFILE"] = build_profile
             rejected = platform == "linux" and (
                 system != "Linux" or (host_arch, arch) not in (("x64", "x64"), ("arm64", "arm64"), ("x64", "arm64"))
                 or (host_arch != arch and not restored))
@@ -203,6 +206,9 @@ path.chmod(0o755)
                 self.assertIn(f'target_cpu = "{arch}"', args)
                 self.assertIn(f'v8_target_cpu = "{arch}"', args)
                 self.assertNotIn("symbol_level = 2", args)
+                self.assertIn("thin_lto_enable_optimizations = " +
+                              ("false" if build_profile == "fast" else "true"), args)
+                self.assertIn("Build profile: " + (build_profile or "release"), result.stdout)
             for name in (".ninja_deps", ".ninja_log", "build.ninja", "retained.o"):
                 self.assertEqual((out / name).read_text(), name)
             self.assertFalse((src / "out/Chromix").exists())
@@ -212,6 +218,12 @@ path.chmod(0o755)
             for arch in ("x64", "arm64"):
                 with self.subTest(platform=platform, arch=arch):
                     self.run_restored_builder(platform, arch)
+
+    def test_fast_profile_reaches_gn_on_both_builds_and_resumes(self):
+        for platform, arch, host in (("linux", "x64", "x64"), ("linux", "arm64", "x64"),
+                                     ("macos", "x64", "x64"), ("macos", "arm64", "arm64")):
+            with self.subTest(platform=platform, arch=arch):
+                self.run_restored_builder(platform, arch, host_arch=host, build_profile="fast")
 
     def test_restored_linux_x64_to_arm64_preserves_host_gn_and_defers_runtime(self):
         self.run_restored_builder("linux", "arm64", host_arch="x64")

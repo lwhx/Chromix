@@ -95,7 +95,11 @@ class PrepareRestoredBuildTest(unittest.TestCase):
         stack.enter_context(mock.patch.object(prepare, "host_identity", return_value=(platform, arch)))
         stack.enter_context(mock.patch.object(prepare.subprocess, "run", return_value=mock.Mock(
             returncode=0, stdout="thirdparty LLVM 23 / rustc nightly")))
-        stack.enter_context(mock.patch.object(prepare, "environment_identity", return_value={"ImageOS": "macos15", "ImageVersion": "1", "SDK": "/sdk/26"}))
+        stack.enter_context(mock.patch.object(prepare, "environment_identity", return_value={
+            "host": [platform, arch], "release": "fixture", "version": "fixture",
+            "environment": {"ImageOS": "macos15", "ImageVersion": "1"},
+            "sdks": [], "sysroots": {},
+        }))
         return stack
 
     def test_internal_dependencies_keep_object_and_mtime(self):
@@ -603,7 +607,8 @@ class PrepareRestoredBuildTest(unittest.TestCase):
             result = prepare.prepare(self.work, "macos", "arm64")
             self.assertEqual(result["dependencies"]["removed_outputs"], 0)
             self.assertTrue(external.exists())
-            with mock.patch.object(prepare, "environment_identity", return_value={"ImageVersion": "2", "SDK": "/sdk/27"}):
+            with mock.patch.object(prepare, "environment_identity", return_value=dict(
+                    result["environment"], environment={"ImageVersion": "2", "SDKROOT": "/sdk/27"})):
                 result = prepare.prepare(self.work, "macos", "arm64")
         self.assertFalse(external.exists())
         self.assertTrue(internal.exists())
@@ -1169,6 +1174,278 @@ class PrepareRestoredBuildTest(unittest.TestCase):
                 self.assertNotIn("sysroot_identity", result)
                 self.assertNotIn("sysroot_invalidations", result["counters"])
 
+    def test_environment_compatibility_ignores_only_nested_scheduling_metadata(self):
+        sdk = self.work / "SDK"
+        self.write(sdk / "SDKSettings.json", '{"Version": "26.0"}')
+        stamp = self.sysroot("amd64")
+        keys = ("RUNNER_NAME", "GITHUB_JOB", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT")
+        with mock.patch.dict(os.environ, dict.fromkeys(keys, "before") | {"SDKROOT": str(sdk)}, clear=True):
+            identity = prepare.environment_identity(self.src, "linux")
+        original = json.dumps(identity, sort_keys=True)
+        for key in keys:
+            with self.subTest(key=key):
+                changed = json.loads(original)
+                changed["environment"][key] = "after"
+                before = json.dumps(changed, sort_keys=True)
+                self.assertTrue(prepare.environments_compatible(identity, changed))
+                self.assertTrue(prepare.environments_compatible(changed, identity))
+                self.assertEqual(json.dumps(changed, sort_keys=True), before)
+                changed["environment"].pop(key)
+                self.assertTrue(prepare.environments_compatible(identity, changed))
+                changed[key] = "after"
+                self.assertFalse(prepare.environments_compatible(identity, changed))
+                changed.pop(key)
+                changed["sdks"][0]["root"][key] = "after"
+                self.assertFalse(prepare.environments_compatible(identity, changed))
+        for key in sorted((set(identity["environment"]) - set(keys)) | {"FUTURE_BUILD_INPUT"}):
+            with self.subTest(build_environment=key):
+                changed = json.loads(original)
+                changed["environment"][key] = "changed"
+                self.assertFalse(prepare.environments_compatible(identity, changed))
+        changes = [(("host",), ["different", "host"]), (("release",), "changed"),
+                   (("version",), "changed"), (("sdks", 0, "settings", "SDKSettings.json"), "changed")]
+        for path in (("sdks", 0, "root"), ("sysroots", stamp.relative_to(self.src).as_posix())):
+            changes.extend(((*path, key), value) for key, value in
+                           (("path", "/other"), ("size", -1), ("mtime_ns", -1)))
+        for path, value in changes:
+            with self.subTest(path=path):
+                changed = json.loads(original)
+                parent = changed
+                for key in path[:-1]:
+                    parent = parent[key]
+                parent[path[-1]] = value
+                self.assertFalse(prepare.environments_compatible(identity, changed))
+        self.assertEqual(json.dumps(identity, sort_keys=True), original)
+
+    def test_environment_compatibility_rejects_missing_and_malformed_identity(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            identity = prepare.environment_identity(self.src, "linux")
+        malformed = [None, [], "identity", {}, {"environment": {}},
+                     {"environment": {"GITHUB_JOB": "before"}}]
+        for key in ("host", "release", "version", "environment", "sdks", "sysroots"):
+            missing = dict(identity)
+            missing.pop(key)
+            malformed.extend((missing, dict(identity, **{key: None})))
+        malformed.extend(dict(identity, environment=value) for value in
+                         ({}, [], {"GITHUB_JOB": "before"}, {"ImageVersion": None}, {1: "value"}))
+        malformed.extend(dict(identity, environment=dict(identity["environment"], **{key: None}))
+                         for key in ("RUNNER_NAME", "GITHUB_JOB", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"))
+        malformed.extend(dict(identity, host=value) for value in ([], ["linux"], ["linux", None]))
+        for value in malformed:
+            with self.subTest(identity=value):
+                self.assertFalse(prepare.environments_compatible(value, identity))
+                self.assertFalse(prepare.environments_compatible(identity, value))
+                self.assertFalse(prepare.environments_compatible(value, value))
+
+    def test_invalid_stored_environment_still_rechecks_sdk_dependencies(self):
+        self.fixture("linux", "x64")
+        header = self.write(self.work / "SDK/include/header.h", "sdk header")
+        self.deps({"obj/sdk.o": [str(header)]})
+        environment_identity = prepare.environment_identity
+        with self.native_context("linux", "x64"), mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(prepare, "environment_identity", side_effect=environment_identity):
+            prepare.prepare(self.work, "linux", "x64")
+            for kind in ("missing", "null", "empty", "scheduling-only", "malformed-scheduling"):
+                with self.subTest(kind=kind):
+                    marker = json.loads((self.src / prepare.MARKER).read_text())
+                    if kind == "missing":
+                        marker.pop("environment")
+                    elif kind == "null":
+                        marker["environment"] = None
+                    elif kind == "empty":
+                        marker["environment"] = {}
+                    elif kind == "scheduling-only":
+                        marker["environment"]["environment"] = {"GITHUB_JOB": "before"}
+                    else:
+                        marker["environment"]["environment"]["GITHUB_JOB"] = None
+                    self.write(self.src / prepare.MARKER, json.dumps(marker))
+                    obj = self.object("sdk.o")
+                    prepare.prepare(self.work, "linux", "x64", phase="inspect")
+                    with mock.patch.dict(os.environ, {"GITHUB_JOB": "after"}):
+                        result = prepare.prepare(self.work, "linux", "x64")
+                    self.assertFalse(obj.exists())
+                    self.assertEqual(result["counters"]["environment_rechecks"], 1)
+                    self.assertEqual(header.read_text(), "sdk header")
+
+    def test_scheduling_changes_preserve_sdk_objects_and_generated_outputs_on_resume(self):
+        root = self.work
+        environment_identity = prepare.environment_identity
+        keys = ("RUNNER_NAME", "GITHUB_JOB", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT")
+        for legacy in (False, True):
+            for key in keys:
+                with self.subTest(legacy=legacy, key=key):
+                    self.work = root / f"{legacy}-{key}"
+                    self.src = self.work / "src"
+                    self.out = self.src / "out/Default"
+                    self.fixture("linux", "arm64", host_arch="x64")
+                    self.write(self.src / "include/a.h", "header")
+                    for cpu in ("amd64", "arm64"):
+                        self.sysroot(cpu)
+                    sdk = self.work / "SDK"
+                    self.write(sdk / "SDKSettings.json", '{"Version": "26.0"}')
+                    header = self.write(sdk / "include/header.h", "sdk header")
+                    internal = self.object("internal.o")
+                    external = self.object("sdk.o")
+                    reader = self.object("generated.o")
+                    generated = self.write(self.out / "gen/header.h", "generated header")
+                    self.deps({"obj/internal.o": ["../../include/a.h"], "obj/sdk.o": [str(header)],
+                               "obj/generated.o": ["gen/header.h"]})
+                    self.write(self.out / ".ninja_log", "# ninja log v5\n0\t1\t1\tgen/header.h\tabc\n")
+                    env = dict.fromkeys(keys, "before") | {
+                        "SDKROOT": str(sdk), "ImageOS": "ubuntu24", "ImageVersion": "v1"}
+                    with self.native_context("linux", "x64"), mock.patch.dict(os.environ, env, clear=True), \
+                            mock.patch.object(prepare, "environment_identity", side_effect=environment_identity):
+                        previous = prepare.prepare(self.work, "linux", "arm64")
+                        self.assertEqual(previous["counters"]["first_finish"], 1)
+                        self.assertEqual(previous["dependencies"]["removed_outputs"], 2)
+                        self.assertFalse(generated.exists())
+                        self.assertTrue(internal.exists())
+                        if legacy:
+                            previous.pop("sysroot_identity")
+                            previous.pop("sysroots_changed")
+                            self.write(self.src / prepare.MARKER, json.dumps(previous))
+                        self.assertEqual(previous["schema_version"], 2)
+                        for index, path in enumerate((external, reader, generated)):
+                            self.write(path, "rebuilt " + path.name)
+                            os.utime(path, ns=(1, 1_750_000_000_123_456_789 + index))
+                        preserved = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in (
+                            internal, external, reader, generated, header,
+                            self.src / restore.MARKER, *(self.out / name for name in prepare.METADATA))}
+                        marker = (self.src / prepare.MARKER).read_bytes()
+                        with mock.patch.dict(os.environ, {key: "after"}):
+                            for _ in range(2):
+                                inspection = prepare.prepare(self.work, "linux", "arm64", phase="inspect")
+                                self.assertFalse(inspection["needs_invalidation"])
+                                self.assertFalse(inspection["generators_changed"])
+                                self.assertFalse(inspection["sysroots_changed"])
+                                self.assertEqual((self.src / prepare.MARKER).read_bytes(), marker)
+                                for path, state in preserved.items():
+                                    self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), state)
+                            for _ in range(2):
+                                result = prepare.prepare(self.work, "linux", "arm64")
+                                for counter in ("first_finish", "environment_rechecks", "generator_rechecks",
+                                                "tool_swap_invalidations", "sysroot_invalidations",
+                                                "toolchain_invalidated_outputs"):
+                                    self.assertEqual(result["counters"][counter], 0)
+                                self.assertEqual(result["dependencies"]["removed_outputs"], 0)
+                                self.assertEqual(result["generated_outputs"]["removed_outputs"], 0)
+                                self.assertEqual(result["environment"], environment_identity(self.src, "linux"))
+                                for path, state in preserved.items():
+                                    self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), state)
+                        self.assertEqual(previous["environment"]["environment"][key], "before")
+                        self.assertEqual(result["environment"]["environment"][key], "after")
+                        for path in (self.src / prepare.MARKER, self.work / "upstream-cache-preparation.json"):
+                            self.assertEqual(json.loads(path.read_text()), result)
+                        self.assertFalse((self.src / prepare.INSPECTION).exists())
+
+    def test_scheduling_changes_do_not_hide_real_build_input_changes(self):
+        root = self.work
+        environment_identity = prepare.environment_identity
+        for change in ("image", "sdk-settings", "sdk-path", "sdk-stat", "tool", "generator", "sysroot"):
+            with self.subTest(change=change):
+                self.work = root / change
+                self.src = self.work / "src"
+                self.out = self.src / "out/Default"
+                self.fixture("linux", "x64")
+                self.write(self.src / "include/a.h", "header")
+                stamp = self.sysroot("amd64")
+                sdk = self.work / "SDK"
+                settings = self.write(sdk / "SDKSettings.json", '{"Version": "26.0"}')
+                header = self.write(sdk / "include/header.h", "sdk header")
+                generator = self.write(self.src / prepare.generator_paths("linux", "x64")["go"], "go one")
+                env = {"SDKROOT": str(sdk), "ImageOS": "ubuntu24", "ImageVersion": "v1", "GITHUB_JOB": "before"}
+                with self.native_context("linux", "x64"), mock.patch.dict(os.environ, env, clear=True), \
+                        mock.patch.object(prepare, "environment_identity", side_effect=environment_identity):
+                    prepare.prepare(self.work, "linux", "x64")
+                    internal = self.object("internal.o")
+                    external = self.object("sdk.o")
+                    reader = self.object("generated.o")
+                    generated = self.write(self.out / "gen/header.h", "generated header")
+                    self.deps({"obj/internal.o": ["../../include/a.h"], "obj/sdk.o": [str(header)],
+                               "obj/generated.o": ["gen/header.h"]})
+                    self.write(self.out / ".ninja_log", "# ninja log v5\n0\t1\t1\tgen/header.h\tabc\n")
+                    preserved = {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                                 for path in (internal, reader, generated)}
+                    prepare.prepare(self.work, "linux", "x64", phase="inspect")
+                    changed_env = {"GITHUB_JOB": "after"}
+                    if change == "image":
+                        changed_env["ImageVersion"] = "v2"
+                    elif change == "sdk-path":
+                        replacement = self.work / "other-sdk"
+                        self.write(replacement / settings.name, settings.read_bytes())
+                        changed_env["SDKROOT"] = str(replacement)
+                    elif change == "sdk-stat":
+                        info = sdk.stat()
+                        os.utime(sdk, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000))
+                    else:
+                        path = {"sdk-settings": settings, "tool": self.src / prepare.CLANG / "bin/clang",
+                                "generator": generator, "sysroot": stamp}[change]
+                        info = path.stat()
+                        content = path.read_bytes()
+                        self.write(path, content[:-1] + bytes([content[-1] ^ 1]))
+                        os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+                        self.assertEqual(path.stat().st_size, info.st_size)
+                        self.assertEqual(path.stat().st_mtime_ns, info.st_mtime_ns)
+                    with mock.patch.dict(os.environ, changed_env):
+                        prepare.prepare(self.work, "linux", "x64", phase="inspect")
+                        result = prepare.prepare(self.work, "linux", "x64")
+                self.assertFalse(external.exists())
+                for path, state in preserved.items():
+                    removed = (path == generated and change == "generator"
+                               or path == reader and change in ("tool", "generator", "sysroot")
+                               or path == internal and change in ("tool", "sysroot"))
+                    if removed:
+                        self.assertFalse(path.exists())
+                    else:
+                        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), state)
+                for counter, expected in (("environment_rechecks", change.startswith("sdk-") or change == "image"),
+                                          ("tool_swap_invalidations", change == "tool"),
+                                          ("generator_rechecks", change == "generator"),
+                                          ("sysroot_invalidations", change == "sysroot")):
+                    self.assertEqual(result["counters"][counter], int(expected))
+                self.assertEqual(header.read_text(), "sdk header")
+
+    def test_scheduling_changes_do_not_clear_sticky_pending_invalidations(self):
+        root = self.work
+        environment_identity = prepare.environment_identity
+        for kind, pending_key, counter in (("tool", "needs_invalidation", "tool_swap_invalidations"),
+                                           ("generator", "generators_changed", "generator_rechecks"),
+                                           ("sysroot", "sysroots_changed", "sysroot_invalidations")):
+            with self.subTest(kind=kind):
+                self.work = root / kind
+                self.src = self.work / "src"
+                self.out = self.src / "out/Default"
+                self.fixture("linux", "x64")
+                stamp = self.sysroot("amd64")
+                generator = self.write(self.src / prepare.generator_paths("linux", "x64")["go"], "go one")
+                with self.native_context("linux", "x64"), mock.patch.dict(os.environ, {"GITHUB_RUN_ID": "before"}, clear=True), \
+                        mock.patch.object(prepare, "environment_identity", side_effect=environment_identity):
+                    prepare.prepare(self.work, "linux", "x64")
+                    obj = self.object("generated.o")
+                    generated = self.write(self.out / "gen/header.h", "generated header")
+                    self.deps({"obj/generated.o": ["gen/header.h"]})
+                    self.write(self.out / ".ninja_log", "# ninja log v5\n0\t1\t1\tgen/header.h\tabc\n")
+                    prepare.prepare(self.work, "linux", "x64", phase="inspect")
+                    path = {"tool": self.src / prepare.CLANG / "bin/clang",
+                            "generator": generator, "sysroot": stamp}[kind]
+                    content, info = path.read_bytes(), path.stat()
+                    self.write(path, content + b" changed")
+                    pending = prepare.prepare(self.work, "linux", "x64", phase="inspect")
+                    self.assertTrue(pending[pending_key])
+                    self.write(path, content)
+                    os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+                    with mock.patch.dict(os.environ, {"GITHUB_RUN_ID": "after"}):
+                        for _ in range(2):
+                            pending = prepare.prepare(self.work, "linux", "x64", phase="inspect")
+                            self.assertTrue(pending[pending_key])
+                            self.assertTrue(obj.exists())
+                            self.assertTrue(generated.exists())
+                        result = prepare.prepare(self.work, "linux", "x64")
+                self.assertFalse(obj.exists())
+                self.assertEqual(generated.exists(), kind != "generator")
+                self.assertEqual(result["counters"][counter], 1)
+                self.assertEqual(result["counters"]["environment_rechecks"], 0)
+
     def test_environment_records_runner_image_and_sdk_build_not_generated_graph(self):
         self.fixture()
         sdk = self.work / "SDK"
@@ -1183,8 +1460,19 @@ class PrepareRestoredBuildTest(unittest.TestCase):
             first = prepare.environment_identity(self.src, "macos")
             self.write(self.out / "build.ninja", "new graph")
             self.assertEqual(first, prepare.environment_identity(self.src, "macos"))
+            with mock.patch.dict(os.environ, {"GITHUB_JOB": "build-2"}):
+                changed = prepare.environment_identity(self.src, "macos")
+                self.assertNotEqual(first, changed)
+                self.assertTrue(prepare.environments_compatible(first, changed))
             with mock.patch.dict(os.environ, {"ImageVersion": "v2"}):
-                self.assertNotEqual(first, prepare.environment_identity(self.src, "macos"))
+                changed = prepare.environment_identity(self.src, "macos")
+                self.assertNotEqual(first, changed)
+                self.assertFalse(prepare.environments_compatible(first, changed))
+        for key in ("xcode-select --print-path", "xcrun --sdk macosx --show-sdk-path",
+                    "xcrun --sdk macosx --show-sdk-version", "xcrun --sdk macosx --show-sdk-build-version",
+                    "xcodebuild -version"):
+            with self.subTest(key=key):
+                self.assertFalse(prepare.environments_compatible(first, dict(first, **{key: "changed"})))
         self.assertEqual(first["xcrun --sdk macosx --show-sdk-build-version"], "25A")
         self.assertEqual(first["sdks"][0]["root"]["path"], str(sdk))
 

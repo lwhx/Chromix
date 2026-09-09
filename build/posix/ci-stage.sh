@@ -43,6 +43,13 @@ done
 
 case "$PLATFORM" in linux|macos) ;; *) echo "--platform linux|macos is required" >&2; exit 2 ;; esac
 case "$ARCH" in x64|arm64) ;; *) echo "--arch x64|arm64 is required" >&2; exit 2 ;; esac
+case "${CHROMIX_BUILD_PROFILE:-release}" in
+  fast|release) ;;
+  *) echo "CHROMIX_BUILD_PROFILE must be fast or release" >&2; exit 2 ;;
+esac
+case "$MAX_STAGES" in [1-8]) ;; *) echo "--max-stages must be between 1 and 8" >&2; exit 2 ;; esac
+case "$STAGE_INDEX" in [1-8]) ;; *) echo "--stage-index must be between 1 and 8" >&2; exit 2 ;; esac
+[ "$STAGE_INDEX" -le "$MAX_STAGES" ] || { echo "stage index exceeds max-stages" >&2; exit 2; }
 
 mkdir -p "$WORK"
 WORK="$(cd "$WORK" && pwd)"
@@ -71,6 +78,17 @@ remaining_min() {
   left=$(( (DEADLINE_EPOCH - now) / 60 ))
   [ "$left" -lt 0 ] && left=0
   echo "$left"
+}
+
+handoff() {
+  if [ "$STAGE_INDEX" -ge "$MAX_STAGES" ]; then
+    die "stage $STAGE_INDEX reached max-stages $MAX_STAGES without finishing"
+  fi
+  log "stage $STAGE_INDEX: $*; handing off"
+  mkdir -p "$SNAPSHOT_DIR"
+  bash "$REPO/build/posix/ci-parts.sh" "$WORK" "$SNAPSHOT_DIR"
+  emit upload_snapshot true
+  exit 0
 }
 
 emit status running
@@ -129,11 +147,7 @@ if [ -f "$SRC/.chromix-source-ready" ]; then
 else
   PREPARE_BUDGET=$(( $(remaining_min) - RESERVE_MINUTES ))
   if [ "$PREPARE_BUDGET" -lt 25 ]; then
-    log "stage $STAGE_INDEX: preparation budget ${PREPARE_BUDGET}m below minimum; handing off"
-    mkdir -p "$SNAPSHOT_DIR"
-    bash "$REPO/build/posix/ci-parts.sh" "$WORK" "$SNAPSHOT_DIR"
-    emit upload_snapshot true
-    exit 0
+    handoff "preparation budget ${PREPARE_BUDGET}m below minimum"
   fi
   "$REPO/build/prepare-ungoogled.sh" "$WORK" "$PLATFORM" "$ARCH"
 fi
@@ -141,11 +155,7 @@ fi
 # ---- bounded compile ------------------------------------------------------
 NINJA_BUDGET=$(( $(remaining_min) - RESERVE_MINUTES ))
 if [ "$NINJA_BUDGET" -le 20 ]; then
-  log "stage $STAGE_INDEX: ninja budget ${NINJA_BUDGET}m below minimum; handing off"
-  mkdir -p "$SNAPSHOT_DIR"
-  bash "$REPO/build/posix/ci-parts.sh" "$WORK" "$SNAPSHOT_DIR"
-  emit upload_snapshot true
-  exit 0
+  handoff "ninja budget ${NINJA_BUDGET}m below minimum"
 fi
 
 if [ "$PLATFORM" = linux ]; then
@@ -171,18 +181,8 @@ set +e
     "$BUILD_SCRIPT" "$WORK" "$ARCH"
 RC=$?
 set -e
-# Mirror the Windows chain's last-stage guard: a green run without a finished
-# build would let release-browser accept an incomplete artifact set.
-
 if [ "$RC" -eq 124 ]; then
-  if [ "$STAGE_INDEX" -ge "$MAX_STAGES" ]; then
-    die "stage $STAGE_INDEX reached max-stages $MAX_STAGES without finishing"
-  fi
-  log "stage $STAGE_INDEX: deadline reached after ${NINJA_BUDGET}m; handing off"
-  mkdir -p "$SNAPSHOT_DIR"
-  bash "$REPO/build/posix/ci-parts.sh" "$WORK" "$SNAPSHOT_DIR"
-  emit upload_snapshot true
-  exit 0
+  handoff "deadline reached after ${NINJA_BUDGET}m"
 elif [ "$RC" -ne 0 ]; then
   die "build script failed at stage $STAGE_INDEX (exit $RC)"
 fi

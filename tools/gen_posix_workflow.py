@@ -39,6 +39,10 @@ on:
         required: false
         type: number
         default: 8
+      build_profile:
+        required: false
+        type: string
+        default: fast
       use_upstream_cache:
         required: false
         type: boolean
@@ -52,7 +56,8 @@ permissions:
   actions: read
 
 concurrency:
-  group: build-posix-${{ inputs.platform }}-${{ inputs.arch }}-${{ github.ref }}
+  # Isolate caller workflows without cancelling the legacy aggregate run.
+  group: build-posix-${{ github.workflow }}-${{ inputs.platform }}-${{ inputs.arch }}-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -72,12 +77,7 @@ LINUX_CLEAN = """      - name: Free Linux disk space
           sudo docker system prune -af || true
           df -h
 
-      # Upstream portablelinux pins a Debian Docker image whose packages match
-      # Chromium's install-build-deps and whose Go is new enough for Dawn's
-      # go.mod toolchain line (go 1.25.0). The preinstalled /usr/local/go is
-      # replaced by the pinned version below; arm64 runners download
-      # linux-arm64 and x64 runners download linux-amd64, matching upstream's
-      # host-architecture Go selection.
+      # Match Chromium's install-build-deps; Go is pinned by setup-go below.
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
@@ -94,21 +94,6 @@ LINUX_CLEAN = """      - name: Free Linux disk space
             ninja-build pkg-config python3-jinja2 python3-pyparsing \\
             python3-setuptools python3-six rsync uuid-dev xz-utils yasm zip unzip \\
             zstd patch file
-          GO_VERSION="$(curl -fsSL "https://go.dev/VERSION?m=text" | head -n1)"
-          case "$GO_VERSION" in go1.*) ;; *) echo "unexpected Go version: $GO_VERSION" >&2; exit 1;; esac
-          case "${GOARCH:-$(uname -m)}" in
-            x86_64|amd64|x64) GO_ARCHIVE_TAIL="amd64" ;;
-            aarch64|arm64) GO_ARCHIVE_TAIL="arm64" ;;
-            *) echo "unsupported Go host architecture" >&2; exit 1 ;;
-          esac
-          curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-${GO_ARCHIVE_TAIL}.tar.gz" -o /tmp/go.tgz
-          sudo rm -rf /usr/local/go /opt/hostedtoolcache/go*
-          sudo tar -C /usr/local -xzf /tmp/go.tgz
-          # arm64 runner images ship no Go on PATH, and a plain `go` here would
-          # still miss after the rm above; publish the bin dir to later steps
-          # through GITHUB_PATH and verify via the absolute path.
-          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
-          /usr/local/go/bin/go version
 
       - name: Install restored-build Ninja v6
         if: runner.os == 'Linux' && inputs.use_upstream_cache
@@ -160,17 +145,27 @@ MAC_STEPS = """      - name: Select compatible Xcode
         if: runner.os == 'macOS'
         run: sudo mdutil -a -i off
 
-      # Upstream macOS CI uses Homebrew for ninja/Go only; clang comes from
-      # Chromium's own downloaded LLVM resources per target architecture.
+      # Chromium supplies clang; Homebrew supplies the remaining build tools.
       - name: Install macOS build tools
         if: runner.os == 'macOS'
-        run: brew install ninja go coreutils gpatch zstd
+        run: brew install ninja coreutils gpatch zstd
 """
 
 NODE_PY = """      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: '24.20.0'
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.1'
+          cache: false
+
+      - name: Verify Go version
+        run: |
+          go version
+          test "$(go env GOVERSION)" = go1.27.1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -206,11 +201,18 @@ def run_step(stage: int) -> str:
         """      - name: Run stage __STAGE__
         id: stage
         env:
+          CHROMIX_BUILD_PROFILE: ${{ inputs.build_profile }}
+          CHROMIX_RESERVE_MINUTES: ${{ inputs['max-stages'] == 1 && '15' || '45' }}
           CHROMIX_USE_UPSTREAM_CACHE: ${{ inputs.use_upstream_cache && '1' || '0' }}
           GH_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_TOKEN || github.token }}
         run: |
           set -euo pipefail
-          DEADLINE_EPOCH=$(( $(date +%s) + 300 * 60 ))
+          NOW_EPOCH="$(date +%s)"
+          DEADLINE_EPOCH=$(( NOW_EPOCH + 300 * 60 ))
+          JOB_DEADLINE_EPOCH=$(( CHROMIX_JOB_START_EPOCH + 330 * 60 ))
+          if [ "$DEADLINE_EPOCH" -gt "$JOB_DEADLINE_EPOCH" ]; then
+            DEADLINE_EPOCH="$JOB_DEADLINE_EPOCH"
+          fi
           build/posix/ci-stage.sh \\
             --platform '${{ inputs.platform }}' --arch '${{ inputs.arch }}' \\
             --workdir "${RUNNER_TEMP}/chromix-build" \\
@@ -326,22 +328,31 @@ def job(stage: int) -> str:
     if needs:
         parts.append(
             "    needs: %s\n    if: >-\n"
-            "      always() &&\n"
+            "      always() && inputs['max-stages'] >= %d &&\n"
             "      needs.%s.result == 'success' &&\n"
-            "      needs.%s.outputs.finished != 'true'\n" % (needs, needs, needs)
+            "      needs.%s.outputs.finished != 'true'\n" % (needs, stage, needs, needs)
         )
     parts.append("    runs-on: ${{ inputs.runner }}\n")
     parts.append("    timeout-minutes: 355\n")
     parts.append("    outputs:\n")
     parts.append("      finished: ${{ steps.stage.outputs.finished }}\n")
     parts.append("    steps:\n")
-    parts.append("      - uses: actions/checkout@v4\n\n")
     parts.append("      - name: Record runner resources\n")
     parts.append("""        run: |
+          set -euo pipefail
+          echo "CHROMIX_JOB_START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
           mkdir -p "${RUNNER_TEMP}/chromix-logs"
-          { uname -a; df -h; } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/runner.log"
+          {
+            uname -a
+            case "$(uname -s)" in
+              Linux) getconf _NPROCESSORS_ONLN; free -h ;;
+              Darwin) sysctl hw.ncpu hw.memsize ;;
+            esac
+            df -h
+          } 2>&1 | tee "${RUNNER_TEMP}/chromix-logs/runner.log"
 
 """)
+    parts.append("      - uses: actions/checkout@v4\n\n")
     parts.append(LINUX_CLEAN)
     parts.append(MAC_STEPS)
     parts.append(NODE_PY)

@@ -286,6 +286,28 @@ def environment_identity(src: Path, platform: str) -> dict:
     return result
 
 
+def environments_compatible(previous: dict | None, current: dict) -> bool:
+    """Compare build inputs without discarding stored scheduling provenance."""
+    fields = {"host": list, "release": str, "version": str, "environment": dict,
+              "sdks": list, "sysroots": dict}
+    ignored = {"RUNNER_NAME", "GITHUB_JOB", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"}
+    for identity in (previous, current):
+        if (not isinstance(identity, dict)
+                or any(not isinstance(identity.get(key), kind) for key, kind in fields.items())
+                or len(identity["host"]) != 2
+                or not all(isinstance(value, str) and value for value in identity["host"])
+                or not all(isinstance(key, str) and isinstance(value, str)
+                           for key, value in identity["environment"].items())
+                or not any(key not in ignored for key in identity["environment"])):
+            return False
+
+    def compatibility(identity):
+        return dict(identity, environment={key: value for key, value in identity["environment"].items()
+                                           if key not in ignored})
+
+    return compatibility(previous) == compatibility(current)
+
+
 def tool_fingerprint(src: Path, platform: str, arch: str) -> dict:
     """Identify tool content, including runtime libraries, without stamp conventions."""
     result = {}
@@ -665,7 +687,7 @@ def _prepare(workdir: Path, platform: str, arch: str, *, phase: str, repo: Path,
     data["operation"] = "tool_fingerprint"
     fingerprint = tool_fingerprint(src, platform, arch)
     tool_changed = needs_invalidation or bool(old and old.get("tool_fingerprint") != fingerprint)
-    environment_changed = not old or old.get("environment") != environment
+    environment_changed = not old or not environments_compatible(old.get("environment"), environment)
     first_finish = old is None
     data["operation"] = "invalidate_outputs"
     products = remove_final_products(src, platform) if first_finish else []

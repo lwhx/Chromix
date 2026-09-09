@@ -3,6 +3,16 @@ name: build-linux-arm64
 on:
   workflow_dispatch:
     inputs:
+      build_profile:
+        description: 'ThinLTO optimization profile'
+        type: choice
+        options: [fast, release]
+        default: fast
+      build_mode:
+        description: 'Staged snapshot/resume or a single job that must finish'
+        type: choice
+        options: [staged, single]
+        default: staged
       use_upstream_cache:
         description: 'Require pinned full upstream source + out/Default reuse; false permits cold builds'
         type: boolean
@@ -49,6 +59,7 @@ jobs:
       arch: arm64
       runner: ${{ github.event_name == 'workflow_dispatch' && !inputs.use_upstream_cache && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
       artifact: chromix-linux-arm64
-      max-stages: 8
+      max-stages: ${{ inputs.build_mode == 'single' && 1 || 8 }}
+      build_profile: ${{ inputs.build_profile || 'fast' }}
       use_upstream_cache: ${{ github.event_name != 'workflow_dispatch' || inputs.use_upstream_cache }}
     secrets: inherit

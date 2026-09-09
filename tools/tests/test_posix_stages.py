@@ -47,6 +47,11 @@ class PosixSnapshotRoundTripTest(unittest.TestCase):
             "src/.chromix-ungoogled-core": "core-commit\n",
             "src/.chromix-ungoogled-platform": "platform-commit\n",
             "src/.chromix-chromium-version": "152.0.7977.82\n",
+            "src/fixture.c": '#include "fixture.h"\nint fixture(void) { return VALUE; }\n',
+            "src/fixture.h": "#define VALUE 42\n",
+            "src/out/Chromix/obj/fixture.o": "object fixture\n",
+            "src/out/Chromix/.ninja_log": "# ninja log v5\n",
+            "src/out/Chromix/.ninja_deps": "dependency fixture\n",
             "src/tool": "#!/bin/sh\necho ok\n",
             "tooling/depot_tools/gclient": "tooling fixture\n",
             "src/download_cache/keep": "not the root cache\n",
@@ -57,18 +62,33 @@ class PosixSnapshotRoundTripTest(unittest.TestCase):
             "line\nbreak": "NUL-delimited name\n",
             "link-target": "fixture",
         }
-        self.mtime = 1700000000
+        self.mtime_ns = 1700000000123456789
         for name, contents in self.fixture_files.items():
             path = self.work / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(contents)
             path.chmod(0o755 if name == "src/tool" else 0o640)
-            os.utime(path, (self.mtime, self.mtime))
-        (self.work / "src/symlink").symlink_to("../link-target")
-        (self.work / "tooling/download_cache").symlink_to("../download_cache")
-        (self.work / "broken-link").symlink_to("missing-target")
-        for directory in ("src", "tooling", "tooling/depot_tools"):
-            os.utime(self.work / directory, (self.mtime, self.mtime))
+        self.fixture_symlinks = {
+            "src/symlink": "../link-target",
+            "tooling/download_cache": "../download_cache",
+            "broken-link": "missing-target",
+            "src/out-link": "out/Chromix",
+        }
+        for name, target in self.fixture_symlinks.items():
+            (self.work / name).symlink_to(target)
+        self.fixture_directories = []
+        self.mtimes_ns = {}
+        for index, path in enumerate([self.work, *sorted(self.work.rglob("*"))]):
+            name = str(path.relative_to(self.work))
+            if path.is_dir() and not path.is_symlink():
+                path.chmod(0o750)
+                if path != self.work:
+                    self.fixture_directories.append(name)
+            mtime_ns = self.mtime_ns + index * 1000001
+            os.utime(path, ns=(mtime_ns, mtime_ns), follow_symlinks=False)
+            self.assertEqual(path.lstat().st_mtime_ns, mtime_ns,
+                             "snapshot tests require nanosecond filesystem timestamps")
+            self.mtimes_ns[name] = mtime_ns
         # A small volume size forces the multi-volume slicing path in tests.
         self.env = {
             **os.environ,
@@ -119,17 +139,159 @@ class PosixSnapshotRoundTripTest(unittest.TestCase):
                 self.assertEqual(path.read_text(), contents)
                 expected_mode = 0o755 if name == "src/tool" else 0o640
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), expected_mode)
-                self.assertEqual(path.stat().st_mtime, self.mtime)
-        for name, target in (("src/symlink", "../link-target"),
-                             ("tooling/download_cache", "../download_cache"),
-                             ("broken-link", "missing-target")):
+                self.assertEqual(path.stat().st_mtime_ns, self.mtimes_ns[name])
+        for name, target in self.fixture_symlinks.items():
             self.assertTrue((dest / name).is_symlink(), name)
             self.assertEqual(os.readlink(dest / name), target)
+            self.assertEqual((dest / name).lstat().st_mtime_ns, self.mtimes_ns[name])
+            self.assertEqual(stat.S_IMODE((dest / name).lstat().st_mode),
+                             stat.S_IMODE((self.work / name).lstat().st_mode))
         self.assertEqual((dest / "src/symlink").read_text(), "fixture")
-        # GNU tar's default format stores whole-second mtimes.
-        for directory in ("src", "tooling", "tooling/depot_tools"):
-            self.assertEqual(int((dest / directory).stat().st_mtime),
-                             int((self.work / directory).stat().st_mtime))
+        for directory in self.fixture_directories:
+            self.assertEqual((dest / directory).stat().st_mtime_ns,
+                             (self.work / directory).stat().st_mtime_ns, directory)
+            self.assertEqual(stat.S_IMODE((dest / directory).stat().st_mode), 0o750)
+
+    def archive_mtime_ns(self, member):
+        from decimal import Decimal
+        self.assertIn("mtime", member.pax_headers, member.name)
+        return int(Decimal(member.pax_headers["mtime"]) * 1000000000)
+
+    def tar_environment(self, implementation):
+        for candidate in ("tar", "gtar", "bsdtar"):
+            executable = shutil.which(candidate)
+            if executable is None:
+                continue
+            version = subprocess.run([executable, "--version"],
+                                     capture_output=True, text=True, timeout=10)
+            signature = {"gnu": "GNU tar", "bsd": "bsdtar"}[implementation]
+            if version.returncode == 0 and signature in version.stdout:
+                bindir = self.root / f"{implementation}-bin"
+                bindir.mkdir(exist_ok=True)
+                if not (bindir / "tar").exists():
+                    (bindir / "tar").symlink_to(executable)
+                return {"PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}"}
+        self.skipTest(f"{implementation.upper()} tar required")
+
+    def tree_metadata(self, work):
+        return {
+            str(path.relative_to(work)): (path.lstat().st_mode, path.lstat().st_mtime_ns)
+            for path in [work, *work.rglob("*")]
+        }
+
+    def assert_tree_metadata(self, dest, expected):
+        for name, metadata in expected.items():
+            with self.subTest(path=name):
+                path = dest / name
+                self.assertEqual((path.lstat().st_mode, path.lstat().st_mtime_ns),
+                                 metadata)
+
+    def nanosecond_round_trip(self, writer, reader):
+        writer_env = self.tar_environment(writer)
+        reader_env = self.tar_environment(reader)
+        expected = self.tree_metadata(self.work)
+        parts, result = self.snapshot(writer_env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        with tarfile.open(fileobj=io.BytesIO(self.snapshot_tar(parts))) as tree:
+            for member in tree.getmembers():
+                name = str(Path(member.name))
+                self.assertEqual(self.archive_mtime_ns(member), expected[name][1], name)
+        restored = self.root / "restored"
+        restored.mkdir()
+        for attempt in range(2):
+            with self.subTest(restore=attempt):
+                self.restore(parts, restored, reader_env)
+                self.assert_fixture(restored)
+                self.assertEqual(self.tree_metadata(restored), expected)
+                # Re-restores must repair existing metadata, including symlinks.
+                for name in expected:
+                    os.utime(restored / name, ns=(self.mtime_ns - 7, self.mtime_ns - 7),
+                             follow_symlinks=False)
+
+    def test_gnu_to_gnu_preserves_nanosecond_metadata(self):
+        self.nanosecond_round_trip("gnu", "gnu")
+
+    def test_bsd_to_bsd_preserves_nanosecond_metadata(self):
+        self.nanosecond_round_trip("bsd", "bsd")
+
+    def test_gnu_to_bsd_preserves_nanosecond_metadata(self):
+        self.nanosecond_round_trip("gnu", "bsd")
+
+    def test_bsd_to_gnu_preserves_nanosecond_metadata(self):
+        self.nanosecond_round_trip("bsd", "gnu")
+
+    def ninja_round_trip(self, writer, reader):
+        import shlex
+        writer_env = self.tar_environment(writer)
+        reader_env = self.tar_environment(reader)
+        ninja = shutil.which("ninja")
+        compiler = shutil.which("cc")
+        if ninja is None or compiler is None:
+            self.skipTest("Ninja and a C compiler required")
+        out = self.work / "src/out/Chromix"
+        for name in ("obj/fixture.o", ".ninja_log", ".ninja_deps"):
+            (out / name).unlink()
+        object_mtime_ns = self.mtime_ns + 500000000
+        stamp = (f'import os; os.utime("obj/fixture.o", '
+                 f'ns=({object_mtime_ns}, {object_mtime_ns}))')
+        (out / "build.ninja").write_text(
+            "rule cc\n"
+            f"  command = {shlex.quote(compiler)} -MMD -MF $out.d -c $in -o $out && "
+            f"{shlex.quote(sys.executable)} -c {shlex.quote(stamp)}\n"
+            "  depfile = $out.d\n"
+            "  deps = gcc\n"
+            "build obj/fixture.o: cc ../../fixture.c\n"
+            "default obj/fixture.o\n")
+
+        def run_ninja(directory, *args):
+            result = subprocess.run([ninja, *args], cwd=directory,
+                                    capture_output=True, text=True, timeout=60,
+                                    env={**self.env, "LC_ALL": "C"})
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return result.stdout + result.stderr
+
+        self.assertIn("[1/1]", run_ninja(out))
+        self.assertIn("../../fixture.h", run_ninja(out, "-t", "deps"))
+        self.assertFalse((out / "obj/fixture.o.d").exists())
+        # The deps database keeps the object's ns timestamp independently of tar.
+        for index, name in enumerate((".ninja_log", ".ninja_deps", "build.ninja")):
+            mtime_ns = self.mtime_ns + 600000000 + index * 1000001
+            os.utime(out / name, ns=(mtime_ns, mtime_ns))
+        for index, directory in enumerate([self.work, *self.work.rglob("*")]):
+            if directory.is_dir() and not directory.is_symlink():
+                mtime_ns = self.mtime_ns + 700000000 + index * 1000001
+                os.utime(directory, ns=(mtime_ns, mtime_ns))
+        self.assertIn("ninja: no work to do.", run_ninja(out, "-d", "explain"))
+        expected = self.tree_metadata(self.work)
+        contents = {name: (self.work / name).read_bytes() for name in expected
+                    if stat.S_ISREG(expected[name][0])}
+        for name, (_, mtime_ns) in expected.items():
+            self.assertNotEqual(mtime_ns % 1000000000, 0, name)
+        parts, result = self.snapshot(writer_env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        restored = self.root / "ninja-restored"
+        restored.mkdir()
+        for attempt in range(2):
+            with self.subTest(restore=attempt):
+                self.restore(parts, restored, reader_env)
+                restored_out = restored / "src/out/Chromix"
+                self.assertIn("ninja: no work to do.",
+                              run_ninja(restored_out, "-d", "explain"))
+                self.assertEqual(self.tree_metadata(restored), expected)
+                for name, payload in contents.items():
+                    self.assertEqual((restored / name).read_bytes(), payload, name)
+
+    def test_real_ninja_has_no_work_after_gnu_to_gnu_restore(self):
+        self.ninja_round_trip("gnu", "gnu")
+
+    def test_real_ninja_has_no_work_after_bsd_to_bsd_restore(self):
+        self.ninja_round_trip("bsd", "bsd")
+
+    def test_real_ninja_has_no_work_after_gnu_to_bsd_restore(self):
+        self.ninja_round_trip("gnu", "bsd")
+
+    def test_real_ninja_has_no_work_after_bsd_to_gnu_restore(self):
+        self.ninja_round_trip("bsd", "gnu")
 
     def test_round_trip_preserves_modes_symlinks_and_markers(self):
         # ~384 KiB of random bytes against 64 KiB volumes exercises multi-volume
@@ -178,6 +340,7 @@ class PosixSnapshotRoundTripTest(unittest.TestCase):
                 stale = parts / "p4/tree.tar.zst.999"
                 stale.parent.mkdir(parents=True)
                 stale.write_text("stale upload")
+                expected_metadata = self.tree_metadata(self.work)
                 # Exercise relative ROOT/PARTS_DIR with spaces in the cwd.
                 _, result = self.snapshot(
                     extra_env, parts_dir=parts.relative_to(self.root),
@@ -201,10 +364,9 @@ class PosixSnapshotRoundTripTest(unittest.TestCase):
                     or Path(name).name.startswith("tree.tar.zst")
                     for name in names), names)
                 for name in self.fixture_files:
-                    self.assertEqual(members[name].mtime, self.mtime)
-                for name, target in (("src/symlink", "../link-target"),
-                                     ("tooling/download_cache", "../download_cache"),
-                                     ("broken-link", "missing-target")):
+                    self.assertEqual(self.archive_mtime_ns(members[name]),
+                                     self.mtimes_ns[name])
+                for name, target in self.fixture_symlinks.items():
                     self.assertIn(name, members)
                     self.assertTrue(members[name].issym(), name)
                     self.assertEqual(members[name].linkname, target)
@@ -216,8 +378,10 @@ class PosixSnapshotRoundTripTest(unittest.TestCase):
                     with self.subTest(restore=attempt):
                         self.restore(parts, restored, extra_env)
                         self.assert_fixture(restored)
-                        self.assertEqual(int(restored.stat().st_mtime),
-                                         int(members["."].mtime))
+                        self.assert_tree_metadata(
+                            restored, {name: expected_metadata[name] for name in names})
+                        self.assertEqual(restored.stat().st_mtime_ns,
+                                         self.archive_mtime_ns(members["."]))
                         self.assertEqual(cached.read_text(), "separately restored cache")
                         self.assertFalse(
                             (restored / "download_cache/chromium.tar.xz").exists())
@@ -552,11 +716,16 @@ class GenPosixWorkflowTest(unittest.TestCase):
         self.assertIn("--from-snapshot \"${RUNNER_TEMP}/chromix-restore\"", stage2)
         deps = next(s for s in jobs["posix-1"]["steps"]
                     if s.get("name") == "Install Linux build dependencies")
-        # arm64 runner images carry no Go on PATH: the pinned toolchain must
-        # publish /usr/local/go/bin to later steps and verify via the
-        # absolute path, not a bare `go` (first real run died with exit 127).
-        self.assertIn('echo "/usr/local/go/bin" >> "$GITHUB_PATH"', deps["run"])
-        self.assertIn("/usr/local/go/bin/go version", deps["run"])
+        # Pinned Go is installed by actions/setup-go and verified in its own step;
+        # this dependency step must not fetch a moving toolchain version.
+        self.assertNotIn("go.dev/VERSION", deps["run"])
+        setup_go = next(s for s in jobs["posix-1"]["steps"]
+                        if s.get("name") == "Set up Go")
+        self.assertEqual(setup_go["with"]["go-version"], "1.27.1")
+        verify_go = next(s for s in jobs["posix-1"]["steps"]
+                        if s.get("name") == "Verify Go version")
+        self.assertIn("go version", verify_go["run"])
+        self.assertIn("go1.27.1", verify_go["run"])
         last = next(s for s in jobs["posix-8"]["steps"]
                     if s.get("name") == "Run stage 8")["run"]
         self.assertIn("--stage-index 8", last)

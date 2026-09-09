@@ -3,6 +3,11 @@
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$REPO/build/posix/upstream-cache.sh"
+BUILD_PROFILE="${CHROMIX_BUILD_PROFILE:-release}"
+case "$BUILD_PROFILE" in
+  fast|release) ;;
+  *) echo "CHROMIX_BUILD_PROFILE must be fast or release" >&2; exit 2 ;;
+esac
 WORK="${1:-$REPO/.chromix-build-linux}"
 HOST_ARCH="$(uname -m)"
 case "$HOST_ARCH" in x86_64) HOST_ARCH=x64 ;; aarch64) HOST_ARCH=arm64 ;; esac
@@ -117,7 +122,8 @@ GN_INPUTS=("$WORK/tooling/ungoogled-chromium/flags.gn"
 if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
   GN_INPUTS=("$OUT/args.gn" "${GN_INPUTS[@]}")
 fi
-python3 "$REPO/tools/merge_gn_args.py" "$OUT/args.gn" "${GN_INPUTS[@]}"
+printf '==> Build profile: %s\n' "$BUILD_PROFILE"
+python3 "$REPO/tools/merge_gn_args.py" --build-profile "$BUILD_PROFILE" "$OUT/args.gn" "${GN_INPUTS[@]}"
 # GN's standalone bootstrap still treats this libstdc++ warning as an error.
 CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }-Wno-deprecated-declarations" \
   python3 "$REPO/tools/bootstrap_gn.py" --src "$SRC" --out "$OUT"

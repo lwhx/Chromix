@@ -36,6 +36,8 @@ def parse(path: Path) -> tuple[list[str], dict[str, str]]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--build-profile", choices=("fast", "release"),
+                        help="override ThinLTO optimization for a POSIX build")
     parser.add_argument("output", type=Path)
     parser.add_argument("inputs", nargs="+", type=Path)
     args = parser.parse_args()
@@ -48,6 +50,13 @@ def main() -> int:
             if key not in merged:
                 order.append(key)
             merged[key] = values[key]
+
+    if args.build_profile:
+        key = "thin_lto_enable_optimizations"
+        if key not in merged:
+            order.append(key)
+        value = "false" if args.build_profile == "fast" else "true"
+        merged[key] = f"{key} = {value}"
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     body = ["# Generated. Later input files override earlier assignments."]

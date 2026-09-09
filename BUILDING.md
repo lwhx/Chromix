@@ -176,6 +176,64 @@ GitHub skips push-triggered workflows for `[skip ci]`, but still permits manual
 dispatch. `build-posix-github.yml` is callable only through a platform entrypoint;
 its platform and architecture must be supplied explicitly.
 
+### POSIX build speed and profiles
+
+The four POSIX entrypoints accept `build_profile=fast|release` and
+`build_mode=staged|single`. Pushes and manual dispatches default to `fast` with
+`staged` recovery. Windows retains its existing configuration.
+
+| Setting | Behavior |
+|---|---|
+| `fast` | Sets only `thin_lto_enable_optimizations=false`, reducing the main browser's expensive ThinLTO link optimizations. |
+| `release` | Sets `thin_lto_enable_optimizations=true` for the original optimized release behavior. |
+| `staged` | Allows up to eight jobs, handing off a snapshot when the current budget is exhausted. |
+| `single` | Allows one compile job, reserves 15 rather than 45 minutes, and fails without a snapshot if it cannot finish. Linux ARM64 still requires the separate native verification job. |
+
+ThinLTO itself, its incremental cache, official non-component builds, sandboxing,
+and browser features are unchanged. Symbols and PGO remain disabled as before.
+The fast profile trades link optimization for build time; runtime performance and
+binary size may differ, and no Chromium timing or runtime benchmark has yet
+quantified that trade-off. Switching profiles forces affected links to rerun and
+may rebuild dependent outputs; keep the profile consistent across a build.
+Locally, POSIX builders default to `release`; select fast explicitly:
+
+```bash
+CHROMIX_BUILD_PROFILE=fast build/build.sh /path/to/chromix-linux-build x64
+CHROMIX_BUILD_PROFILE=fast build/macos/build.sh /path/to/chromix-mac-build arm64
+```
+
+After publishing the workflow changes, a single-platform manual dispatch can use:
+
+```bash
+gh workflow run build-linux-x64.yml --ref main \
+  -f build_profile=fast -f build_mode=staged -f use_upstream_cache=true
+```
+
+Use `single` only when a representative build fits the hosted job budget or a
+failed time-boxed experiment is acceptable. It increases available compilation
+time by reducing the handoff reserve, not by increasing CPU resources. It does
+not preserve an unfinished tree for a later stage. Existing active runs continue
+using their original source revision and are unaffected by these settings.
+
+The speed work borrows Camoufox's independent parallel targets, reduced costly
+build options, and optional one-job builds rather than copying Firefox's `mach`
+commands or Rust job limits into Chromium. Linux ARM64 already cross-compiles on
+x64 when restoring upstream builds. Linux-to-Windows and Linux-to-macOS paths are
+not implemented: they need reproducible platform SDK/tool distribution and native
+runtime checks before replacing the current builders. A two-hour Camoufox build
+is not evidence that Chromium can finish in the same time.
+
+Two fixes reduce unnecessary work during staged recovery: POSIX pax snapshots
+preserve nanosecond timestamps, and environment compatibility ignores only
+`RUNNER_NAME`, `GITHUB_JOB`, `GITHUB_RUN_ID`, and `GITHUB_RUN_ATTEMPT`. These fields
+remain in diagnostic reports. Actual runner image, SDK, compiler, generator,
+sysroot, and dependency changes still invalidate affected outputs. Node.js
+`24.20.0` and Go `1.27.1` are pinned across POSIX jobs to avoid moving host tools
+between stages; changing to these versions may require initial regeneration.
+Checksum, native smoke, and object-retention evidence checks remain mandatory.
+Compare completed-run elapsed times, planned Ninja work, and retention reports
+before claiming a measured speedup.
+
 The Windows reusable workflow retains its 12-stage snapshot/resume chain. Each
 stage uploads multi-volume 7-Zip snapshots with modification times preserved so
 Ninja can continue incrementally. Manual dispatch of
@@ -216,18 +274,23 @@ stage 1 repeats restoration on its own runner.
 
 The POSIX reusable workflow follows the upstream ungoogled-chromium CI model:
 portablelinux's `prep` + `build_part_01..10` chain and macOS'
-`retrieve-resources` + `build_job_01..20` chain. Each POSIX target runs
-`posix-1..posix-8`; every stage is a fresh native runner with a self-imposed
-~300-minute deadline (`timeout -k 7m -s SIGTERM`) that leaves ~45 minutes for
-snapshotting inside GitHub's 355/360-minute limits:
+`retrieve-resources` + `build_job_01..20` chain. In staged mode each POSIX target
+can run `posix-1..posix-8`, with a fresh runner matching the platform table for
+each stage. Resource recording precedes checkout and records CPU, RAM, disk, and
+a job-start timestamp. The internal deadline is the earlier of 300 minutes from
+stage-script start or 330 minutes from that timestamp, within the 355-minute job.
+Compilation uses `timeout -k 7m -s SIGTERM` with a 45-minute handoff reserve
+(15 minutes in single mode), leaving additional time for diagnostic/artifact
+uploads. Setup and snapshot download time therefore reduce the remaining budget:
 
 1. restore the previous stage's tree snapshot (none at stage 1);
 2. run `build/posix/ci-stage.sh --platform --arch --stage-index ...`;
 3. prepare the pinned ungoogled source (or resume it) under the deadline;
 4. continue Ninja through `build/build.sh` / `build/macos/build.sh`;
-5. on deadline exit 124, pack `${workdir}` with `build/posix/ci-parts.sh`
-   into multi-volume `tree.tar.zst.*` files via `tar | zstd`, preserving
-   mtimes, modes, and symlinks so incremental Ninja state survives; the packer
+5. on deadline exit 124, when another stage is available, pack `${workdir}` with
+   `build/posix/ci-parts.sh` into multi-volume `tree.tar.zst.*` files via
+   `tar --format=pax | zstd`, preserving nanosecond mtimes, modes, and symlinks
+   so incremental Ninja state survives; the packer
    excludes all snapshot staging directories and the separately cached
    `download_cache`, preventing the archive from reading its own output;
 6. verify the handoff contains at least one numbered volume, then upload up to
@@ -235,7 +298,9 @@ snapshotting inside GitHub's 355/360-minute limits:
    `actions/download-artifact@v4` (`merge-multiple: true`, sorted part order)
    and resumes.
 
-Compile failures fail the job immediately; only the timeout hands off.
+Compile failures fail the job immediately. Insufficient preparation/compile
+budget and timeout exit 124 hand off only when another stage is available;
+otherwise they fail without packing an unusable snapshot or reporting completion.
 The POSIX stage scripts stay compatible with the system `/bin/bash` 3.2 that
 runs GitHub's macOS workflow steps (no nested quoted command substitution
 inside `$(( ))`, no bare GNU `timeout`/`split` - both resolve through a
@@ -246,9 +311,10 @@ the regression suite. `tree.tar.zst*` archives over eight volumes (eight
 mirroring the Windows multi-volume guard; between five and eight volumes
 the chain continues with an explicit warning instead of aborting, because
 re-packing hundreds of gigabytes buys nothing once the per-artifact upload
-cap is the real constraint. Stage jobs declare
-`if: always() && needs.posix-N.result == 'success' && needs.posix-N.outputs.finished != 'true'`,
-so an early finish skips later stages while hard failures stop the platform.
+cap is the real constraint. Later stage jobs require `always()`, a successful
+predecessor whose `finished` output is not `true`, and a `max-stages` value that
+includes their index. An early finish skips later stages while hard failures
+stop the platform; single mode never schedules another compile stage.
 
 Each POSIX stage also caches only the pinned source and resource downloads at
 `${{ runner.temp }}/chromix-build/download_cache`. The cache key includes the
@@ -441,12 +507,11 @@ x64 link for hardcoded generator paths, Go is linked as
 `third_party/dawn/tools/golang/linux-amd64/bin/go` on x64 hosts and
 `linux-arm64` on arm64 hosts (Dawn's DEPS pins exactly these cipd directories),
 matching upstream portablelinux's `setup_toolchain`. Only GN args, sysroots,
-and output binaries select the target architecture. Linux stages install a
-current Go explicitly because Dawn's `go.mod` requires go 1.25.0 toolchain
-support, matching the pinned Docker image upstream builds with; arm64
-runners download linux-arm64 and x64 runners download linux-amd64 from
-go.dev. That single dependency drift was enough to fail prior one-shot POSIX
-builds when Ubuntu's apt Go predated the new module syntax.
+and output binaries select the target architecture. POSIX stages install Go
+`1.27.1` through `actions/setup-go` and verify its version on PATH, meeting Dawn's
+`go.mod` requirement of go 1.25.0 toolchain support. The action selects the host
+architecture. This avoids relying on older distro Go or changing the generator
+version between stages; no compiled-object cache is provided by this action.
 
 The final POSIX stage verifies `SHA256SUMS` and extracts the ZIP into a fresh
 directory using the SDK's checked extractor, preserving executable permissions
@@ -488,9 +553,10 @@ artifact limits; a failed upload stops the chain. Hard job termination, runner
 loss, or a full disk can prevent diagnostic uploads too.
 
 **CI cost and capacity:** filtered pushes to `main` start affected platforms;
-a manual dispatch starts only its selected platform. Each POSIX stage spans a
-full 355-minute budget rather than one shot, so retry capacity comes from
-resumable snapshots instead of repeated full rebuilds. A full run can consume
+a manual dispatch starts only its selected platform. In staged mode, each POSIX
+job has a 355-minute limit and retry capacity comes from resumable snapshots
+instead of repeated full rebuilds. Single mode keeps that job limit but has no
+unfinished-tree recovery. A full staged run can consume
 far more runner-minutes than the earlier one-shot layout before billing
 multipliers/quota rules; macOS is typically more expensive where usage is
 billed. `cancel-in-progress: false` does not cancel an active run when newer
