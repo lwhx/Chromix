@@ -38,5 +38,5 @@ remain Actions artifacts pending real native compile and runtime verification.
 
 To build the pinned ungoogled source layers and then apply this series, see
 `BUILDING.md`, `build/prepare-ungoogled.sh`, `build/windows/build.ps1`, or the
-staged `.github/workflows/build-win-x64-github.yml` and
-`.github/workflows/build-cross-platform.yml` CI workflows.
+staged `.github/workflows/build-win-x64-github.yml` and the four
+`build-linux-{x64,arm64}.yml` / `build-macos-{x64,arm64}.yml` CI entrypoints.

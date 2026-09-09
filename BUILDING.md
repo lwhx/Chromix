@@ -27,7 +27,7 @@ version files remain available for tooling compatibility.
 
 ## Linux x64/arm64 builds
 
-The unified workflow builds Linux ARM64 on an x64 Ubuntu 24.04 host, matching the
+The Linux ARM64 workflow builds on an x64 Ubuntu 24.04 host, matching the
 pinned portablelinux donor's cross-build environment. It restores ARM64 target
 sources and objects while executing x64 LLVM, Rust, GN, Node, Go, and Ninja.
 Both amd64 host and arm64 target sysroots are checked. Their directory metadata,
@@ -146,25 +146,40 @@ changes SDK pins/GN requirements to hide a mismatch.
 
 ## GitHub Actions cross-platform build
 
-`.github/workflows/build-cross-platform.yml` calls five reusable staged
-workflows, one per native target, so one successful run owns all five ZIP
-artifacts: `build-posix-github.yml` for the four POSIX targets and
-`build-win-x64-github.yml` for Windows.
+Five independent workflows each own one platform's jobs and ZIP artifact.
+The four POSIX entrypoints call `build-posix-github.yml`; Windows uses its
+existing staged workflow directly. Failures and retries stay within that
+platform, and no entrypoint cancels an active build.
 
-| Runner | Target | Archive |
-|---|---|---|
-| `ubuntu-22.04` | Linux x64 | `chromix-linux-x64.zip` |
-| `ubuntu-24.04` build; `ubuntu-24.04-arm` smoke | Linux arm64 | `chromix-linux-arm64.zip` |
-| `macos-15-intel` | macOS x64 | `chromix-mac-x64.zip` |
-| `macos-15` | macOS arm64 | `chromix-mac-arm64.zip` |
-| `windows-2022` | Windows x64 | `chromix-win-x64.zip` |
+| Workflow | Runner | Target | Archive |
+|---|---|---|---|
+| `build-linux-x64.yml` | `ubuntu-22.04` | Linux x64 | `chromix-linux-x64.zip` |
+| `build-linux-arm64.yml` | `ubuntu-24.04` build; `ubuntu-24.04-arm` smoke | Linux arm64 | `chromix-linux-arm64.zip` |
+| `build-macos-x64.yml` | `macos-15-intel` | macOS x64 | `chromix-mac-x64.zip` |
+| `build-macos-arm64.yml` | `macos-15` | macOS arm64 | `chromix-mac-arm64.zip` |
+| `build-win-x64-github.yml` | `windows-2022` | Windows x64 | `chromix-win-x64.zip` |
+
+Each entrypoint supports manual dispatch with `use_upstream_cache=true` by
+default. Filtered pushes start the affected platform workflows; shared build
+changes can start all five. To push a repair without duplicating platforms
+already running, include `[skip ci]` in the commit message, then dispatch only
+the repaired platform. Confirm the source SHA and workflow before dispatching
+and reuse an existing run rather than dispatching the same pair twice:
+
+```bash
+gh run list --workflow build-win-x64-github.yml --commit "$(git rev-parse HEAD)"
+gh workflow run build-win-x64-github.yml --ref main -f use_upstream_cache=true
+```
+
+GitHub skips push-triggered workflows for `[skip ci]`, but still permits manual
+dispatch. `build-posix-github.yml` is callable only through a platform entrypoint;
+its platform and architecture must be supplied explicitly.
 
 The Windows reusable workflow retains its 12-stage snapshot/resume chain. Each
 stage uploads multi-volume 7-Zip snapshots with modification times preserved so
 Ninja can continue incrementally. Manual dispatch of
-`.github/workflows/build-win-x64-github.yml` remains available for explicit
-Windows-only retries or cross-run resume; the normal release path uses the
-Windows job nested in `build-cross-platform`. Windows validation also requires
+`.github/workflows/build-win-x64-github.yml` supports Windows-only retries and
+cross-run resume independently of the other four workflows. Windows validation requires
 restoration when requested. Its internal deadline is 230 minutes within the
 240-minute job, with 15 minutes reserved for diagnostics; normal build stages
 retain a 300-minute internal deadline and 40-minute handoff reserve. Windows
@@ -185,6 +200,15 @@ These diagnostics and the revised budget still require validation on the full
 Windows runner workload. Miss reports
 retain the last download attempt's partial and expected byte counts separately
 from verified bytes.
+Windows selects the host Git installation's `usr/bin/patch.exe` before PATH
+alternatives. Every candidate must pass a small real patch test with the same
+strict options used for application: zero fuzz, no version-control checkout,
+CRLF preservation, dry-run, duplicate rejection, and reverse application.
+An incompatible executable fails before a patch-in-progress marker is written;
+`--version` alone is not accepted as a compatibility check. Cold and restored
+preparation share this selection. An existing interrupted-patch marker still
+requires a clean restored work directory.
+
 V8 Torque validation uses only the remaining non-reserved time. The
 validation runner currently uploads diagnostics rather than its build tree, so
 stage 1 repeats restoration on its own runner.
@@ -462,8 +486,8 @@ stalled`. Completed handoff uploads still depend on network availability and
 artifact limits; a failed upload stops the chain. Hard job termination, runner
 loss, or a full disk can prevent diagnostic uploads too.
 
-**CI cost and capacity:** filtered pushes to `main` and manual dispatches start
-four POSIX chains plus the Windows 12-stage chain. Each POSIX stage now spans a
+**CI cost and capacity:** filtered pushes to `main` start affected platforms;
+a manual dispatch starts only its selected platform. Each POSIX stage spans a
 full 355-minute budget rather than one shot, so retry capacity comes from
 resumable snapshots instead of repeated full rebuilds. A full run can consume
 far more runner-minutes than the earlier one-shot layout before billing
@@ -474,11 +498,17 @@ especially for the arm64 LLVM/Rust bootstrap, link steps, and duplicate
 packaging/extraction trees. Do not treat cleanup or a 100 GB estimate as proof
 of capacity.
 
-A successful unified run uploads all five browser ZIPs as Actions artifacts
-retained for 14 days. `release-browser.yml` consumes only a successful
-`build-cross-platform` run and refuses to publish until all five artifacts pass
-checksum, ZIP-layout, and corruption checks. SDK package versions and
-release-channel pins are unchanged.
+Each successful platform run uploads its browser ZIP and `SHA256SUMS` as an
+Actions artifact retained for 14 days. `release-browser.yml` reacts to each
+platform's successful completion, waits for all five workflows to succeed at
+the same source SHA, and validates every checksum, ZIP layout, and archive
+before publishing. Read-only readiness checks are isolated by source SHA; only
+a complete successful set enters the shared publication queue. Runs from
+different commits are never combined; a platform
+that is still running or failed leaves the release pending. Existing runs keep
+the workflow definition of their original commit, including any older unified
+run; preserving such builds does not make their artifacts eligible for a new
+commit's release. SDK package versions and release-channel pins are unchanged.
 
 ### Verify and run a POSIX candidate
 

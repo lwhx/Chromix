@@ -1,0 +1,54 @@
+name: build-linux-arm64
+
+on:
+  workflow_dispatch:
+    inputs:
+      use_upstream_cache:
+        description: 'Require pinned full upstream source + out/Default reuse; false permits cold builds'
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    paths:
+      - 'build/*'
+      - 'build/linux/**'
+      - 'build/posix/**'
+      - 'patches/**'
+      - 'assets/fonts/**'
+      - 'tools/*upstream_cache.py'
+      - 'tools/upstream_object_cache.py'
+      - 'tools/upstream_script_identity.py'
+      - 'tools/apply_restored_patches.py'
+      - 'tools/prepare_restored_build.py'
+      - 'tools/restore_ninja.py'
+      - 'tools/bootstrap_gn.py'
+      - 'tools/restored_reuse_evidence.py'
+      - 'tools/verify_linux_bundle.py'
+      - 'sdk/python/chromix/_binary.py'
+      - 'tools/gen_posix_workflow.py'
+      - 'tools/merge_gn_args.py'
+      - '.github/workflows/build-linux-arm64.yml'
+      - '.github/workflows/build-posix-github.yml'
+      - 'CHROMIUM_VERSION'
+      - 'UNGOOGLED_VERSION'
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: build-linux-arm64-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Linux arm64 (x64-host build + native smoke)
+    uses: ./.github/workflows/build-posix-github.yml
+    with:
+      platform: linux
+      arch: arm64
+      runner: ${{ github.event_name == 'workflow_dispatch' && !inputs.use_upstream_cache && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+      artifact: chromix-linux-arm64
+      max-stages: 8
+      use_upstream_cache: ${{ github.event_name != 'workflow_dispatch' || inputs.use_upstream_cache }}
+    secrets: inherit

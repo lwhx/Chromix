@@ -5,7 +5,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 PACKAGE_MACOS = REPO / "build" / "macos" / "package-macos.sh"
 PREPARE = REPO / "build" / "prepare-ungoogled.sh"
-WORKFLOW = REPO / ".github" / "workflows" / "build-cross-platform.yml"
+WORKFLOWS = REPO / ".github" / "workflows"
 REVISIONS = REPO / "build" / "ungoogled-revisions.psd1"
 
 
@@ -45,7 +45,8 @@ class CrossPlatformBuildRegressionTest(unittest.TestCase):
         )
 
     def test_workflow_matches_sdk_asset_names(self):
-        source = WORKFLOW.read_text(encoding="utf-8")
+        source = "\n".join((WORKFLOWS / f"build-{platform}-{arch}.yml").read_text()
+                           for platform in ("linux", "macos") for arch in ("x64", "arm64"))
         posix_workflow = REPO / ".github" / "workflows" / "build-posix-github.yml"
         posix_source = posix_workflow.read_text(encoding="utf-8")
         for asset in (
@@ -63,16 +64,15 @@ class CrossPlatformBuildRegressionTest(unittest.TestCase):
         self.assertNotIn("macos-14", source)
         self.assertIn("actions/cache@v4", posix_source)
         self.assertIn("download_cache", posix_source)
-        self.assertIn("./.github/workflows/build-win-x64-github.yml", source)
-        self.assertIn("12-stage snapshot/resume", source)
+        self.assertIn("build-12:", (WORKFLOWS / "build-win-x64-github.yml").read_text())
         self.assertIn("8-stage snapshot/resume", source)
         self.assertIn(".github/workflows/build-posix-github.yml", source)
 
     def test_linux_arm64_cross_build_requires_same_run_native_verification(self):
         import yaml
 
-        workflow = yaml.safe_load(WORKFLOW.read_text())
-        build = workflow["jobs"]["linux-arm64"]
+        workflow = yaml.safe_load((WORKFLOWS / 'build-linux-arm64.yml').read_text())
+        build = workflow["jobs"]["build"]
         self.assertIn("!inputs.use_upstream_cache && 'ubuntu-24.04-arm' || 'ubuntu-24.04'", build["with"]["runner"])
         self.assertEqual(build["with"]["arch"], "arm64")
         posix = yaml.safe_load((REPO / ".github/workflows/build-posix-github.yml").read_text())

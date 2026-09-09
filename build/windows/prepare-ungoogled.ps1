@@ -20,7 +20,9 @@ $Ungoogled = Join-Path $Tooling "ungoogled-chromium"
 $Windows = Join-Path $Tooling "ungoogled-chromium-windows"
 $DownloadCache = Join-Path $Root "download_cache"
 $Src = Join-Path $Root "src"
-$PatchExe = Join-Path $Src "third_party\git\usr\bin\patch.exe"
+$PatchExe = ""
+$PatchSafetyOptions = @("--fuzz=0", "--binary", "--get=0", "--no-backup-if-mismatch", "--reject-file=-")
+$env:PATCH_GET = "0"
 $Python = (Get-Command python.exe -ErrorAction Stop).Source
 
 function Get-RemainingMinutes {
@@ -166,16 +168,16 @@ function Invoke-ChromixPatches(
         }
         if ($ResumePatchIsClean) {
           Assert-Budget "$PatchExe -p1 --batch --forward -i $patch"
-          & $PatchExe -p1 --batch --forward -i $patch
+          & $PatchExe -p1 --batch --forward -i $patch @PatchSafetyOptions
           if ($LASTEXITCODE -ne 0) {
             throw "$PatchExe failed to apply rolled-back patch $rel"
           }
           Write-Host "      rolled-back patch applied"
         } else {
           Assert-Budget "$PatchExe -p1 --batch --forward --dry-run -i $patch"
-          & $PatchExe -p1 --batch --forward --dry-run -i $patch | Out-Null
+          & $PatchExe -p1 --batch --forward --dry-run -i $patch @PatchSafetyOptions | Out-Null
           if ($LASTEXITCODE -eq 0) {
-            & $PatchExe -p1 --batch --forward -i $patch
+            & $PatchExe -p1 --batch --forward -i $patch @PatchSafetyOptions
             if ($LASTEXITCODE -ne 0) {
               throw "$PatchExe failed to apply interrupted patch $rel"
             }
@@ -185,17 +187,17 @@ function Invoke-ChromixPatches(
               throw "interrupted patch content changed and the new patch cannot apply cleanly: $rel"
             }
             Assert-Budget "$PatchExe -p1 --batch --reverse --dry-run -i $patch"
-            & $PatchExe -p1 --batch --reverse --dry-run -i $patch | Out-Null
+            & $PatchExe -p1 --batch --reverse --dry-run -i $patch @PatchSafetyOptions | Out-Null
             if ($LASTEXITCODE -eq 0) {
               Write-Host "      interrupted patch was already complete"
             } else {
               Assert-Budget "$PatchExe -p1 --batch --reverse --force -i $patch"
-              & $PatchExe -p1 --batch --reverse --force -i $patch | Out-Null
-              & $PatchExe -p1 --batch --forward --dry-run -i $patch | Out-Null
+              & $PatchExe -p1 --batch --reverse --force -i $patch @PatchSafetyOptions | Out-Null
+              & $PatchExe -p1 --batch --forward --dry-run -i $patch @PatchSafetyOptions | Out-Null
               if ($LASTEXITCODE -ne 0) {
                 throw "$PatchExe could not roll back interrupted patch $rel"
               }
-              & $PatchExe -p1 --batch --forward -i $patch
+              & $PatchExe -p1 --batch --forward -i $patch @PatchSafetyOptions
               if ($LASTEXITCODE -ne 0) {
                 throw "$PatchExe failed to reapply interrupted patch $rel"
               }
@@ -206,7 +208,7 @@ function Invoke-ChromixPatches(
         $resuming = $false
       } else {
         Assert-Budget "$PatchExe -p1 --batch --forward -i $patch"
-        & $PatchExe -p1 --batch --forward -i $patch
+        & $PatchExe -p1 --batch --forward -i $patch @PatchSafetyOptions
         if ($LASTEXITCODE -ne 0) {
           throw "$PatchExe failed to apply $rel"
         }
@@ -222,12 +224,43 @@ function Invoke-ChromixPatches(
 }
 
 function Resolve-HostPatch {
-  $command = Get-Command patch.exe -ErrorAction SilentlyContinue
-  if ($command) { return $command.Source }
-  $gitPath = (Get-Command git.exe -ErrorAction Stop).Source
-  $path = Join-Path (Split-Path (Split-Path $gitPath)) "usr\bin\patch.exe"
-  if (Test-Path -LiteralPath $path -PathType Leaf) { return $path }
-  throw "GNU patch.exe from the host Git installation is required for restored source"
+  $candidates = [Collections.Generic.List[string]]::new()
+  foreach ($gitCommand in @(Get-Command git.exe -All -ErrorAction SilentlyContinue)) {
+    if ([string]::IsNullOrWhiteSpace($gitCommand.Source)) { continue }
+    $directory = Split-Path $gitCommand.Source
+    foreach ($root in @($directory, (Split-Path $directory), (Split-Path (Split-Path $directory)))) {
+      if (-not [string]::IsNullOrWhiteSpace($root)) {
+        $candidates.Add((Join-Path $root "usr\bin\patch.exe"))
+      }
+    }
+  }
+  foreach ($base in @($env:ProgramW6432, $env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+    if (-not [string]::IsNullOrWhiteSpace($base)) {
+      $candidates.Add((Join-Path $base "Git\usr\bin\patch.exe"))
+    }
+  }
+  foreach ($command in @(Get-Command patch.exe -ErrorAction SilentlyContinue -All)) {
+    if (-not [string]::IsNullOrWhiteSpace($command.Source)) { $candidates.Add($command.Source) }
+  }
+  $candidates = @($candidates | Select-Object -Unique | Where-Object {
+    Test-Path -LiteralPath $_ -PathType Leaf
+  })
+  if ($candidates.Count -eq 0) { throw "no host patch.exe candidates; install Git for Windows" }
+  $probeArgs = @(
+    (Join-Path $Repo "tools\apply_restored_patches.py"), "--select-patch-bin",
+    "--src", $Src, "--repo", $Repo, "--core", $Ungoogled,
+    "--platform-tooling", $Windows, "--platform", "windows", "--patch-bin", $candidates[0]
+  )
+  foreach ($candidate in $candidates | Select-Object -Skip 1) {
+    $probeArgs += @("--patch-candidate", $candidate)
+  }
+  Assert-Budget "host patch capability probe"
+  $selected = @(& $Python @probeArgs)
+  if ($LASTEXITCODE -ne 0 -or $selected.Count -ne 1 -or [string]::IsNullOrWhiteSpace($selected[0])) {
+    throw "no compatible host patch.exe passed the capability probe"
+  }
+  Write-Host "==> verified host patch: $($selected[0])"
+  return $selected[0]
 }
 
 function Assert-RestoredToolchain {
@@ -337,6 +370,7 @@ if (Test-Path $readyMarker) {
     return
   }
 }
+if (-not $RestoredUpstream) { $PatchExe = Resolve-HostPatch }
 $resumeChromixPatch = ""
 $resumeChromixPatchHash = ""
 $resumeChromixPatchIsClean = $false
@@ -365,9 +399,9 @@ if (Test-Path (Join-Path $Src ".chromix-layer-in-progress")) {
         Assert-Budget "$PatchExe -p1 --batch --forward -i $legacyRollback"
         Push-Location $Src
         try {
-          & $PatchExe -p1 --batch --forward -i $legacyRollback
+          & $PatchExe -p1 --batch --forward -i $legacyRollback @PatchSafetyOptions
           if ($LASTEXITCODE -ne 0) {
-            & $PatchExe -p1 --batch --reverse --dry-run -i $legacyRollback | Out-Null
+            & $PatchExe -p1 --batch --reverse --dry-run -i $legacyRollback @PatchSafetyOptions | Out-Null
             if ($LASTEXITCODE -ne 0) {
               throw "$PatchExe failed to roll back the legacy interrupted WebGL patch"
             }
@@ -466,7 +500,9 @@ if (-not (Test-Marker ".chromix-source-unpacked" $Revisions.ChromiumVersion)) {
     "-c", $DownloadCache, "-i", (Join-Path $Windows "downloads.ini"),
     "--7z-path", "_use_registry", $Src
   )
-  if (-not (Test-Path $PatchExe)) { throw "GNU patch.exe missing after Windows downloads: $PatchExe" }
+  if (-not (Test-Path (Join-Path $Src "third_party\git\usr\bin\patch.exe"))) {
+    throw "GNU patch.exe missing after Windows downloads"
+  }
   foreach ($tool in @(
     (Join-Path $Src "third_party\ninja\ninja.exe"),
     (Join-Path $Src "third_party\node\win\node.exe"),

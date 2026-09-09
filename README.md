@@ -1,16 +1,20 @@
 # Chromix
 
 [![Windows x64 build](https://github.com/xiaozhou26/Chromix/actions/workflows/build-win-x64-github.yml/badge.svg)](https://github.com/xiaozhou26/Chromix/actions/workflows/build-win-x64-github.yml)
-[![Cross-platform build](https://github.com/xiaozhou26/Chromix/actions/workflows/build-cross-platform.yml/badge.svg)](https://github.com/xiaozhou26/Chromix/actions/workflows/build-cross-platform.yml)
+[![Linux x64 build](https://github.com/xiaozhou26/Chromix/actions/workflows/build-linux-x64.yml/badge.svg)](https://github.com/xiaozhou26/Chromix/actions/workflows/build-linux-x64.yml)
+[![Linux ARM64 build](https://github.com/xiaozhou26/Chromix/actions/workflows/build-linux-arm64.yml/badge.svg)](https://github.com/xiaozhou26/Chromix/actions/workflows/build-linux-arm64.yml)
+[![macOS Intel build](https://github.com/xiaozhou26/Chromix/actions/workflows/build-macos-x64.yml/badge.svg)](https://github.com/xiaozhou26/Chromix/actions/workflows/build-macos-x64.yml)
+[![macOS ARM build](https://github.com/xiaozhou26/Chromix/actions/workflows/build-macos-arm64.yml/badge.svg)](https://github.com/xiaozhou26/Chromix/actions/workflows/build-macos-arm64.yml)
 [![GitHub release](https://img.shields.io/github/v/release/xiaozhou26/Chromix?display_name=tag)](https://github.com/xiaozhou26/Chromix/releases)
 
 Chromix is a Chromium-based browser build focused on presenting a coherent,
 per-launch browser persona across JavaScript-visible surfaces. It is built on
 pinned `ungoogled-chromium` sources and the matching Windows/Linux/macOS platform
 layer, then adds a reviewed Chromium 152 patch series and lightweight Python and
-Node SDKs. The unified cross-platform workflow builds Windows x64, Linux
-x64/arm64, and macOS x64/arm64; Releases are published only after all five ZIP
-bundles pass checksum, extraction, version, and headless smoke checks.
+Node SDKs. Five independent workflows build Windows x64, Linux x64/arm64,
+and macOS x64/arm64. Releases require all five workflows to succeed for the
+same source commit and all five ZIP bundles to pass checksum, extraction,
+version, and headless smoke checks.
 
 > Chromix is intended for browser automation, compatibility testing, privacy
 > research, and controlled fingerprinting experiments. A custom browser does
@@ -40,7 +44,7 @@ bundles pass checksum, extraction, version, and headless smoke checks.
 
 Prebuilt **Windows x64, Linux x64/arm64, and macOS x64/arm64** packages are
 published on the [GitHub Releases page](https://github.com/xiaozhou26/Chromix/releases)
-after the unified `build-cross-platform` workflow succeeds for all five targets.
+after all five independent platform workflows succeed for the same source commit.
 Every browser bundle is a ZIP accompanied by `SHA256SUMS`. macOS bundles remain
 unsigned and are not notarized because Apple signing credentials are not part of
 this build.

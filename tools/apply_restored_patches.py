@@ -26,6 +26,8 @@ LITE = "build/windows/lite-tarball-files"
 CLEAN = "Use a clean workdir restored from upstream; do not remove markers and retry."
 HUNK = re.compile(rb"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@[^\n]*\n")
 HEX = re.compile(r"[0-9a-f]{64}")
+PATCH_OPTIONS = ("-p1", "--fuzz=0", "--batch", "--forward", "--binary",
+                 "--get=0", "--no-backup-if-mismatch", "--reject-file=-")
 
 
 class ApplyError(RuntimeError):
@@ -308,14 +310,78 @@ def _atomic_write(path: Path, data: bytes, mode: int = 0o644,
             os.unlink(temporary)
 
 
+def _patch_command(program: str, patch_file: Path, *options: str) -> list[str]:
+    return [program, *PATCH_OPTIONS, *options, "--input", str(patch_file)]
+
+
+def _patch_environment() -> dict[str, str]:
+    return dict(os.environ, LC_ALL="C", PATCH_GET="0")
+
+
+def _probe_patch(program: str, donor_roots: tuple[Path, ...]) -> None:
+    """Exercise the exact application options without touching source or receipts."""
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    if any(temp_root.is_relative_to(root) for root in donor_roots):
+        raise ApplyError("patch probe temporary directory must be outside SRC/tooling")
+    with tempfile.TemporaryDirectory(prefix="chromix patch probe ", dir=temp_root) as temporary:
+        scratch = Path(temporary)
+        stage = scratch / "source tree"
+        stage.mkdir()
+        source = stage / "probe.txt"
+        original = b"context\r\nold\r\ntail\r\n"
+        expected = b"context\r\nnew\r\ntail\r\n"
+        patch_file = scratch / "tiny change.patch"
+        patch_file.write_bytes(
+            b"diff --git a/probe.txt b/probe.txt\n--- a/probe.txt\n+++ b/probe.txt\n"
+            b"@@ -1,3 +1,3 @@\n context\r\n-old\r\n+new\r\n tail\r\n")
+        source.write_bytes(original)
+        steps = (
+            ("dry-run", ("--dry-run",), 0, original),
+            ("apply", (), 0, expected),
+            ("duplicate forward", (), 1, expected),
+            ("reverse dry-run", ("--reverse", "--dry-run"), 0, expected),
+            ("reverse", ("--reverse",), 0, original),
+            ("reject fuzz", ("--dry-run",), 1, original.replace(b"context", b"mismatch")),
+        )
+        for label, options, code, content in steps:
+            if label == "reject fuzz":
+                source.write_bytes(content)
+            try:
+                result = subprocess.run(
+                    _patch_command(program, patch_file, *options), cwd=stage,
+                    env=_patch_environment(), stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False, timeout=10)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise ApplyError(f"patch capability probe failed ({label}): {program}: {exc}") from exc
+            if (result.returncode != code or not source.is_file()
+                    or source.read_bytes() != content or set(stage.iterdir()) != {source}):
+                detail = result.stdout.decode("utf-8", errors="replace").strip()
+                raise ApplyError(f"patch capability probe failed ({label}): {program} "
+                                 f"(exit {result.returncode}, expected {code})\n{detail}")
+
+
 def _patch_program(patch_bin: str | Path, donor_roots: tuple[Path, ...]) -> str:
+    if not str(patch_bin).strip():
+        raise ApplyError("patch binary path is empty or whitespace")
     found = shutil.which(str(patch_bin))
     if not found:
         raise ApplyError(f"patch binary not executable: {patch_bin}")
     path = Path(found).resolve()
     if any(path.is_relative_to(root) for root in donor_roots):
         raise ApplyError(f"refusing to execute donor code as patch binary: {path}")
+    _probe_patch(str(path), donor_roots)
     return str(path)
+
+
+def select_patch_program(candidates: list[str], donor_roots: tuple[Path, ...]) -> str:
+    failures = []
+    for candidate in dict.fromkeys(candidates):
+        try:
+            return _patch_program(candidate, donor_roots)
+        except ApplyError as exc:
+            failures.append(str(exc))
+    raise ApplyError("no compatible host patch binary passed the capability probe:\n"
+                     + "\n".join(failures))
 
 
 def run_apply(src: Path | str, repo: Path | str, core: Path | str,
@@ -376,7 +442,7 @@ def run_apply(src: Path | str, repo: Path | str, core: Path | str,
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
             os.chmod(path, mode | stat.S_IWUSR)
-        environment = dict(os.environ, LC_ALL="C", PATCH_GET="0")
+        environment = _patch_environment()
         for number, (name, data, entries) in enumerate(patches):
             for target, action, _ in entries:
                 path = _path(stage, target)
@@ -386,9 +452,7 @@ def run_apply(src: Path | str, repo: Path | str, core: Path | str,
                     raise ApplyError(f"unknown/missing patch path: {target}. {CLEAN}")
             patch_file = scratch / f"{number:04d}.patch"
             patch_file.write_bytes(data)
-            command = [program, "-p1", "--fuzz=0", "--batch", "--forward", "--binary",
-                       "--get=0", "--no-backup-if-mismatch", "--reject-file=-",
-                       "--input", str(patch_file)]
+            command = _patch_command(program, patch_file)
             result = subprocess.run(command, cwd=stage, env=environment, stdin=subprocess.DEVNULL,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
             if result.returncode:
@@ -432,12 +496,23 @@ def run_apply(src: Path | str, repo: Path | str, core: Path | str,
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    for flag in ("src", "repo", "core", "platform-tooling", "patch-bin"):
+    for flag in ("src", "repo", "core", "platform-tooling"):
         parser.add_argument(f"--{flag}", type=Path, required=True)
+    parser.add_argument("--patch-bin", required=True)
+    parser.add_argument("--patch-candidate", action="append", default=[],
+                        help="fallback executable for --select-patch-bin (repeatable)")
+    parser.add_argument("--select-patch-bin", action="store_true",
+                        help="probe candidates and print the compatible host executable only")
     parser.add_argument("--platform", choices=("linux", "macos", "windows"), required=True)
     parser.add_argument("--check", action="store_true", help="verify completion without changing SRC")
     args = parser.parse_args(argv)
+    if (args.patch_candidate and not args.select_patch_bin) or (args.select_patch_bin and args.check):
+        parser.error("patch candidates require --select-patch-bin without --check")
     try:
+        if args.select_patch_bin:
+            roots = tuple(p.resolve() for p in (args.src, args.core, args.platform_tooling))
+            print(select_patch_program([args.patch_bin, *args.patch_candidate], roots))
+            return 0
         result = run_apply(args.src, args.repo, args.core, args.platform_tooling,
                            args.platform, args.patch_bin, check=args.check)
     except (ApplyError, OSError, UnicodeError, re.error) as exc:

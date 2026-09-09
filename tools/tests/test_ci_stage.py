@@ -735,7 +735,7 @@ class ResumeWorkflowRegressionTest(unittest.TestCase):
         self.assertIn("GH_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_TOKEN || github.token }}", self.source)
         self.assertIn("UPSTREAM_RUN_ID: ${{ inputs.upstream_run_id }}", self.source)
         self.assertEqual(self.source.count("UseUpstreamCache ="), 1)
-        self.assertIn("CHROMIX_USE_UPSTREAM_CACHE: ${{ (inputs.use_upstream_cache || inputs.upstream_run_id != '') && '1' || '0' }}", self.source)
+        self.assertIn("CHROMIX_USE_UPSTREAM_CACHE: ${{ (github.event_name == 'push' || inputs.use_upstream_cache || inputs.upstream_run_id != '') && '1' || '0' }}", self.source)
         self.assertIn("-ValidateOnly -UpstreamRunId $env:UPSTREAM_RUN_ID", self.source)
         self.assertNotIn("-UpstreamArtifactPath", self.source)
 

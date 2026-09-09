@@ -84,6 +84,10 @@ def test_tiny_patch_context_removal_addition_and_metadata(tmp_path, monkeypatch)
         temporary_patch = Path(command[-1])
         assert not temporary_patch.is_relative_to(fx.repo)
         assert not temporary_patch.is_relative_to(fx.src)
+        assert kwargs["env"]["PATCH_GET"] == "0"
+        if "chromix patch probe " in str(temporary_patch):
+            assert kwargs["timeout"] == 10
+            return subprocess_run(command, **kwargs)
         transformed = temporary_patch.read_bytes()
         expected = original.replace(b" context example.com", b" context blocked.test")
         expected = expected.replace(b"-old example.com", b"-old blocked.test")
@@ -96,7 +100,7 @@ def test_tiny_patch_context_removal_addition_and_metadata(tmp_path, monkeypatch)
     assert result["status"] == "applied"
     assert result["changed_files"] == ["listed.txt"]
     assert result["patch_count"] == 1
-    assert len(commands) == 1
+    assert len(commands) == 7
     assert (fx.src / "listed.txt").read_bytes() == EXPECTED
     assert (fx.repo / "patches/0001.patch").read_bytes() == original
     assert (fx.repo / "patches/0001.patch").stat().st_mtime_ns == patch_mtime
@@ -470,3 +474,191 @@ def test_real_series_parses_without_donor_execution():
         assert transformed == raw
         assert entries
     assert len(names) == 110
+
+
+def patch_stub(root, name, *, compatible):
+    if os.name == "nt":
+        pytest.skip("POSIX executable fixture; native Windows uses installed patch.exe")
+    log = root / (name.replace("/", "_") + ".jsonl")
+    program = put(root, name, (
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        f"with open({str(log)!r}, 'a') as output:\n"
+        "    output.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        "    print('GNU patch fixture')\n"
+        "    raise SystemExit(0)\n"
+        "assert '--get=0' in sys.argv and '--fuzz=0' in sys.argv\n"
+        "assert os.environ['PATCH_GET'] == '0'\n"
+        + (f"os.execv({PATCH_BIN!r}, [{PATCH_BIN!r}, *sys.argv[1:]])\n" if compatible else
+           "print(\"patch.exe: option `--get' doesn't allow an argument\")\nraise SystemExit(2)\n")
+    ).encode())
+    program.chmod(0o755)
+    return program, log
+
+
+def test_strawberry_version_success_is_not_capability_and_fallback_is_probed(tmp_path):
+    fx = Fixture(tmp_path / "work space")
+    bad, bad_log = patch_stub(tmp_path, "Strawberry/c/bin/patch.exe", compatible=False)
+    good, good_log = patch_stub(tmp_path, "Compatible Git/usr/bin/patch.exe", compatible=True)
+    assert subprocess.run([str(bad), "--version"], capture_output=True).returncode == 0
+    roots = (fx.src, fx.core, fx.tooling)
+    selected = arp.select_patch_program([str(bad), str(good)], roots)
+    assert selected == str(good)
+    assert "--get=0" in bad_log.read_text()
+    assert len(good_log.read_text().splitlines()) == 6
+    assert not list(fx.src.glob(".chromix*"))
+    assert fx.run(patch_bin=selected)["status"] == "applied"
+    count = len(good_log.read_text().splitlines())
+    assert fx.run(patch_bin=selected)["status"] == "skipped"
+    assert fx.run(patch_bin=selected, check=True)["status"] == "checked"
+    assert len(good_log.read_text().splitlines()) == count
+
+
+def test_no_compatible_tool_fails_before_source_or_progress_writes(tmp_path):
+    fx = Fixture(tmp_path / "work")
+    bad, _ = patch_stub(tmp_path, "Strawberry/c/bin/patch.exe", compatible=False)
+    before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in fx.src.rglob("*") if p.is_file()}
+    with pytest.raises(arp.ApplyError, match="no compatible host patch.*"):
+        arp.select_patch_program([str(bad)], (fx.src, fx.core, fx.tooling))
+    with pytest.raises(arp.ApplyError, match="doesn't allow an argument"):
+        fx.run(patch_bin=bad)
+    assert not list(fx.src.glob(".chromix*"))
+    assert {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in before} == before
+
+
+@pytest.mark.parametrize("candidate", ["", " ", "\t", "missing patch.exe"])
+def test_empty_whitespace_and_missing_patch_paths_fail_before_progress(tmp_path, candidate):
+    fx = Fixture(tmp_path)
+    with pytest.raises(arp.ApplyError, match="patch binary"):
+        fx.run(patch_bin=candidate)
+    command = [sys.executable, arp.__file__, "--src", str(fx.src), "--repo", str(fx.repo),
+               "--core", str(fx.core), "--platform-tooling", str(fx.tooling),
+               "--platform", "windows", "--patch-bin", candidate]
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode == 1, result.stderr
+    assert "patch binary" in result.stderr
+    assert not list(fx.src.glob(".chromix*"))
+    assert (fx.src / "listed.txt").read_bytes() == RESTORED
+
+
+def test_empty_executable_is_rejected_and_compatible_fallback_is_used(tmp_path):
+    empty = put(tmp_path, "empty patch.exe", b"")
+    empty.chmod(0o755)
+    assert arp.select_patch_program([str(empty), PATCH_BIN], ()) == str(Path(PATCH_BIN).resolve())
+
+
+@pytest.mark.parametrize("failure", ["no-op", "ignores-fuzz", "timeout"])
+def test_probe_rejects_false_success_ignored_safety_and_timeout(tmp_path, monkeypatch, failure):
+    fx = Fixture(tmp_path)
+    real_run = arp.subprocess.run
+
+    def incompatible(command, **kwargs):
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        if failure == "no-op":
+            return subprocess.CompletedProcess(command, 0, b"GNU patch fixture\n")
+        return real_run([arg for arg in command if arg != "--fuzz=0"], **kwargs)
+
+    monkeypatch.setattr(arp.subprocess, "run", incompatible)
+    with pytest.raises(arp.ApplyError, match="capability probe failed"):
+        fx.run()
+    assert not list(fx.src.glob(".chromix*"))
+    assert (fx.src / "listed.txt").read_bytes() == RESTORED
+
+
+def test_selector_never_executes_donor_fallback(tmp_path):
+    fx = Fixture(tmp_path)
+    donor, log = patch_stub(fx.core, "patch.exe", compatible=True)
+    selected = arp.select_patch_program([str(donor), PATCH_BIN], (fx.src, fx.core, fx.tooling))
+    assert selected == str(Path(PATCH_BIN).resolve())
+    assert not log.exists()
+
+
+def resolve_host_patch(tmp_path, git_paths, patch_paths, *, program_files=""):
+    pwsh = shutil.which("pwsh")
+    if not pwsh:
+        pytest.skip("PowerShell is required")
+    repo = Path(__file__).resolve().parents[2]
+    source = (repo / "build/windows/prepare-ungoogled.ps1").read_text()
+    resolver = source[source.index("function Resolve-HostPatch"):source.index("function Assert-RestoredToolchain")]
+    script = put(tmp_path, "resolve.ps1", (r'''
+$ErrorActionPreference = "Stop"
+$Repo = $env:PROBE_REPO
+$Src = Join-Path $env:PROBE_ROOT "src"
+$Ungoogled = Join-Path $env:PROBE_ROOT "core"
+$Windows = Join-Path $env:PROBE_ROOT "windows"
+$Python = $env:PROBE_PYTHON
+function Assert-Budget([string]$Step) {}
+function Get-Command {
+  param([string]$Name, [switch]$All, [string]$ErrorAction)
+  $paths = if ($Name -eq "git.exe") { $env:PROBE_GITS } else { $env:PROBE_PATCHES }
+  foreach ($path in ($paths | ConvertFrom-Json)) { [pscustomobject]@{ Source = $path } }
+}
+''' + resolver + "\nResolve-HostPatch\n").encode())
+    environment = dict(os.environ, PROBE_REPO=str(repo), PROBE_ROOT=str(tmp_path),
+                       PROBE_PYTHON=sys.executable, PROBE_GITS=json.dumps(git_paths),
+                       PROBE_PATCHES=json.dumps(patch_paths), ProgramW6432="",
+                       ProgramFiles=program_files)
+    environment["ProgramFiles(x86)"] = ""
+    return subprocess.run([pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)],
+                          env=environment, capture_output=True, text=True, timeout=30)
+
+
+@pytest.mark.parametrize("git_directory", ["cmd", "bin", "mingw64/bin"])
+def test_windows_resolver_prefers_git_over_strawberry_in_path(tmp_path, git_directory):
+    bad, bad_log = patch_stub(tmp_path, "Strawberry/c/bin/patch.exe", compatible=False)
+    good, good_log = patch_stub(tmp_path, "Program Files/Git/usr/bin/patch.exe", compatible=True)
+    git = tmp_path / "Program Files/Git" / git_directory / "git.exe"
+    result = resolve_host_patch(tmp_path, ["", " ", str(git)], [str(bad)])
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.splitlines()[-1] == str(good)
+    assert len(good_log.read_text().splitlines()) == 6
+    assert not bad_log.exists()
+
+
+def test_windows_resolver_probes_rejected_path_tool_then_compatible_alternative(tmp_path):
+    bad, bad_log = patch_stub(tmp_path, "Strawberry/c/bin/patch.exe", compatible=False)
+    good, good_log = patch_stub(tmp_path, "Alternate Tools/patch.exe", compatible=True)
+    result = resolve_host_patch(tmp_path, [], ["", " ", str(bad), str(good)])
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.splitlines()[-1] == str(good)
+    assert len(bad_log.read_text().splitlines()) == 1
+    assert len(good_log.read_text().splitlines()) == 6
+
+
+def test_windows_resolver_finds_standard_git_with_empty_command_sources(tmp_path):
+    good, log = patch_stub(tmp_path, "Program Files/Git/usr/bin/patch.exe", compatible=True)
+    result = resolve_host_patch(tmp_path, ["", " "], ["", " "], program_files=str(tmp_path / "Program Files"))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.splitlines()[-1] == str(good)
+    assert len(log.read_text().splitlines()) == 6
+
+
+@pytest.mark.parametrize("has_bad_tool", [False, True])
+def test_windows_resolver_without_compatible_alternative_fails_early(tmp_path, has_bad_tool):
+    paths = ["", " "]
+    if has_bad_tool:
+        bad, _ = patch_stub(tmp_path, "Strawberry/c/bin/patch.exe", compatible=False)
+        paths.append(str(bad))
+    result = resolve_host_patch(tmp_path, [], paths)
+    assert result.returncode != 0
+    message = "no compatible host patch" if has_bad_tool else "no host patch.exe candidates"
+    assert message in result.stderr
+    assert not (tmp_path / "src").exists()
+
+
+def test_cold_and_restored_use_same_probed_host_selector_and_keep_safety_options():
+    repo = Path(__file__).resolve().parents[2]
+    source = (repo / "build/windows/prepare-ungoogled.ps1").read_text()
+    cold = source.index("if (-not $RestoredUpstream) { $PatchExe = Resolve-HostPatch }")
+    assert cold < source.index('$resumeChromixPatch = ""') < source.index("Ensure-Checkout \"")
+    assert '$RestoredPatchExe = Resolve-HostPatch' in source
+    assert '"--patch-bin", $PatchExe' in source
+    assert '"--patch-bin", $RestoredPatchExe' in source
+    assert '$env:PATCH_GET = "0"' in source
+    for option in ("--fuzz=0", "--binary", "--get=0", "--no-backup-if-mismatch", "--reject-file=-"):
+        assert f'"{option}"' in source
+    commands = [line for line in source.splitlines() if "& $PatchExe " in line]
+    assert commands
+    assert all("@PatchSafetyOptions" in line for line in commands)

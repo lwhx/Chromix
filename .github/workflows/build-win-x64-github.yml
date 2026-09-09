@@ -7,6 +7,26 @@
 name: build-win-x64-github
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'build/*'
+      - 'build/windows/**'
+      - 'patches/**'
+      - 'assets/fonts/**'
+      - 'tools/*upstream_cache.py'
+      - 'tools/upstream_object_cache.py'
+      - 'tools/upstream_script_identity.py'
+      - 'tools/apply_restored_patches.py'
+      - 'tools/prepare_restored_build.py'
+      - 'tools/restore_ninja.py'
+      - 'tools/bootstrap_gn.py'
+      - 'tools/restored_reuse_evidence.py'
+      - 'tools/merge_gn_args.py'
+      - '.github/workflows/build-win-x64-github.yml'
+      - 'CHROMIUM_VERSION'
+      - 'UNGOOGLED_VERSION'
+      - 'UNGOOGLED_WINDOWS_VERSION'
   workflow_call:
     inputs:
       resume_run_id:
@@ -77,12 +97,11 @@ permissions:
   actions: read
 
 concurrency:
-  # Keep direct Windows retries separate from the nested job in the unified run.
-  group: build-win-x64-github-${{ github.workflow }}
+  group: build-win-x64-github-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  CHROMIX_USE_UPSTREAM_CACHE: ${{ (inputs.use_upstream_cache || inputs.upstream_run_id != '') && '1' || '0' }}
+  CHROMIX_USE_UPSTREAM_CACHE: ${{ (github.event_name == 'push' || inputs.use_upstream_cache || inputs.upstream_run_id != '') && '1' || '0' }}
   DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
   DEPOT_TOOLS_METRICS: '0'
   DEPOT_TOOLS_COLLECT_METRICS: '0'
@@ -133,7 +152,7 @@ jobs:
         shell: powershell
         env:
           GH_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_TOKEN || github.token }}
-          USE_UPSTREAM_CACHE: ${{ inputs.use_upstream_cache }}
+          USE_UPSTREAM_CACHE: ${{ github.event_name == 'push' || inputs.use_upstream_cache }}
           UPSTREAM_RUN_ID: ${{ inputs.upstream_run_id }}
         run: |
           $stageArgs = @{

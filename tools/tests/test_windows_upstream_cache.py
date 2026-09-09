@@ -221,7 +221,7 @@ class WindowsUpstreamCacheRegressionTest(unittest.TestCase):
         import yaml
 
         workflow = yaml.safe_load(self.workflow)
-        required = "${{ (inputs.use_upstream_cache || inputs.upstream_run_id != '') && '1' || '0' }}"
+        required = "${{ (github.event_name == 'push' || inputs.use_upstream_cache || inputs.upstream_run_id != '') && '1' || '0' }}"
         self.assertEqual(workflow['env']['CHROMIX_USE_UPSTREAM_CACHE'], required)
         for job in workflow['jobs'].values():
             self.assertNotIn('CHROMIX_USE_UPSTREAM_CACHE', job.get('env', {}))
@@ -263,7 +263,7 @@ class WindowsUpstreamCacheRegressionTest(unittest.TestCase):
         for run in runs:
             self.assertNotIn("${{", run)
         self.assertIn("UPSTREAM_RUN_ID: ${{ inputs.upstream_run_id }}", self.build_one)
-        self.assertIn("USE_UPSTREAM_CACHE: ${{ inputs.use_upstream_cache }}", self.build_one)
+        self.assertIn("USE_UPSTREAM_CACHE: ${{ github.event_name == 'push' || inputs.use_upstream_cache }}", self.build_one)
         self.assertIn("GH_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_TOKEN || github.token }}", self.build_one)
         self.assertIn(r"[ValidatePattern('\A[0-9]*\z')] [string]$UpstreamRunId", self.stage)
         self.assertIn('if ($UpstreamRunId) { $fetchArgs += @("--run-id", $UpstreamRunId) }', self.cache)

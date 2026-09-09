@@ -46,7 +46,6 @@ on:
     secrets:
       UPSTREAM_ACTIONS_TOKEN:
         required: false
-  workflow_dispatch:
 
 permissions:
   contents: read

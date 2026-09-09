@@ -17,7 +17,8 @@ CI_STAGE = REPO / "build" / "posix" / "ci-stage.sh"
 CI_PARTS = REPO / "build" / "posix" / "ci-parts.sh"
 GEN_WORKFLOW = REPO / "tools" / "gen_posix_workflow.py"
 WORKFLOW = REPO / ".github" / "workflows" / "build-posix-github.yml"
-MAIN_WORKFLOW = REPO / ".github" / "workflows" / "build-cross-platform.yml"
+ENTRY_WORKFLOWS = [REPO / '.github/workflows' / f'build-{platform}-{arch}.yml'
+                   for platform in ('linux', 'macos') for arch in ('x64', 'arm64')]
 BASH32 = Path(os.path.expanduser("~/.local/bash-3.2-for-ci/bash"))
 
 
@@ -588,16 +589,13 @@ class GenPosixWorkflowTest(unittest.TestCase):
             logs = next(s for s in steps if s.get("name") == "Upload build diagnostics")
             self.assertEqual(logs["if"], "always()")
 
-    def test_main_workflow_references_posix_reusable_jobs(self):
-        source = MAIN_WORKFLOW.read_text(encoding="utf-8")
-        for artifact in ("chromix-linux-x64", "chromix-linux-arm64",
-                         "chromix-mac-x64", "chromix-mac-arm64"):
-            self.assertIn(artifact, source)
-        self.assertIn("./.github/workflows/build-posix-github.yml", source)
-        self.assertIn("./.github/workflows/build-win-x64-github.yml", source)
-        self.assertNotIn("runs-on: ubuntu-22.04", source)
-        self.assertNotIn("runs-on: macos-15", source)
-        self.assertIn("secrets: inherit", source)
+    def test_platform_workflows_reference_posix_reusable_jobs(self):
+        for path in ENTRY_WORKFLOWS:
+            source = path.read_text(encoding="utf-8")
+            self.assertIn("./.github/workflows/build-posix-github.yml", source)
+            self.assertNotIn("runs-on:", source)
+            self.assertIn("secrets: inherit", source)
+            self.assertEqual(source.count("artifact:"), 1)
 
 
 class WorkflowInputIntegrityTest(unittest.TestCase):

@@ -13,9 +13,13 @@ BASH32 = Path.home() / ".local/bash-3.2-for-ci/bash"
 
 class PosixUpstreamCacheTest(unittest.TestCase):
     def test_all_five_targets_receive_cache_option(self):
-        caller = (REPO / ".github/workflows/build-cross-platform.yml").read_text()
-        self.assertEqual(caller.count("use_upstream_cache: ${{"), 5)
-        self.assertIn("'tools/*upstream_cache.py'", caller)
+        for platform in ('linux', 'macos'):
+            for arch in ('x64', 'arm64'):
+                caller = (REPO / f'.github/workflows/build-{platform}-{arch}.yml').read_text()
+                self.assertEqual(caller.count("use_upstream_cache: ${{"), 1)
+                self.assertIn("'tools/*upstream_cache.py'", caller)
+        windows = (REPO / '.github/workflows/build-win-x64-github.yml').read_text()
+        self.assertIn("github.event_name == 'push' || inputs.use_upstream_cache", windows)
         workflow = (REPO / ".github/workflows/build-posix-github.yml").read_text()
         self.assertIn("UPSTREAM_ACTIONS_TOKEN:", workflow)
         self.assertIn("secrets.UPSTREAM_ACTIONS_TOKEN || github.token", workflow)

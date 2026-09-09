@@ -2,20 +2,25 @@ name: release-browser
 
 on:
   workflow_run:
-    workflows: [build-cross-platform]
+    workflows:
+      - build-linux-x64
+      - build-linux-arm64
+      - build-macos-x64
+      - build-macos-arm64
+      - build-win-x64-github
     types: [completed]
     branches: [main]
 
 permissions:
   actions: read
-  contents: write
+  contents: read
 
 concurrency:
-  group: release-browser
+  group: release-browser-${{ github.event.workflow_run.head_sha }}
   cancel-in-progress: false
 
 jobs:
-  release:
+  readiness:
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.head_branch == 'main' &&
@@ -24,9 +29,39 @@ jobs:
       (github.event.workflow_run.event == 'push' ||
        github.event.workflow_run.event == 'workflow_dispatch')
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      # Use release tooling from the same-repository main build commit.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Check all five platform runs
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/release_browser.py --check-ready
+
+  release:
+    needs: readiness
+    if: needs.readiness.outputs.ready == 'true'
+    permissions:
+      actions: read
+      contents: write
+    concurrency:
+      group: release-browser-publish
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      # Execute trusted release tooling, not code from the triggering run.
+      # Use release tooling from the same-repository main build commit.
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
@@ -37,9 +72,9 @@ jobs:
           python-version: '3.13'
 
       - name: Test release tooling
-        run: python -m unittest discover -s tools/tests -p test_release_browser.py -v
+        run: python3 -m unittest discover -s tools/tests -p test_release_browser.py -v
 
       - name: Verify artifacts and publish browser ZIPs
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python tools/release_browser.py
+        run: python3 tools/release_browser.py
