@@ -36,7 +36,10 @@ def record(name):
     with Path(os.environ["COMMAND_LOG"]).open("a") as stream:
         stream.write(json.dumps([name]) + "\\n")
 def verify_tooling(*args): record("verify-pinned-tooling")
-def prepare_tooling_links(*args): record("host-and-tooling-links")
+def prepare_tooling_links(*args, host_arch=None):
+    expected = {"x86_64": "x64", "aarch64": "arm64", "arm64": "arm64"}[os.environ["TEST_MACHINE"]]
+    assert host_arch == expected, (host_arch, expected)
+    record("host-and-tooling-links")
 def restore_tool_endpoints(*args): record("restore-known-endpoints")
 def repair_linux_arm64_tool_script(*args): record("repair-linux-arm64-tool-script")
 ''')

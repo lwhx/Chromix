@@ -68,6 +68,39 @@ class CrossPlatformBuildRegressionTest(unittest.TestCase):
         self.assertIn("8-stage snapshot/resume", source)
         self.assertIn(".github/workflows/build-posix-github.yml", source)
 
+    def test_linux_arm64_cross_build_requires_same_run_native_verification(self):
+        import yaml
+
+        workflow = yaml.safe_load(WORKFLOW.read_text())
+        build = workflow["jobs"]["linux-arm64"]
+        self.assertIn("!inputs.use_upstream_cache && 'ubuntu-24.04-arm' || 'ubuntu-24.04'", build["with"]["runner"])
+        self.assertEqual(build["with"]["arch"], "arm64")
+        posix = yaml.safe_load((REPO / ".github/workflows/build-posix-github.yml").read_text())
+        verify = posix["jobs"]["verify-linux-arm64"]
+        self.assertEqual(verify["runs-on"], "ubuntu-24.04-arm")
+        self.assertEqual(verify["needs"], [f"posix-{n}" for n in range(1, 9)])
+        self.assertIn("always()", verify["if"])
+        self.assertIn("!contains(needs.*.result, 'failure')", verify["if"])
+        self.assertNotIn("continue-on-error", verify)
+        download = next(step for step in verify["steps"] if step.get("uses", "").startswith("actions/download-artifact@"))
+        self.assertEqual(download["with"]["name"], "${{ inputs.artifact }}")
+        self.assertNotIn("run-id", download["with"])
+        check = next(step["run"] for step in verify["steps"] if step.get("name") == "Verify checksum and native launcher")
+        self.assertLess(check.index("sha256sum --check --strict"), check.index("module._extract_zip"))
+        self.assertIn('"sdk/python/chromix/_binary.py"', check)
+        self.assertNotIn("unzip -q", check)
+        self.assertIn("verify_linux_bundle.py", check)
+        self.assertIn("--arch arm64 --runtime", check)
+        self.assertLess(check.index("module._extract_zip"), check.index("prepare-ci-sandbox.sh"))
+        self.assertLess(check.index("prepare-ci-sandbox.sh"), check.index("verify_linux_bundle.py"))
+        self.assertNotIn("--no-sandbox", check)
+        stage = (REPO / "build/posix/ci-stage.sh").read_text()
+        cross = stage[stage.index('HOST_ARCH="$(uname -m)"'):stage.index('VERSION_OUTPUT=')]
+        self.assertIn("verify_linux_bundle.py", cross)
+        self.assertIn("emit runtime_verified false", cross)
+        self.assertIn("emit status compiled", cross)
+        self.assertNotIn("--version", cross)
+
     def test_linux_restore_ninja_is_pinned_for_both_native_architectures(self):
         import ast
 

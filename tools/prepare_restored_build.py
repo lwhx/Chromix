@@ -102,25 +102,31 @@ def binary_architectures(path: Path, platform: str) -> set[str]:
     return {cpus[cpu]} if cpu in cpus else set()
 
 
-def tool_paths(platform: str, arch: str) -> dict[str, Path]:
+def tool_paths(platform: str, arch: str, *, host_arch: str | None = None) -> dict[str, Path]:
+    host_arch = arch if host_arch is None else host_arch
     suffix = ".exe" if platform == "windows" else ""
     clang = {"linux": ("clang", "clang++", "llvm-ar", "llvm-nm", "ld.lld"),
              "macos": ("clang", "clang++", "llvm-ar", "ld64.lld"),
              "windows": ("clang-cl", "lld-link", "llvm-ml")}[platform]
     paths = {name: CLANG / "bin" / (name + suffix) for name in clang}
     paths.update({name: RUST / "bin" / (name + suffix) for name in ("rustc", "cargo", "bindgen")})
-    node = {"linux": "linux/node-linux-x64/bin/node", "windows": "win/node.exe",
-            "macos": "mac_arm64/node-darwin-arm64/bin/node" if arch == "arm64" else "mac/node-darwin-x64/bin/node"}[platform]
+    node = {"linux": f"linux/node-linux-{host_arch}/bin/node", "windows": "win/node.exe",
+            "macos": "mac_arm64/node-darwin-arm64/bin/node" if host_arch == "arm64" else "mac/node-darwin-x64/bin/node"}[platform]
     paths.update(node=Path("third_party/node") / node, gn=Path("out/Default") / ("gn" + suffix))
     return paths
 
 
 def inspect_native_tools(src: Path, platform: str, arch: str) -> dict:
     system, machine = host_identity()
-    native_host = (system, machine) == (platform, arch)
-    probe_env = runtime_environment(src, arch) if native_host and platform == "macos" else None
+    if (platform, arch) not in (("linux", "x64"), ("linux", "arm64"), ("macos", "x64"),
+                                ("macos", "arm64"), ("windows", "x64")):
+        raise ValueError("unsupported restored build target")
+    if ((system, machine) != (platform, arch)
+            and (platform, arch, system, machine) != ("linux", "arm64", "linux", "x64")):
+        raise ValueError(f"a native {platform} {arch} runner is required (Linux ARM64 also supports Linux x64 hosts)")
+    probe_env = runtime_environment(src, machine) if platform == "macos" else None
     tools = {}
-    for name, relative in tool_paths(platform, arch).items():
+    for name, relative in tool_paths(platform, arch, host_arch=machine).items():
         path = src / relative
         entry = {"path": relative.as_posix(), "native": False, "architectures": [], "exists": path.is_file(),
                  "file_identity": _stat_identity(path)}
@@ -128,13 +134,13 @@ def inspect_native_tools(src: Path, platform: str, arch: str) -> dict:
             architectures = binary_architectures(path, platform)
             entry["architectures"] = sorted(architectures)
             entry["wrong_host"] = bool(architectures and machine not in architectures)
-            if not native_host or machine not in architectures:
+            if machine not in architectures:
                 raise ValueError("binary does not match the native runner")
             if platform != "windows" and not os.access(path, os.X_OK):
                 raise ValueError("tool is not executable")
             probe_arg = "/?" if name == "llvm-ml" else "--version"
             entry["probe_argument"] = probe_arg
-            context = (bindgen_environment(src, arch) if platform == "macos" and name == "bindgen"
+            context = (bindgen_environment(src, machine) if platform == "macos" and name == "bindgen"
                        else nullcontext(probe_env))
             with context as env:
                 completed = subprocess.run([str(path), probe_arg], cwd=src, text=True, env=env,
@@ -181,6 +187,74 @@ def _stat_identity(path: Path) -> dict:
         return {"path": str(path.resolve()), "size": info.st_size, "mtime_ns": info.st_mtime_ns}
     except (OSError, RuntimeError):
         return {"path": str(path), "missing": True}
+
+
+def linux_sysroot_identity(src: Path, arch: str, *, host_arch: str) -> dict:
+    """Record pinned host/target sysroots before an installer can replace them."""
+    cpus = {"x64": "amd64", "arm64": "arm64"}
+    if arch not in cpus or host_arch not in cpus:
+        raise ValueError("unsupported Linux sysroot architecture")
+
+    def identity(relative: str, *, directory=False) -> dict:
+        path = _safe_file(src, relative)
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return {"path": str(path), "missing": True}
+        if directory:
+            if not stat.S_ISDIR(info.st_mode):
+                raise ValueError(f"invalid sysroot directory: {relative}")
+            return {"path": str(path), "mode": stat.S_IMODE(info.st_mode), "mtime_ns": info.st_mtime_ns}
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError(f"invalid sysroot stamp: {relative}")
+        with path.open("rb") as stream:
+            payload = stream.read(4097)
+        if len(payload) > 4096:
+            raise ValueError(f"oversized sysroot stamp: {relative}")
+        after = path.lstat()
+        if any(getattr(after, key) != getattr(info, key) for key in
+               ("st_dev", "st_ino", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")):
+            raise ValueError(f"sysroot stamp changed during inspection: {relative}")
+        return {"path": str(path), "size": info.st_size, "mtime_ns": info.st_mtime_ns,
+                "sha256": hashlib.sha256(payload).hexdigest()}
+
+    result = {}
+    for cpu in sorted({cpus[arch], cpus[host_arch]}):
+        relative = f"build/linux/debian_bullseye_{cpu}-sysroot"
+        root = identity(relative, directory=True)
+        stamp = identity(relative + "/.stamp")
+        first_class = {path.name: identity(relative + "/" + path.name)
+                       for path in sorted((src / relative).glob(".*_is_first_class_gcs"))}
+        result[relative + "/.stamp"] = {"root": root, "stamp": stamp, "first_class": first_class}
+    return result
+
+
+def _sysroots_changed(previous: dict | None, current: dict) -> bool | None:
+    if previous is None:
+        return None
+    if "sysroot_identity" in previous:
+        return previous["sysroot_identity"] != current
+    environment = previous.get("environment")
+    if not isinstance(environment, dict) or not isinstance(environment.get("sysroots"), dict):
+        return None
+    # Schema-2 finish markers predate content hashes; retain their stat baseline.
+    legacy = environment["sysroots"]
+    for name, entry in current.items():
+        stamp = entry["stamp"]
+        before = legacy.get(name)
+        if name in legacy and (not isinstance(before, dict)
+                               or not isinstance(before.get("path"), str)
+                               or type(before.get("size")) is not int
+                               or type(before.get("mtime_ns")) is not int):
+            return True
+        if stamp.get("missing"):
+            if before is not None or not entry["root"].get("missing"):
+                return True
+        elif before != {key: value for key, value in stamp.items() if key != "sha256"}:
+            return True
+        if entry["first_class"]:
+            return True
+    return False
 
 
 def environment_identity(src: Path, platform: str) -> dict:
@@ -243,13 +317,14 @@ def tool_fingerprint(src: Path, platform: str, arch: str) -> dict:
     return result
 
 
-def generator_paths(platform: str, arch: str) -> dict[str, Path]:
-    paths = {"node": tool_paths(platform, arch)["node"]}
+def generator_paths(platform: str, arch: str, *, host_arch: str | None = None) -> dict[str, Path]:
+    host_arch = arch if host_arch is None else host_arch
+    paths = {"node": tool_paths(platform, arch, host_arch=host_arch)["node"]}
     if platform == "windows":
         paths["go"] = Path("third_party/dawn/tools/golang/windows-amd64/bin/go.exe")
     else:
         system = "mac" if platform == "macos" else "linux"
-        cpu = "amd64" if arch == "x64" else "arm64"
+        cpu = "amd64" if host_arch == "x64" else "arm64"
         paths["go"] = Path(f"third_party/dawn/tools/golang/{system}-{cpu}/bin/go")
         if platform == "linux":
             paths.update(gperf=Path("third_party/gperf/cipd/bin/gperf"),
@@ -257,9 +332,9 @@ def generator_paths(platform: str, arch: str) -> dict[str, Path]:
     return paths
 
 
-def generator_fingerprint(src: Path, platform: str, arch: str) -> dict:
+def generator_fingerprint(src: Path, platform: str, arch: str, *, host_arch: str | None = None) -> dict:
     result = {}
-    for name, relative in generator_paths(platform, arch).items():
+    for name, relative in generator_paths(platform, arch, host_arch=host_arch).items():
         path = src / relative
         result[name] = {"path": relative.as_posix(),
                         "sha256": digest_file(path) if path.is_file() else None}
@@ -474,7 +549,9 @@ def verify_tooling(work: Path, platform: str, repo: Path = ROOT) -> None:
                        stdout=subprocess.PIPE, check=True, timeout=30)
 
 
-def prepare_tooling_links(work: Path, platform: str, arch: str) -> None:
+def prepare_tooling_links(work: Path, platform: str, arch: str, *, host_arch: str | None = None) -> None:
+    host_arch = arch if host_arch is None else host_arch
+
     def link(relative, target):
         path = work / relative
         if any(linked(parent) for parent in path.parents):
@@ -494,11 +571,11 @@ def prepare_tooling_links(work: Path, platform: str, arch: str) -> None:
         link(base + "ungoogled-chromium", work / "tooling/ungoogled-chromium")
         link(base + "build/src", work / "src")
         link(base + "build/download_cache", work / "download_cache")
-        tools = {f"third_party/dawn/tools/golang/mac-{'arm64' if arch == 'arm64' else 'amd64'}/bin/go": "go"}
+        tools = {f"third_party/dawn/tools/golang/mac-{'arm64' if host_arch == 'arm64' else 'amd64'}/bin/go": "go"}
     else:
-        tools = {f"third_party/node/linux/node-linux-{cpu}/bin/node": "node" for cpu in ("x64", arch)}
+        tools = {f"third_party/node/linux/node-linux-{cpu}/bin/node": "node" for cpu in ("x64", host_arch)}
         tools.update({"third_party/gperf/cipd/bin/gperf": "gperf", "buildtools/linux64-format/clang-format": "clang-format",
-                      f"third_party/dawn/tools/golang/linux-{'arm64' if arch == 'arm64' else 'amd64'}/bin/go": "go"})
+                      f"third_party/dawn/tools/golang/linux-{'arm64' if host_arch == 'arm64' else 'amd64'}/bin/go": "go"})
     for relative, name in tools.items():
         target = shutil.which(name)
         if not target:
@@ -549,18 +626,32 @@ def _prepare(workdir: Path, platform: str, arch: str, *, phase: str, repo: Path,
     needs_invalidation = (incompatible or changed_since_inspect
                           or bool(pending and pending.get("needs_invalidation")))
     data["operation"] = "generator_fingerprint"
-    generators = generator_fingerprint(src, platform, arch)
+    generators = generator_fingerprint(src, platform, arch, host_arch=inspection["host"]["arch"])
     generators_changed = (bool(pending and pending.get("generators_changed"))
                           or bool(pending and pending.get("generator_fingerprint") != generators)
                           or bool(old and old.get("generator_fingerprint") != generators))
     data.update(needs_invalidation=needs_invalidation, generator_fingerprint=generators,
                 generators_changed=generators_changed, operation="validate_native_tools")
+    sysroots_changed = False
+    if platform == "linux":
+        data["operation"] = "linux_sysroot_identity"
+        sysroots = linux_sysroot_identity(src, arch, host_arch=inspection["host"]["arch"])
+        old_change = _sysroots_changed(old, sysroots)
+        pending_change = _sysroots_changed(pending, sysroots)
+        sysroots_changed = (bool(pending and pending.get("sysroots_changed"))
+                            or old_change is True or pending_change is True
+                            or bool(old and old_change is None)
+                            or bool(not old and pending and pending_change is None))
+        data.update(sysroot_identity=sysroots, sysroots_changed=sysroots_changed,
+                    operation="validate_native_tools")
     if phase not in ("inspect", "finish"):
         raise ValueError(f"unsupported preparation phase: {phase}")
     write_json(report_path, data)
     if phase == "inspect":
         write_json(pending_path, data)
         return data
+    if platform == "linux":
+        write_json(pending_path, dict(data, phase="inspect"))
     if not inspection["toolchains_native"] or not inspection["tools"]["node"]["native"]:
         failed = [f"{name} ({entry.get('reason', 'probe failed')})"
                   for name, entry in inspection["tools"].items() if name != "gn" and not entry["native"]]
@@ -581,11 +672,12 @@ def _prepare(workdir: Path, platform: str, arch: str, *, phase: str, repo: Path,
     removed_generated = set()
     generated = (invalidate_generated_outputs(src, removed_paths=removed_generated)
                  if first_finish or generators_changed else {"removed_outputs": 0, "unknown_outputs": []})
+    invalidate_all = tool_changed or sysroots_changed
     dependencies = invalidate_external_dependencies(
-        src, invalidate_all=tool_changed,
+        src, invalidate_all=invalidate_all,
         recheck_external=environment_changed or generators_changed or bool(generated["removed_outputs"]),
         external_inputs=receipt["external_symlink_paths"], removed_generated=removed_generated)
-    compiled = invalidate_compiled_outputs(src) if tool_changed else {"removed_outputs": 0, "unknown_outputs": []}
+    compiled = invalidate_compiled_outputs(src) if invalidate_all else {"removed_outputs": 0, "unknown_outputs": []}
     gn = inspection["tools"]["gn"]
     gn_path = _safe_file(src / "out/Default", Path(gn["path"]).name)
     if gn["exists"] and not gn["native"]:
@@ -602,6 +694,9 @@ def _prepare(workdir: Path, platform: str, arch: str, *, phase: str, repo: Path,
                     "generator_rechecks": int(first_finish or generators_changed),
                     "toolchain_invalidated_outputs": dependencies["toolchain_invalidated_outputs"] + compiled["removed_outputs"],
                     "first_finish": int(first_finish)})
+    if platform == "linux":
+        data["sysroots_changed"] = False
+        data["counters"]["sysroot_invalidations"] = int(sysroots_changed)
     write_json(marker, data)
     write_json(report_path, data)
     pending_path.unlink(missing_ok=True)

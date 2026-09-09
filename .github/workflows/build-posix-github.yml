@@ -84,7 +84,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            bison clang clang-format cmake curl flex g++ git gperf \
+            apparmor-utils bison clang clang-format cmake curl flex g++ git gperf \
             libasound2-dev libatk1.0-dev libcups2-dev libdrm-dev libegl1-mesa-dev \
             libevent-dev libflac-dev libgbm-dev libglib2.0-dev libgtk-3-dev \
             libjpeg-dev libnss3-dev libopus-dev libpam0g-dev libpci-dev \
@@ -312,7 +312,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            bison clang clang-format cmake curl flex g++ git gperf \
+            apparmor-utils bison clang clang-format cmake curl flex g++ git gperf \
             libasound2-dev libatk1.0-dev libcups2-dev libdrm-dev libegl1-mesa-dev \
             libevent-dev libflac-dev libgbm-dev libglib2.0-dev libgtk-3-dev \
             libjpeg-dev libnss3-dev libopus-dev libpam0g-dev libpci-dev \
@@ -549,7 +549,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            bison clang clang-format cmake curl flex g++ git gperf \
+            apparmor-utils bison clang clang-format cmake curl flex g++ git gperf \
             libasound2-dev libatk1.0-dev libcups2-dev libdrm-dev libegl1-mesa-dev \
             libevent-dev libflac-dev libgbm-dev libglib2.0-dev libgtk-3-dev \
             libjpeg-dev libnss3-dev libopus-dev libpam0g-dev libpci-dev \
@@ -786,7 +786,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            bison clang clang-format cmake curl flex g++ git gperf \
+            apparmor-utils bison clang clang-format cmake curl flex g++ git gperf \
             libasound2-dev libatk1.0-dev libcups2-dev libdrm-dev libegl1-mesa-dev \
             libevent-dev libflac-dev libgbm-dev libglib2.0-dev libgtk-3-dev \
             libjpeg-dev libnss3-dev libopus-dev libpam0g-dev libpci-dev \
@@ -1023,7 +1023,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            bison clang clang-format cmake curl flex g++ git gperf \
+            apparmor-utils bison clang clang-format cmake curl flex g++ git gperf \
             libasound2-dev libatk1.0-dev libcups2-dev libdrm-dev libegl1-mesa-dev \
             libevent-dev libflac-dev libgbm-dev libglib2.0-dev libgtk-3-dev \
             libjpeg-dev libnss3-dev libopus-dev libpam0g-dev libpci-dev \
@@ -1260,7 +1260,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            bison clang clang-format cmake curl flex g++ git gperf \
+            apparmor-utils bison clang clang-format cmake curl flex g++ git gperf \
             libasound2-dev libatk1.0-dev libcups2-dev libdrm-dev libegl1-mesa-dev \
             libevent-dev libflac-dev libgbm-dev libglib2.0-dev libgtk-3-dev \
             libjpeg-dev libnss3-dev libopus-dev libpam0g-dev libpci-dev \
@@ -1497,7 +1497,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            bison clang clang-format cmake curl flex g++ git gperf \
+            apparmor-utils bison clang clang-format cmake curl flex g++ git gperf \
             libasound2-dev libatk1.0-dev libcups2-dev libdrm-dev libegl1-mesa-dev \
             libevent-dev libflac-dev libgbm-dev libglib2.0-dev libgtk-3-dev \
             libjpeg-dev libnss3-dev libopus-dev libpam0g-dev libpci-dev \
@@ -1734,7 +1734,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            bison clang clang-format cmake curl flex g++ git gperf \
+            apparmor-utils bison clang clang-format cmake curl flex g++ git gperf \
             libasound2-dev libatk1.0-dev libcups2-dev libdrm-dev libegl1-mesa-dev \
             libevent-dev libflac-dev libgbm-dev libglib2.0-dev libgtk-3-dev \
             libjpeg-dev libnss3-dev libopus-dev libpam0g-dev libpci-dev \
@@ -1928,5 +1928,62 @@ jobs:
             ${{ runner.temp }}/chromix-build/upstream-reuse/
             ${{ runner.temp }}/chromix-build/upstream-object-cache.json
             ${{ runner.temp }}/chromix-upstream/result.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  verify-linux-arm64:
+    name: Linux ARM64 native bundle verification
+    needs: [posix-1, posix-2, posix-3, posix-4, posix-5, posix-6, posix-7, posix-8]
+    if: >-
+      always() && inputs.platform == 'linux' && inputs.arch == 'arm64' &&
+      !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apparmor-utils libasound2t64 libatk1.0-0t64 libatk-bridge2.0-0t64 \
+            libcups2t64 libgbm1 libgtk-3-0t64 libnss3 libx11-xcb1 libxcomposite1 \
+            libxdamage1 libxfixes3 libxkbcommon0 libxrandr2 unzip
+      - name: Download same-run ARM64 bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}
+          path: ${{ runner.temp }}/chromix-native-bundle
+      - name: Verify checksum and native launcher
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}/chromix-native-bundle"
+          test -s chromix-linux-arm64.zip
+          grep -E '^[0-9a-fA-F]{64}  chromix-linux-arm64\.zip$' SHA256SUMS > ARM64.SHA256SUMS
+          test "$(wc -l < ARM64.SHA256SUMS)" -eq 1
+          sha256sum --check --strict ARM64.SHA256SUMS
+          mkdir "${RUNNER_TEMP}/chromix-native-smoke"
+          python3 - <<'PY'
+          import importlib.util
+          import os
+          from pathlib import Path
+          path = Path(os.environ["GITHUB_WORKSPACE"]) / "sdk/python/chromix/_binary.py"
+          spec = importlib.util.spec_from_file_location("chromix_bundle_extract", path)
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          module._extract_zip(Path("chromix-linux-arm64.zip"), Path(os.environ["RUNNER_TEMP"]) / "chromix-native-smoke")
+          PY
+          bash "${GITHUB_WORKSPACE}/build/linux/prepare-ci-sandbox.sh" \
+            "${RUNNER_TEMP}/chromix-native-smoke/chromix/chrome"
+          python3 "${GITHUB_WORKSPACE}/tools/verify_linux_bundle.py" \
+            --bundle-dir "${RUNNER_TEMP}/chromix-native-smoke/chromix" --arch arm64 --runtime \
+            2>&1 | tee "${RUNNER_TEMP}/chromix-linux-arm64-native-smoke.log"
+      - name: Upload native verification diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}-native-smoke-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/chromix-linux-arm64-native-smoke.log
           if-no-files-found: warn
           retention-days: 14

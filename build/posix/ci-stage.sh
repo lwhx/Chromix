@@ -5,8 +5,9 @@
 # restores the previous stage's tar|zstd tree snapshot when one exists,
 # prepares the pinned source or resumes ninja under `timeout -k`, snapshots
 # the work tree again (mtimes/modes/symlinks preserved for ninja state), and
-# reports status=running|completed through GITHUB_OUTPUT. A failed compile
-# fails the job; only the deadline path hands off to the next stage.
+# reports status=running|compiled|completed through GITHUB_OUTPUT. Cross-built
+# bundles require a separate native runtime check. A failed compile fails the
+# job; only the deadline path hands off to the next stage.
 #
 # Usage:
 #   ci-stage.sh --platform linux|macos --arch x64|arm64 \
@@ -217,10 +218,35 @@ fi
 SMOKE_DIR="$WORK/smoke"
 rm -rf "$SMOKE_DIR"
 mkdir -p "$SMOKE_DIR"
-unzip -q "$DEST_DIST/$ASSET" -d "$SMOKE_DIR"
+python3 - "$REPO" "$DEST_DIST/$ASSET" "$SMOKE_DIR" <<'PY'
+import importlib.util
+from pathlib import Path
+import sys
+spec = importlib.util.spec_from_file_location("chromix_bundle_extract", Path(sys.argv[1]) / "sdk/python/chromix/_binary.py")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module._extract_zip(Path(sys.argv[2]), Path(sys.argv[3]))
+PY
 LAUNCHER="$SMOKE_DIR/chromix/chromix"
 [ -x "$LAUNCHER" ] || die "extracted bundle launcher is missing: $LAUNCHER"
 
+HOST_ARCH="$(uname -m)"
+case "$HOST_ARCH" in x86_64) HOST_ARCH=x64 ;; aarch64) HOST_ARCH=arm64 ;; esac
+if [ "$PLATFORM" = linux ] && [ "$HOST_ARCH" != "$ARCH" ]; then
+  [ "$HOST_ARCH:$ARCH" = x64:arm64 ] || die "unsupported Linux cross-build completion"
+  python3 "$REPO/tools/verify_linux_bundle.py" --bundle-dir "$SMOKE_DIR/chromix" --arch "$ARCH" ||
+    die "cross-built bundle architecture verification failed"
+  rm -rf "$SMOKE_DIR"
+  log "ARM64 bundle compiled and checksum/ELF verified; native runtime verification is still required"
+  emit runtime_verified false
+  emit finished true
+  emit status compiled
+  exit 0
+fi
+
+if [ "$PLATFORM" = linux ]; then
+  bash "$REPO/build/linux/prepare-ci-sandbox.sh" "$SMOKE_DIR/chromix/chrome"
+fi
 VERSION_OUTPUT="$("$TIMEOUT" 30s "$LAUNCHER" --version)" ||
   die "extracted launcher --version check failed"
 echo "$VERSION_OUTPUT"
@@ -237,6 +263,7 @@ grep -qF '<p>chromix-smoke-ok</p>' <<<"$DOM_OUTPUT" ||
   die "smoke page marker missing from dumped DOM"
 
 rm -rf "$SMOKE_DIR"
+emit runtime_verified true
 emit finished true
 emit status completed
 exit 0

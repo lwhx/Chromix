@@ -14,6 +14,8 @@ Ninja 1.11.x/1.12.x/1.13.x (including .chromium.N) is required for -t inputs;
 The restore receipt verifies source provenance, not original per-object records.
 Retention is measured since the first baseline, not independently back to the
 upstream build, and is not a cache-hit percentage or compiler compatibility claim.
+The result-only architecture_evidence v1 classifies retained Linux ELF64 ET_REL
+headers from fully hashed bytes. Bitcode and other formats remain unknown.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ import json
 import os
 import re
 import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -50,6 +53,8 @@ MAX_JSON_BYTES = 2 * 1024**2
 MAX_PATH_EXAMPLES = 8
 MAX_PATH_EXAMPLE_CHARS = 256
 NINJA_TIMEOUT = 120
+ELF_ARCHITECTURES = {62: "x64", 183: "arm64"}
+ARCHITECTURE_METHOD = "linux-elf64-le-et-rel"
 SCOPE = "retained since first Chromix build, upstream source verified"
 CONTRACT = "Initial before follows GN/plan, precedes all actual object builds, and is preserved across stages."
 SAFE_ENV = ("GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_SHA", "GITHUB_JOB", "GITHUB_HEAD_REF")
@@ -83,7 +88,7 @@ def stamp(info) -> tuple:
 
 def object_name(name: str) -> str:
     if (not isinstance(name, str) or len(name) > 2048
-            or not re.fullmatch(r"[A-Za-z0-9_./+-]+\.(?:o|obj)", name)
+            or not re.fullmatch(r"[A-Za-z0-9_./+=-]+\.(?:o|obj)", name)
             or name.startswith("/") or ".." in name.split("/")
             or Path(name).as_posix() != name):
         raise EvidenceError("unsafe or unsupported object path")
@@ -312,7 +317,7 @@ def read_log(out: Path, selected: set[str], *, baseline=None, previous=None) -> 
     return records, log, stamp(info), changed
 
 
-def file_record(path: Path, budget: int = MAX_HASH_BYTES, expected=None) -> dict:
+def file_record(path: Path, budget: int = MAX_HASH_BYTES, expected=None, *, header: bytearray | None = None) -> dict:
     info = regular(path)
     if (not 0 < info.st_size <= min(MAX_FILE_BYTES, budget)
             or not 0 < info.st_mtime_ns < 1 << 63):
@@ -320,6 +325,7 @@ def file_record(path: Path, budget: int = MAX_HASH_BYTES, expected=None) -> dict
     if expected is not None and (info.st_size, info.st_mtime_ns) != (expected["size"], expected["mtime_ns"]):
         raise EvidenceError("object changed before hashing")
     digest = hashlib.sha256()
+    prefix = b""
     remaining = info.st_size
     with path.open("rb") as stream:
         while remaining:
@@ -327,10 +333,87 @@ def file_record(path: Path, budget: int = MAX_HASH_BYTES, expected=None) -> dict
             if not data:
                 raise EvidenceError("object shortened during hashing")
             digest.update(data)
+            if header is not None and len(prefix) < 64:
+                prefix += data[:64 - len(prefix)]
             remaining -= len(data)
     if stamp(regular(path)) != stamp(info):
         raise EvidenceError("object changed during hashing")
+    if header is not None:
+        header.extend(prefix)
     return {"sha256": digest.hexdigest(), "size": info.st_size, "mtime_ns": info.st_mtime_ns}
+
+
+def elf_architecture(header: bytes | bytearray) -> str:
+    if (len(header) != 64 or header[:7] != b"\x7fELF\x02\x01\x01"
+            or struct.unpack_from("<H", header, 16)[0] != 1
+            or struct.unpack_from("<I", header, 20)[0] != 1
+            or struct.unpack_from("<H", header, 52)[0] != 64):
+        return "unknown"
+    return ELF_ARCHITECTURES.get(struct.unpack_from("<H", header, 18)[0], "unknown")
+
+
+def architecture_report(source: dict, retained_outputs: dict, *, successful=False) -> dict:
+    counts = dict.fromkeys((*ELF_ARCHITECTURES.values(), "unknown"), 0)
+    counts.update(Counter(retained_outputs.values()))
+    identity = source["identity"]
+    target_count = counts.get(identity["arch"], 0) if identity["platform"] == "linux" else 0
+    return {"schema_version": 1, "method": ARCHITECTURE_METHOD, "retained_outputs": retained_outputs,
+            "retained_by_arch": counts, "target_retained_count": target_count,
+            "target_retention_proven": successful and target_count > 0}
+
+
+def architecture_valid(state: dict, baseline: dict) -> None:
+    if "architecture_evidence" not in state:
+        return
+    data = state["architecture_evidence"]
+    keys = {"schema_version", "method", "retained_outputs", "retained_by_arch",
+            "target_retained_count", "target_retention_proven"}
+    if (not isinstance(data, dict) or set(data) != keys
+            or type(data["schema_version"]) is not int or data["schema_version"] != 1
+            or data["method"] != ARCHITECTURE_METHOD
+            or type(data["target_retained_count"]) is not int
+            or type(data["target_retention_proven"]) is not bool):
+        raise EvidenceError("invalid architecture evidence metadata")
+    selected = {sample["output"]: sample for sample in baseline["samples"]}
+    retained = data["retained_outputs"]
+    counts = data["retained_by_arch"]
+    if (not isinstance(retained, dict) or any(name not in selected or name in state["disqualified"]
+            or not isinstance(arch, str) or arch not in (*ELF_ARCHITECTURES.values(), "unknown")
+            for name, arch in retained.items())
+            or not isinstance(counts, dict) or set(counts) != {*ELF_ARCHITECTURES.values(), "unknown"}
+            or any(type(count) is not int or not 0 <= count <= len(selected) for count in counts.values())
+            or (baseline["source"]["identity"]["platform"] != "linux"
+                and any(arch != "unknown" for arch in retained.values()))):
+        raise EvidenceError("invalid retained architecture counts")
+    samples = state.get("samples", [])
+    if not isinstance(samples, list) or len(samples) > len(selected):
+        raise EvidenceError("invalid architecture observation samples")
+    seen, observed_retained = set(), set()
+    for sample in samples:
+        if not isinstance(sample, dict) or not isinstance(sample.get("output"), str):
+            raise EvidenceError("invalid architecture observation sample")
+        name = sample["output"]
+        if (name not in selected or name in seen
+                or sample.get("status") != state["disqualified"].get(name, "retained")):
+            raise EvidenceError("inconsistent architecture observation status")
+        seen.add(name)
+        if sample["status"] == "retained":
+            if sample.get("file") != selected[name]["file"] or sample.get("record") != selected[name]["record"]:
+                raise EvidenceError("architecture observation lacks retained content")
+            observed_retained.add(name)
+    if (("samples" in state or state["phase"] == "after") and seen != set(selected)
+            or set(retained) != observed_retained):
+        raise EvidenceError("inconsistent retained architecture outputs")
+    if state["phase"] == "after":
+        if (type(state.get("exit_code")) is not int or type(state.get("retained_count")) is not int
+                or state["retained_count"] != len(retained)):
+            raise EvidenceError("invalid architecture build outcome")
+    elif state.get("exit_code") is not None:
+        raise EvidenceError("invalid architecture before outcome")
+    expected = architecture_report(baseline["source"], retained,
+                                   successful=state["phase"] == "after" and state["exit_code"] == 0)
+    if data != expected:
+        raise EvidenceError("inconsistent architecture evidence summary")
 
 
 def path_diagnostics_valid(data: dict, count_key: str, examples_key: str, origin: str, total: int) -> None:
@@ -436,6 +519,7 @@ def state_valid(state: dict, baseline: dict) -> dict:
             or type(state.get("disqualified_count")) is not int or state["disqualified_count"] != len(disqualified)
             or state.get("disqualification_reasons") != dict(Counter(disqualified.values()))):
         raise EvidenceError("invalid permanent disqualification metadata")
+    architecture_valid(state, baseline)
     return dict(disqualified)
 
 
@@ -448,6 +532,7 @@ def observe(out: Path, baseline: dict, previous: dict, names: set[str], membersh
     graph_changed = after_build and any(membership[key] != previous["membership"][key] for key in
                                         ("sha256", "input_count", "object_count", "tool", "validation_inputs_included"))
     observations, hashed = [], 0
+    retained_architectures = {}
     for sample in baseline["samples"]:
         name = sample["output"]
         observation = {"output": name, "baseline": sample, "record": records.get(name)}
@@ -471,10 +556,14 @@ def observe(out: Path, baseline: dict, previous: dict, names: set[str], membersh
                 if info.st_size != sample["file"]["size"] or info.st_mtime_ns != sample["file"]["mtime_ns"]:
                     status = "file_metadata_changed"
                 else:
-                    observed = file_record(path, MAX_HASH_BYTES - hashed, sample["file"])
+                    header = bytearray()
+                    observed = file_record(path, MAX_HASH_BYTES - hashed, sample["file"], header=header)
                     hashed += observed["size"]
                     observation["file"] = observed
                     status = "retained" if observed == sample["file"] else "content_changed"
+                    if status == "retained":
+                        retained_architectures[name] = (elf_architecture(header)
+                            if baseline["source"]["identity"]["platform"] == "linux" else "unknown")
         if status != "retained":
             disqualified.setdefault(name, status)
         observation["status"] = status
@@ -484,6 +573,7 @@ def observe(out: Path, baseline: dict, previous: dict, names: set[str], membersh
     if stamp(regular(out / ".ninja_log")) != log_stamp:
         raise EvidenceError("Ninja log changed during observation")
     return {"log": log, "samples": observations, "object_hash_bytes": hashed,
+            "architecture_evidence": architecture_report(baseline["source"], retained_architectures),
             "disqualified": disqualified, "disqualified_count": len(disqualified),
             "disqualification_reasons": dict(Counter(disqualified.values()))}
 
@@ -543,6 +633,7 @@ def before(workdir: Path, platform: str, arch: str, ninja: Path, targets=("chrom
         baseline_valid(baseline, source, targets)
         write_json(path, baseline, exclusive=True)
         observation = {"log": log, "object_hash_bytes": hashed, "disqualified": {},
+                       "architecture_evidence": architecture_report(source, {}),
                        "disqualified_count": 0, "disqualification_reasons": {}}
     report = base_report("before", source, targets, runner)
     report.update(observation)
@@ -572,6 +663,8 @@ def after(workdir: Path, platform: str, arch: str, ninja: Path, targets=("chrome
             or len(set(eligible)) != len(eligible)):
         raise EvidenceError("invalid before membership metadata")
     observation = observe(out, baseline, pending, names.intersection(eligible), membership, after_build=True)
+    observation["architecture_evidence"] = architecture_report(
+        source, observation["architecture_evidence"]["retained_outputs"], successful=exit_code == 0)
     retained = sum(item["status"] == "retained" for item in observation["samples"])
     report = base_report("after", source, targets, runner)
     report.update(observation)

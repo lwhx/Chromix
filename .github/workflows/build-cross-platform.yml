@@ -21,6 +21,8 @@ on:
       - 'tools/restore_ninja.py'
       - 'tools/macos_runtime.py'
       - 'tools/restored_reuse_evidence.py'
+      - 'tools/verify_linux_bundle.py'
+      - 'sdk/python/chromix/_binary.py'
       - 'tools/gen_posix_workflow.py'
       - 'tools/merge_gn_args.py'
       - '.github/workflows/build-cross-platform.yml'
@@ -61,12 +63,12 @@ jobs:
     secrets: inherit
 
   linux-arm64:
-    name: Linux arm64 (8-stage snapshot/resume)
+    name: Linux arm64 (x64-host build + native smoke)
     uses: ./.github/workflows/build-posix-github.yml
     with:
       platform: linux
       arch: arm64
-      runner: ubuntu-24.04-arm
+      runner: ${{ github.event_name == 'workflow_dispatch' && !inputs.use_upstream_cache && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
       artifact: chromix-linux-arm64
       max-stages: 8
       use_upstream_cache: ${{ github.event_name != 'workflow_dispatch' || inputs.use_upstream_cache }}

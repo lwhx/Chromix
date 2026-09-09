@@ -12,9 +12,12 @@ fi
 HOST="$(uname -m)"
 case "$HOST" in x86_64) HOST=x64 ;; aarch64) HOST=arm64 ;; esac
 SYSTEM="$(uname -s)"
-if [ "$HOST" != "$ARCH" ] || { [ "$PLATFORM" = linux ] && [ "$SYSTEM" != Linux ]; } || \
-   { [ "$PLATFORM" = macos ] && [ "$SYSTEM" != Darwin ]; }; then
-  echo "a native $PLATFORM $ARCH runner is required" >&2
+case "$SYSTEM:$PLATFORM:$HOST:$ARCH" in
+  Linux:linux:x64:x64|Linux:linux:arm64:arm64|Darwin:macos:x64:x64|Darwin:macos:arm64:arm64|Linux:linux:x64:arm64) ;;
+  *) echo "a native $PLATFORM $ARCH runner is required (except restored Linux x64 -> arm64)" >&2; exit 2 ;;
+esac
+if [ "$HOST" != "$ARCH" ] && [ ! -f "$WORK/src/.chromix-upstream-restored.json" ]; then
+  echo "Linux x64 -> arm64 requires a full restored upstream cache; cold cross builds are unsupported" >&2
   exit 2
 fi
 WORK="$(cd "$WORK" && pwd)"
@@ -44,16 +47,16 @@ if [ "$COMPILERS_NATIVE" != 1 ] || [ "$BINDGEN_NATIVE" != 1 ] || [ "$RETRIEVE" =
   fi
 fi
 # Only fixed tooling/host-link paths and known downloader endpoints are changed.
-python3 - "$REPO" "$WORK" "$PLATFORM" "$ARCH" <<'PY'
+python3 - "$REPO" "$WORK" "$PLATFORM" "$ARCH" "$HOST" <<'PY'
 from pathlib import Path
 import sys
 sys.path.insert(0, sys.argv[1])
 from tools.prepare_restored_build import prepare_tooling_links, verify_tooling
 verify_tooling(Path(sys.argv[2]), sys.argv[3], Path(sys.argv[1]))
-prepare_tooling_links(Path(sys.argv[2]), sys.argv[3], sys.argv[4])
+prepare_tooling_links(Path(sys.argv[2]), sys.argv[3], sys.argv[4], host_arch=sys.argv[5])
 PY
 cd "$SRC"
-if [ "$COMPILERS_NATIVE" != 1 ] || [ "$BINDGEN_NATIVE" != 1 ] || [ "$RETRIEVE" = 1 ]; then
+if [ "$COMPILERS_NATIVE" != 1 ] || [ "$BINDGEN_NATIVE" != 1 ] || [ "$RETRIEVE" = 1 ] || [ "$HOST" != "$ARCH" ]; then
   python3 - "$REPO" "$SRC" <<'PY'
 from pathlib import Path
 import sys
@@ -62,7 +65,7 @@ from tools.prepare_restored_build import restore_tool_endpoints
 restore_tool_endpoints(Path(sys.argv[2]))
 PY
 fi
-if [ "$PLATFORM" = linux ] && [ "$ARCH" = arm64 ] && { [ "$COMPILERS_NATIVE" != 1 ] || [ "$BINDGEN_NATIVE" != 1 ]; }; then
+if [ "$PLATFORM" = linux ] && [ "$HOST" = arm64 ] && { [ "$COMPILERS_NATIVE" != 1 ] || [ "$BINDGEN_NATIVE" != 1 ]; }; then
   python3 - "$REPO" "$SRC" <<'PY'
 from pathlib import Path
 import sys
@@ -90,7 +93,7 @@ if [ "$PLATFORM" = macos ]; then
 else
   if [ "$ARCH" = x64 ]; then SYSROOT_ARCH=amd64; else SYSROOT_ARCH=arm64; fi
   if [ "$COMPILERS_NATIVE" != 1 ]; then
-    if [ "$ARCH" = x64 ]; then
+    if [ "$HOST" = x64 ]; then
       # Matching revisions do not prove that the restored binaries can execute.
       python3 - "$SRC" <<'PY'
 from pathlib import Path
@@ -129,12 +132,40 @@ PY
       BINDGEN_NATIVE=0
     fi
   fi
-  if [ "$ARCH" = x64 ] && [ "$BINDGEN_NATIVE" != 1 ]; then
+  if [ "$HOST" = x64 ] && [ "$BINDGEN_NATIVE" != 1 ]; then
     echo "Linux x64 Rust package lacks executable bindgen; refusing to build without native Rust LLVM intermediates" >&2
     exit 1
   fi
+  SYSROOT_ARCHES=("$SYSROOT_ARCH")
+  if [ "$HOST" != "$ARCH" ]; then
+    SYSROOT_ARCHES=(amd64 arm64)
+  fi
   if [ "${GITHUB_ACTIONS:-}" = true ]; then
-    python3 build/linux/sysroot_scripts/install-sysroot.py --arch="$SYSROOT_ARCH"
+    for sysroot_arch in "${SYSROOT_ARCHES[@]}"; do
+      python3 build/linux/sysroot_scripts/install-sysroot.py --arch="$sysroot_arch"
+    done
+  fi
+  if [ "$HOST" != "$ARCH" ]; then
+    # Match the pinned installer's stamps without downloading on local runs.
+    python3 - "$SRC" "${SYSROOT_ARCHES[@]}" <<'PY'
+import json
+from pathlib import Path
+import sys
+src = Path(sys.argv[1])
+linux = src / "build/linux"
+sysroots = json.loads((linux / "sysroot_scripts/sysroots.json").read_text())
+for arch in sys.argv[2:]:
+    entry = sysroots[f"bullseye_{arch}"]
+    directory = f"debian_bullseye_{arch}-sysroot"
+    if entry["SysrootDir"] != directory:
+        raise SystemExit(f"unexpected pinned {arch} sysroot directory")
+    root = linux / directory
+    stamp = root / ".stamp"
+    expected = entry["URL"] + "/" + entry["Sha256Sum"]
+    if (not stamp.is_file() or stamp.read_text() != expected
+            or any(root.glob(".*_is_first_class_gcs"))):
+        raise SystemExit(f"missing or stale {arch} sysroot for Linux x64 -> arm64; prepare both sysroots in GitHub Actions")
+PY
   fi
   if [ "$BINDGEN_NATIVE" != 1 ]; then
     python3 tools/rust/build_bindgen.py --skip-test

@@ -25,13 +25,35 @@ and GN arguments, not a different official Chromium checkout.
 The machine-readable pins are in `build/ungoogled-revisions.psd1`; the legacy
 version files remain available for tooling compatibility.
 
-## Native Linux x64/arm64 builds
+## Linux x64/arm64 builds
 
-Prerequisites are a native Debian/Ubuntu build host with Chromium's Linux build
+The unified workflow builds Linux ARM64 on an x64 Ubuntu 24.04 host, matching the
+pinned portablelinux donor's cross-build environment. It restores ARM64 target
+sources and objects while executing x64 LLVM, Rust, GN, Node, Go, and Ninja.
+Both amd64 host and arm64 target sysroots are checked. Their directory metadata,
+stamp contents, and first-class download markers are recorded before installation;
+observed replacement invalidates compiled outputs, including on resumed stages.
+Target receipt identity,
+GN arguments, patch application, and artifact names remain ARM64. This avoids
+replacing a usable donor compiler solely because its host CPU differs from the
+target CPU; genuine tool or dependency incompatibility still invalidates outputs.
+
+The cross-build stage checks the ZIP checksum and every packaged ELF file's
+AArch64 architecture, then reports compilation complete with runtime verification
+pending. A required `ubuntu-24.04-arm` job downloads that exact same-run ZIP,
+checks the checksum again, and executes its extracted launcher for version and
+headless DOM smoke tests. The workflow and release gate cannot succeed if this
+native verification fails. A successful static ELF check is not a runtime test.
+Explicit cold builds (`use_upstream_cache=false`) retain the native ARM64 runner;
+the cross-host route requires a verified full restored tree.
+
+Standalone native builds remain supported. Prerequisites are a native
+Debian/Ubuntu build host with Chromium's Linux build
 packages, Python 3, Git, Ninja, Node.js, Go, `zip`, `unzip`, and GNU `sha256sum`.
 Budget at least 100 GB free as a starting estimate, not a sufficient-space
 guarantee: archives, toolchains, objects, staging, ZIPs, and smoke extraction
-coexist. Linux arm64 additionally builds LLVM and Rust from source. Run:
+coexist. Native Linux arm64 additionally builds LLVM and Rust from source; the
+CI cross-build instead uses the restored x64-host tools. Run:
 
 ```bash
 build/build.sh /path/to/chromix-linux-build x64
@@ -132,7 +154,7 @@ artifacts: `build-posix-github.yml` for the four POSIX targets and
 | Runner | Target | Archive |
 |---|---|---|
 | `ubuntu-22.04` | Linux x64 | `chromix-linux-x64.zip` |
-| `ubuntu-24.04-arm` | Linux arm64 | `chromix-linux-arm64.zip` |
+| `ubuntu-24.04` build; `ubuntu-24.04-arm` smoke | Linux arm64 | `chromix-linux-arm64.zip` |
 | `macos-15-intel` | macOS x64 | `chromix-mac-x64.zip` |
 | `macos-15` | macOS arm64 | `chromix-mac-arm64.zip` |
 | `windows-2022` | Windows x64 | `chromix-win-x64.zip` |
@@ -319,6 +341,12 @@ of output readers affected by omitted external links, other external inputs,
 missing local inputs, and intentionally removed generated inputs; these categories
 can overlap for one output. Timestamp-repair diagnostics separately retain up to
 32 skipped output/input examples before preparation cleanup.
+In native macOS ARM64 run `34291301280`, these diagnostics attributed 46,151
+outputs to omitted SDK dependencies, including
+`sdk/xcode_links/MacOSX26.0.sdk/SDKSettings.json`; all 45,769 eligible object
+candidates were missing by the first build baseline. That run reached actual
+compilation, but established no object retention. A matching SDK directory name
+alone is not enough to exempt these dependencies from invalidation.
 A successful restoration is not proof of object hits,
 and a dry-run
 count is not a measured speedup. Native CI must establish actual reuse and
@@ -348,7 +376,16 @@ changed graphs, truncated logs, and zero retained samples do not establish reuse
 These small reports are uploaded on every build stage. This measures retention
 since the first Chromix build in a verified upstream source tree; it does not
 independently reconstruct the donor's per-object history or imply a whole-tree
-cache-hit percentage.
+cache-hit percentage. The requested target's dependency closure can include
+host-tool objects, so a positive generic retained count alone does not establish
+ARM64 object reuse on an x64 host. Architecture-qualified evidence must match the
+retained object's contents, not its directory name or the target receipt.
+`architecture_evidence` in the result reports Linux ELF64 little-endian relocatable
+objects by architecture, with `target_retained_count` and `target_retention_proven`
+separate from generic retention. Bitcode and unsupported formats remain `unknown`;
+a zero target count means no proven target objects in this sample, not no reuse
+elsewhere. Classification uses the same fully hashed bytes and does not replace
+or resample an existing baseline.
 
 Host toolchains follow the host architecture, not the target: Node resolves
 through `third_party/node/linux/node-linux-$HOST_ARCH/bin/node` with an extra
@@ -363,10 +400,18 @@ runners download linux-arm64 and x64 runners download linux-amd64 from
 go.dev. That single dependency drift was enough to fail prior one-shot POSIX
 builds when Ubuntu's apt Go predated the new module syntax.
 
-The final POSIX stage verifies `SHA256SUMS`, extracts the ZIP into a fresh
-directory, and runs the extracted launcher with `--version` and a bounded
-headless `--dump-dom` check against a local data URL. It checks the pinned
-browser version and rendered marker before uploading the browser artifact. It
+The final POSIX stage verifies `SHA256SUMS` and extracts the ZIP into a fresh
+directory using the SDK's checked extractor, preserving executable permissions
+and rejecting unsafe members and links. Native builds run the extracted launcher with `--version` and a bounded
+headless `--dump-dom` check against a local data URL. Linux ARM64 cross-builds
+perform the ELF architecture checks there and require the separate native ARM64
+job described above for both runtime checks. These checks use the pinned
+browser version and rendered marker. The bundle is uploaded by the compile
+stage, but the overall workflow still waits for required native verification.
+On Linux CI hosts with AppArmor's unprivileged-user-namespace restriction,
+`build/linux/prepare-ci-sandbox.sh` loads a path-specific profile for the extracted
+browser before the smoke test. It leaves global sysctls and executable privilege
+bits unchanged; an unavailable sandbox remains a failure. The workflow
 does not launch from the build output, contact a test website, disable the
 sandbox, or notarize macOS bundles. Sandbox/user-namespace policy, missing
 shared libraries, or macOS launch restrictions can fail the check; such

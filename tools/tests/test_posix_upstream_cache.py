@@ -49,7 +49,8 @@ class PosixUpstreamCacheTest(unittest.TestCase):
                 self.assertIn('"$REPO/tools/merge_gn_args.py"', source)
                 self.assertIn('--fail-on-unused-args', source)
 
-    def run_restored_builder(self, platform, arch, *, fail_tools=False):
+    def run_restored_builder(self, platform, arch, *, fail_tools=False, host_arch=None,
+                             restored=True, system=None, missing_gn=False, incomplete_tools=False):
         with tempfile.TemporaryDirectory(prefix="restored build ") as directory:
             root = Path(directory)
             repo, work, binaries = root / "repo", root / "work", root / "bin"
@@ -82,18 +83,26 @@ from pathlib import Path
 args = sys.argv[1:]
 phase = args[args.index('--phase') + 1]
 assert args[args.index('--ninja') + 1] == os.environ['SELECTED_NINJA']
+assert args[args.index('--arch') + 1] == os.environ['TARGET_ARCH']
 if phase == 'after':
     assert args[args.index('--exit-code') + 1] == '0'
 with open(os.environ['CALL_LOG'], 'a') as output:
     output.write('evidence-' + phase + '\\n')
 ''')
-            script(repo / "build/prepare-ungoogled.sh", 'printf "prepare\\n" >> "$CALL_LOG"\n')
+            script(repo / "build/prepare-ungoogled.sh",
+                   f'test "$2:$3" = "{platform}:{arch}" || exit 96\n'
+                   'printf "prepare\\n" >> "$CALL_LOG"\n')
             script(repo / "build/posix/prepare-restored-tools.sh",
+                   f'test "$2:$3" = "{platform}:{arch}" || exit 96\n'
                    'printf "tools\\n" >> "$CALL_LOG"\n' +
-                   ('exit 19\n' if fail_tools else 'touch "$1/src/.chromix-toolchain-ready"\n'))
+                   ('exit 19\n' if fail_tools else 'exit 0\n' if incomplete_tools else
+                    'touch "$1/src/.chromix-toolchain-ready"\n'))
             script(repo / "build/macos/select-xcode.sh", 'select_macos_xcode() { :; }\n')
-            for name in (".chromix-upstream-restored.json", ".chromix-domain-substituted"):
-                (src / name).touch()
+            (src / ".chromix-domain-substituted").touch()
+            if restored:
+                (src / ".chromix-upstream-restored.json").touch()
+            else:
+                (src / ".chromix-toolchain-ready").touch()
             overlay = "args.gn" if platform == "linux" else "args.macos.gn"
             (repo / "build" / overlay).write_text('symbol_level = 0\nchrome_pgo_phase = 0\n')
             platform_repo = "ungoogled-chromium-" + ("portablelinux" if platform == "linux" else "macos")
@@ -104,37 +113,83 @@ with open(os.environ['CALL_LOG'], 'a') as output:
             (out / "args.gn").write_text('symbol_level = 2\nchrome_pgo_phase = 2\nupstream_extra = true\n')
             for name in (".ninja_deps", ".ninja_log", "build.ninja", "retained.o"):
                 (out / name).write_text(name)
-            script(out / "gn", 'printf "gn\\n" >> "$CALL_LOG"\n')
-            script(out / "chrome", 'printf "Chromium fixture\\n"\n')
+            gn_script = '#!/bin/sh\nprintf "gn\\n" >> "$CALL_LOG"\n'
+            if missing_gn:
+                bootstrap = src / "tools/gn/bootstrap/bootstrap.py"
+                bootstrap.parent.mkdir(parents=True)
+                bootstrap.write_text(f'''import os, sys
+from pathlib import Path
+assert os.environ['CXX'] == {str(src / 'third_party/llvm-build/Release+Asserts/bin/clang++')!r}
+assert sys.argv[-1] == '--skip-generate-buildfiles'
+with open(os.environ['CALL_LOG'], 'a') as output:
+    output.write('bootstrap-gn\\n')
+path = Path(sys.argv[sys.argv.index('-o') + 1])
+path.write_text({gn_script!r})
+path.chmod(0o755)
+''')
+            else:
+                script(out / "gn", gn_script.split('\n', 1)[1])
+            script(out / "chrome", 'printf "chrome-version\\n" >> "$CALL_LOG"\n'
+                   'printf "Chromium fixture\\n"\n' + ('exit 99\n' if host_arch and host_arch != arch else ''))
             for name in ("node", "go", "gperf", "clang-format"):
                 script(binaries / name, "exit 0\n")
             selected_ninja = root / "selected tools/ninja"
             script(binaries / "ninja", 'printf "unselected-ninja\\n" >> "$CALL_LOG"\nexit 97\n')
             script(selected_ninja, 'test "$NINJA" = "$0" || exit 98\n'
                    'printf "ninja\\n" >> "$CALL_LOG"\n')
-            machine = "x86_64" if arch == "x64" else ("aarch64" if platform == "linux" else "arm64")
-            system = "Linux" if platform == "linux" else "Darwin"
+            host_arch = host_arch or arch
+            machine = {"x64": "x86_64", "arm64": "aarch64" if platform == "linux" else "arm64"}.get(host_arch, host_arch)
+            system = system or ("Linux" if platform == "linux" else "Darwin")
             script(binaries / "uname", f'case "$1" in -m) printf "{machine}\\n";; -s) printf "{system}\\n";; esac\n')
             script(binaries / "sysctl", 'printf "2\\n"\n')
             env = {**os.environ, "PATH": str(binaries) + os.pathsep + os.environ["PATH"],
                    "CHROMIX_SKIP_DEPS": "1", "CHROMIX_JOBS": "2", "CALL_LOG": str(log),
-                   "SELECTED_NINJA": str(selected_ninja)}
+                   "SELECTED_NINJA": str(selected_ninja), "TARGET_ARCH": arch}
             env.pop("CHROMIX_UPSTREAM_CACHE_DIR", None)
-            for _ in range(1 if fail_tools else 2):
+            rejected = platform == "linux" and (
+                system != "Linux" or (host_arch, arch) not in (("x64", "x64"), ("arm64", "arm64"), ("x64", "arm64"))
+                or (host_arch != arch and not restored))
+            expected_rc = 2 if rejected else 19 if fail_tools else 1 if incomplete_tools else 0
+            for _ in range(1 if expected_rc else 2):
                 result = subprocess.run([str(BASH32 if BASH32.exists() else shutil.which("bash")),
                                          str(repo / builder), str(work), arch],
                                         env=env, capture_output=True, text=True, timeout=15)
-                self.assertEqual(result.returncode, 19 if fail_tools else 0, result.stdout + result.stderr)
-            if fail_tools:
+                self.assertEqual(result.returncode, expected_rc, result.stdout + result.stderr)
+            if rejected:
+                self.assertFalse(log.exists())
+                self.assertIn("cold cross builds are unsupported" if (host_arch, arch) == ("x64", "arm64") and not restored
+                              else "unsupported Linux", result.stderr)
+                self.assertFalse((work / "tmp").exists())
+            elif fail_tools or incomplete_tools:
                 self.assertEqual(log.read_text().splitlines(), ["prepare", "ninja-guard", "tools"])
+                if incomplete_tools:
+                    self.assertIn("cold cross builds are unsupported", result.stderr)
             else:
-                self.assertEqual(log.read_text().splitlines(),
-                                 ["prepare", "ninja-guard", "tools", "gn", "ninja", "evidence-before", "ninja", "evidence-after"] * 2)
+                iteration = ["prepare", "ninja-guard", "tools", "gn", "ninja", "evidence-before", "ninja", "evidence-after"]
+                if platform == "linux" and host_arch == arch:
+                    iteration.append("chrome-version")
+                expected_calls = iteration * 2
+                if missing_gn:
+                    expected_calls.insert(3, "bootstrap-gn")
+                self.assertEqual(log.read_text().splitlines(), expected_calls)
+                self.assertEqual((out / "gn").read_text(), gn_script)
+                if host_arch != arch:
+                    self.assertIn("runtime validation deferred to the required native ARM64 job", result.stdout)
+                    self.assertIn("runtime is not verified", result.stdout)
+                    self.assertNotIn("Chromium fixture", result.stdout)
+                    for relative, tool in (("third_party/node/linux/node-linux-x64/bin/node", "node"),
+                                           ("third_party/dawn/tools/golang/linux-amd64/bin/go", "go")):
+                        self.assertEqual((src / relative).resolve(), binaries / tool)
+                    self.assertFalse((src / "third_party/dawn/tools/golang/linux-arm64").exists())
+                elif platform == "linux":
+                    self.assertIn("Chromium fixture", result.stdout)
+                    self.assertNotIn("runtime validation deferred", result.stdout)
                 args = (out / "args.gn").read_text()
                 self.assertIn("upstream_extra = true", args)
                 self.assertIn("symbol_level = 0", args)
                 self.assertIn("chrome_pgo_phase = 0", args)
                 self.assertIn(f'target_cpu = "{arch}"', args)
+                self.assertIn(f'v8_target_cpu = "{arch}"', args)
                 self.assertNotIn("symbol_level = 2", args)
             for name in (".ninja_deps", ".ninja_log", "build.ninja", "retained.o"):
                 self.assertEqual((out / name).read_text(), name)
@@ -146,10 +201,146 @@ with open(os.environ['CALL_LOG'], 'a') as output:
                 with self.subTest(platform=platform, arch=arch):
                     self.run_restored_builder(platform, arch)
 
+    def test_restored_linux_x64_to_arm64_preserves_host_gn_and_defers_runtime(self):
+        self.run_restored_builder("linux", "arm64", host_arch="x64")
+
+    def test_restored_linux_cross_bootstraps_missing_native_gn_once(self):
+        self.run_restored_builder("linux", "arm64", host_arch="x64", missing_gn=True)
+
+    def test_linux_cross_requires_full_restore_before_preparing_source(self):
+        self.run_restored_builder("linux", "arm64", host_arch="x64", restored=False)
+
+    def test_linux_cross_never_falls_back_to_cold_compiler_setup(self):
+        self.run_restored_builder("linux", "arm64", host_arch="x64", incomplete_tools=True)
+
+    def test_linux_rejects_other_host_target_pairs(self):
+        for host, target, system in (("arm64", "x64", "Linux"), ("riscv64", "arm64", "Linux"),
+                                     ("x64", "x64", "Darwin")):
+            with self.subTest(host=host, target=target, system=system):
+                self.run_restored_builder("linux", target, host_arch=host, system=system)
+
     def test_restored_tool_failure_stops_before_gn_and_ninja(self):
         for platform in ("linux", "macos"):
             with self.subTest(platform=platform):
                 self.run_restored_builder(platform, "x64", fail_tools=True)
+
+    def cross_tools_fixture(self, *, restored=True):
+        from tools.tests import test_prepare_restored_tools
+        fixture = test_prepare_restored_tools.PrepareRestoredToolsTest()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        src = fixture.work / "src"
+        if restored:
+            (src / ".chromix-upstream-restored.json").touch()
+        linux = src / "build/linux"
+        (linux / "sysroot_scripts").mkdir(parents=True)
+        entries = {f"bullseye_{arch}": {"SysrootDir": f"debian_bullseye_{arch}-sysroot",
+                                       "URL": "https://example.invalid/sysroot", "Sha256Sum": arch + "-digest"}
+                   for arch in ("amd64", "arm64")}
+        (linux / "sysroot_scripts/sysroots.json").write_text(json.dumps(entries))
+        for arch in ("amd64", "arm64"):
+            entry = entries[f"bullseye_{arch}"]
+            root = linux / entry["SysrootDir"]
+            root.mkdir()
+            (root / ".stamp").write_text(entry["URL"] + "/" + entry["Sha256Sum"])
+        return fixture
+
+    def test_cross_tools_reuse_native_compilers_and_install_both_sysroots(self):
+        fixture = self.cross_tools_fixture()
+        result, commands = fixture.run_helper("linux", "arm64", machine="x86_64", compatible=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        installations = [command for command in commands if command[0].endswith("install-sysroot.py")]
+        self.assertEqual(installations, [["build/linux/sysroot_scripts/install-sysroot.py", "--arch=amd64"],
+                                         ["build/linux/sysroot_scripts/install-sysroot.py", "--arch=arm64"]])
+        self.assertLess(commands.index(["restore-known-endpoints"]), commands.index(installations[0]))
+        self.assertEqual(commands[-1][1:3], ["--phase", "finish"])
+        for command in commands:
+            if "--arch" in command:
+                self.assertEqual(command[command.index("--arch") + 1], "arm64")
+            self.assertNotIn(command[0], ("tools/clang/scripts/build.py", "tools/rust/build_rust.py",
+                                          "tools/rust/build_bindgen.py", "repair-linux-arm64-tool-script"))
+        self.assertTrue((fixture.work / "src/.chromix-toolchain-ready").exists())
+
+    @unittest.skipUnless(BASH32.exists(), "Bash 3.2 required")
+    def test_cross_tools_bash32_installs_host_and_target_sysroots(self):
+        fixture = self.cross_tools_fixture()
+        result, commands = fixture.run_helper("linux", "arm64", machine="x86_64", compatible=True, bash=BASH32)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(["build/linux/sysroot_scripts/install-sysroot.py", "--arch=amd64"], commands)
+        self.assertIn(["build/linux/sysroot_scripts/install-sysroot.py", "--arch=arm64"], commands)
+
+    def test_cross_tools_compiler_fallback_downloads_host_x64_packages(self):
+        fixture = self.cross_tools_fixture()
+        fixture.x64_package_fixture()
+        result, commands = fixture.run_helper("linux", "arm64", machine="x86_64", package_bindgen=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(["tools/rust/update_rust.py"], commands)
+        self.assertIn(["tools/clang/scripts/update.py"], commands)
+        for command in commands:
+            self.assertNotIn(command[0], ("tools/clang/scripts/build.py", "tools/rust/build_rust.py",
+                                          "tools/rust/build_bindgen.py", "repair-linux-arm64-tool-script"))
+            if "--arch" in command:
+                self.assertEqual(command[command.index("--arch") + 1], "arm64")
+        self.assertEqual((fixture.work / "src/out/Default/obj/keep.o").read_text(), "retained object")
+        self.assertEqual(commands[-1][1:3], ["--phase", "finish"])
+
+    def test_cross_tools_missing_host_bindgen_cannot_use_arm_rebuild(self):
+        fixture = self.cross_tools_fixture()
+        fixture.x64_package_fixture()
+        result, commands = fixture.run_helper("linux", "arm64", machine="x86_64", package_bindgen=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Linux x64 Rust package lacks executable bindgen", result.stderr)
+        self.assertNotIn(["tools/rust/build_bindgen.py", "--skip-test"], commands)
+        self.assertNotIn(["repair-linux-arm64-tool-script"], commands)
+        self.assertFalse(any("finish" in command for command in commands))
+        self.assertFalse((fixture.work / "src/.chromix-toolchain-ready").exists())
+
+    def test_cross_tools_local_resume_checks_sysroots_without_installing(self):
+        fixture = self.cross_tools_fixture()
+        for _ in range(2):
+            result, commands = fixture.run_helper("linux", "arm64", machine="x86_64", compatible=True, ci=False)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(any(command[0].endswith("install-sysroot.py") for command in commands))
+            self.assertEqual(commands[-1][1:3], ["--phase", "finish"])
+
+    def test_cross_tools_reject_missing_or_stale_host_and_target_sysroot(self):
+        for ci in (False, True):
+            for arch in ("amd64", "arm64"):
+                for state in ("missing", "stale", "first-class"):
+                    with self.subTest(ci=ci, arch=arch, state=state):
+                        fixture = self.cross_tools_fixture()
+                        root = fixture.work / f"src/build/linux/debian_bullseye_{arch}-sysroot"
+                        if state == "missing":
+                            (root / ".stamp").unlink()
+                        elif state == "stale":
+                            (root / ".stamp").write_text("stale")
+                        else:
+                            (root / ".fixture_is_first_class_gcs").touch()
+                        result, commands = fixture.run_helper("linux", "arm64", machine="x86_64", compatible=True, ci=ci)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(f"missing or stale {arch} sysroot", result.stderr)
+                        self.assertFalse(any("finish" in command for command in commands))
+                        self.assertFalse((fixture.work / "src/.chromix-toolchain-ready").exists())
+
+    def test_cross_tools_no_local_compiler_downloads(self):
+        fixture = self.cross_tools_fixture()
+        result, commands = fixture.run_helper("linux", "arm64", machine="x86_64", ci=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("restricted to GitHub Actions", result.stderr)
+        self.assertEqual(len(commands), 1)
+
+    def test_restored_tools_cross_guard_rejects_cold_and_unsupported_pairs(self):
+        for platform, arch, machine, restored in (("linux", "arm64", "x86_64", False),
+                                                   ("linux", "x64", "aarch64", True),
+                                                   ("macos", "arm64", "x86_64", True),
+                                                   ("macos", "x64", "arm64", True),
+                                                   ("linux", "arm64", "riscv64", True)):
+            with self.subTest(platform=platform, arch=arch, machine=machine, restored=restored):
+                fixture = self.cross_tools_fixture(restored=restored)
+                result, commands = fixture.run_helper(platform, arch, machine=machine, compatible=True)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(commands, [])
+                self.assertIn("cold cross builds are unsupported" if not restored else "native", result.stderr)
 
     def test_actual_build_evidence_gates_and_preserves_ninja_failure(self):
         for before_rc, ninja_rc, after_rc, expected in ((0, 0, 0, 0), (7, 0, 0, 1),

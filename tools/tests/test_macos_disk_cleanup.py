@@ -500,8 +500,9 @@ class MacOSDiskWorkflowTest(unittest.TestCase):
     def test_cleanup_precedes_all_downloads_and_restores_on_every_stage(self):
         import yaml
         jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
-        self.assertEqual(len(jobs), 8)
-        for stage, job in enumerate(jobs.values(), 1):
+        self.assertEqual(len(jobs), 9)
+        for stage in range(1, 9):
+            job = jobs[f"posix-{stage}"]
             with self.subTest(stage=stage):
                 steps = job["steps"]
                 names = [step.get("name", "") for step in steps]

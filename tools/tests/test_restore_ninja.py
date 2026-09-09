@@ -75,9 +75,9 @@ class RestoreNinjaTest(unittest.TestCase):
             raise value
         return value
 
-    def select(self, system="linux", arch="x64"):
+    def select(self, system="linux", arch="x64", *, host=None):
         before = self.log.read_bytes() if self.log.exists() else None
-        with mock.patch.object(guard, "host_identity", return_value=(system, arch)), \
+        with mock.patch.object(guard, "host_identity", return_value=host or (system, arch)), \
                 mock.patch.object(guard, "probe_version", side_effect=self.probe):
             try:
                 return guard.select_ninja(self.work, system, arch)
@@ -96,6 +96,60 @@ class RestoreNinjaTest(unittest.TestCase):
                     self.assertEqual(self.select(system, arch), path.resolve())
                     self.assertEqual(self.report()["log"]["format"], log_format)
                     self.assertEqual(self.report()["selected"]["version"], version)
+
+    def test_linux_arm64_target_uses_x64_host_ninja_for_all_log_formats(self):
+        for log_format, version in ((5, "1.11.1"), (6, "1.12.1.chromium.4"), (7, "1.13.2")):
+            with self.subTest(log=log_format):
+                self.log.write_bytes(f"# ninja log v{log_format}\n".encode())
+                host = self.put_binary(version=version)
+                bundle = self.put_binary(arch="arm64", version=version, bundled=True)
+                self.probed.clear()
+                self.assertEqual(self.select("linux", "arm64", host=("linux", "x64")), host)
+                self.assertEqual(self.probed, [host])
+                report = self.report()
+                self.assertEqual((report["platform"], report["arch"]), ("linux", "arm64"))
+                self.assertEqual(report["host"], ["linux", "x64"])
+                self.assertEqual(report["selected"]["architectures"], ["x64"])
+                self.assertEqual(report["log"]["format"], log_format)
+                host.unlink()
+                self.probed.clear()
+                with self.assertRaisesRegex(ValueError, "no compatible native Ninja"):
+                    self.select("linux", "arm64", host=("linux", "x64"))
+                self.assertEqual(self.probed, [])
+                self.assertIn("header", self.report()["candidates"][-1]["reason"])
+                self.put_binary(version=version, bundled=True)
+                self.assertEqual(self.select("linux", "arm64", host=("linux", "x64")), bundle)
+                self.assertEqual(self.probed, [bundle])
+
+    def test_linux_cross_does_not_relax_executable_header_or_version_checks(self):
+        host = self.put_binary()
+        headers = [binary_header("linux", "arm64"), binary_header("macos", "x64"),
+                   binary_header("linux", "x64")[:63], b"#!/bin/sh\nexit 0\n"]
+        relocatable = bytearray(binary_header("linux", "x64"))
+        struct.pack_into("<H", relocatable, 16, 1)
+        headers.append(relocatable)
+        for header in headers:
+            with self.subTest(header=header[:20]):
+                host.write_bytes(header)
+                with self.assertRaisesRegex(ValueError, "no compatible native Ninja"):
+                    self.select("linux", "arm64", host=("linux", "x64"))
+                self.assertEqual(self.probed, [])
+        for version in ("1.11.1", "1.13.2", "1.14.0", "1.12.1-git", "1.12", "1.12.1\nwarning"):
+            with self.subTest(version=version):
+                self.put_binary(version=version)
+                with self.assertRaisesRegex(ValueError, "requires 1.12.x"):
+                    self.select("linux", "arm64", host=("linux", "x64"))
+                self.assertEqual(self.report()["status"], "failed")
+
+    def test_linux_cross_does_not_relax_log_header_checks(self):
+        self.put_binary()
+        for header in (b"# ninja log v8\n", b"# ninja log v06\n", b"# ninja log v6",
+                       b"# ninja log v6 \n", b"", b"X" * 200):
+            with self.subTest(header=header[:30]):
+                self.log.write_bytes(header)
+                with self.assertRaisesRegex(ValueError, "unknown restored Ninja log header"):
+                    self.select("linux", "arm64", host=("linux", "x64"))
+                self.assertEqual(self.probed, [])
 
     def test_compatibility_map_does_not_guess_future_versions(self):
         for version, expected in (("1.10.1", None), ("1.11.1", 5), ("1.12.1", 6),
@@ -179,12 +233,19 @@ class RestoreNinjaTest(unittest.TestCase):
             self.versions[host] = error
             self.assertEqual(self.select(), bundle)
 
-    def test_native_host_is_required(self):
-        with mock.patch.object(guard, "host_identity", return_value=("linux", "arm64")), \
-                mock.patch.object(guard, "probe_version") as probe:
-            with self.assertRaisesRegex(ValueError, "native linux x64"):
-                guard.select_ninja(self.work, "linux", "x64")
-            probe.assert_not_called()
+    def test_only_native_and_linux_x64_to_arm64_host_target_pairs_are_allowed(self):
+        for target in TARGETS:
+            for host in (*TARGETS, ("windows", "arm64"), ("linux", "unknown")):
+                if host == target or (target, host) == (("linux", "arm64"), ("linux", "x64")):
+                    continue
+                with self.subTest(target=target, host=host):
+                    with self.assertRaisesRegex(ValueError, "native .* runner is required"):
+                        self.select(*target, host=host)
+                    self.assertEqual(self.probed, [])
+                    self.assertEqual(self.report()["host"], list(host))
+                    self.assertEqual(self.report()["candidates"], [])
+        with self.assertRaisesRegex(ValueError, "unsupported restored build target"):
+            self.select("windows", "arm64")
 
     def test_bundle_cannot_link_outside_source(self):
         external = self.put_binary(version="1.13.2")

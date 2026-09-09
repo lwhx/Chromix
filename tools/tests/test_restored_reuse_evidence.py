@@ -3,6 +3,7 @@ import io
 import json
 import os
 import shutil
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -15,11 +16,19 @@ from tools import restore_upstream_cache as restore
 
 NINJAS = [Path(f"/tmp/chromix-ninja-v{version}/ninja") for version in ("1.11.1", "1.12.1", "1.13.2")]
 AVAILABLE = [path for path in NINJAS if path.is_file()]
+XNNPACK_OBJECT = ("obj/third_party/xnnpack/f16-avgpool_arch=armv8.2-a+fp16/"
+                  "f16-avgpool-9p-minmax-neonfp16arith.o")
 UNSUPPORTED_OBJECT_NAMES = (
     "../escape.o", "/escape.o", "obj/../escape.o", "obj//a.o", "./obj/a.o",
     "C:/escape.obj", "obj\\escape.obj", "'obj/a.o'", '"obj/a.o"', "'obj/space name.o'", "obj/$a.o",
     "obj/lib.a:member.o", "obj/lib.a(member.o)", "'obj/lib.a(member.o)'", "obj/é.o",
 )
+
+
+def elf_object(machine=183):
+    ident = b"\x7fELF\x02\x01\x01" + b"\0" * 9
+    return ident + struct.pack("<HHIQQQIHHHHHH", 1, machine, 1,
+                               0, 0, 0, 0, 64, 0, 0, 0, 0, 0)
 
 
 class RestoredReuseEvidenceTest(unittest.TestCase):
@@ -61,17 +70,30 @@ class RestoredReuseEvidenceTest(unittest.TestCase):
         self.log = self.out / ".ninja_log"
         self.log.write_text(f"# ninja log v{self.version}\n" + "".join(self.records))
 
+    def architecture_fixture(self, files, *, platform="linux", arch="arm64"):
+        self.receipt["identity"].update(platform=platform, arch=arch)
+        self.inputs = list(files)
+        self.make_log(names=self.inputs)
+        for name, content in files.items():
+            path = self.out / name
+            info = path.stat()
+            path.write_bytes(content)
+            os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+
     def before(self, **kwargs):
-        return evidence.before(self.work, "linux", "x64", self.ninja, **kwargs)
+        identity = self.receipt["identity"]
+        return evidence.before(self.work, identity["platform"], identity["arch"], self.ninja, **kwargs)
 
     def after(self, code=0, **kwargs):
-        return evidence.after(self.work, "linux", "x64", self.ninja, exit_code=code, **kwargs)
+        identity = self.receipt["identity"]
+        return evidence.after(self.work, identity["platform"], identity["arch"], self.ninja, exit_code=code, **kwargs)
 
     def result(self):
         return json.loads((self.work / "upstream-reuse/result.json").read_text())
 
     def cli(self, phase, code=None):
-        args = [phase, "--workdir", str(self.work), "--platform", "linux", "--arch", "x64",
+        identity = self.receipt["identity"]
+        args = [phase, "--workdir", str(self.work), "--platform", identity["platform"], "--arch", identity["arch"],
                 "--ninja", str(self.ninja), "--target", "chrome"]
         if code is not None:
             args += ["--exit-code", str(code)]
@@ -103,6 +125,290 @@ class RestoredReuseEvidenceTest(unittest.TestCase):
                 self.assertEqual(report["scope"], evidence.SCOPE)
                 self.assertLess(len(json.dumps(report)), 16 * 1024)
                 self.verify.assert_called_with(self.work, "linux", "x64", repo=evidence.REPO)
+
+    def test_mixed_elf_architectures_ignore_paths_and_preserve_baseline_schema(self):
+        self.architecture_fixture({"clang_x64/obj/target.o": elf_object(),
+                                   "obj/arm64/host.o": elf_object(62),
+                                   "obj/bitcode.o": b"BC\xc0\xdeaarch64-unknown-linux-gnu"})
+        baseline = self.before()
+        path = self.work / "upstream-reuse/baseline.json"
+        raw, info = path.read_bytes(), path.stat()
+        self.assertNotIn("architecture_evidence", baseline)
+        self.assertEqual(baseline["schema_version"], 1)
+        for sample in baseline["samples"]:
+            self.assertEqual(set(sample), {"output", "record", "file"})
+            self.assertEqual(set(sample["file"]), {"sha256", "size", "mtime_ns"})
+        self.assertEqual(self.result()["architecture_evidence"], {
+            "schema_version": 1, "method": "linux-elf64-le-et-rel", "retained_outputs": {},
+            "retained_by_arch": {"x64": 0, "arm64": 0, "unknown": 0},
+            "target_retained_count": 0, "target_retention_proven": False})
+        for _ in range(2):
+            report = self.after()
+            data = report["architecture_evidence"]
+            self.assertEqual(report["retained_count"], 3)
+            self.assertTrue(report["retention_proven"])
+            self.assertEqual(data["retained_outputs"], {"clang_x64/obj/target.o": "arm64",
+                "obj/arm64/host.o": "x64", "obj/bitcode.o": "unknown"})
+            self.assertEqual(data["retained_by_arch"], {"x64": 1, "arm64": 1, "unknown": 1})
+            self.assertEqual(data["target_retained_count"], 1)
+            self.assertTrue(data["target_retention_proven"])
+            self.assertEqual(report["baseline_sha256"], hashlib.sha256(raw).hexdigest())
+            self.assertEqual(self.before(), baseline)
+            pending = self.result()["architecture_evidence"]
+            self.assertEqual(pending["retained_outputs"], data["retained_outputs"])
+            self.assertFalse(pending["target_retention_proven"])
+        self.assertEqual(path.read_bytes(), raw)
+        self.assertEqual(path.stat().st_mtime_ns, info.st_mtime_ns)
+
+    def test_128_host_samples_do_not_count_unsampled_arm64_or_resample(self):
+        files = {f"clang_x64/obj/host{index:03}.o": elf_object(62) for index in range(128)}
+        files["obj/target.o"] = elf_object()
+        self.architecture_fixture(files)
+        baseline = self.before()
+        raw = (self.work / "upstream-reuse/baseline.json").read_bytes()
+        self.assertEqual(len(baseline["samples"]), 128)
+        self.assertNotIn("obj/target.o", {sample["output"] for sample in baseline["samples"]})
+        for _ in range(2):
+            report = self.after()
+            self.assertEqual(report["retained_count"], 128)
+            self.assertTrue(report["retention_proven"])
+            self.assertEqual(report["architecture_evidence"]["retained_by_arch"],
+                             {"x64": 128, "arm64": 0, "unknown": 0})
+            self.assertEqual(report["architecture_evidence"]["target_retained_count"], 0)
+            self.assertFalse(report["architecture_evidence"]["target_retention_proven"])
+            self.assertEqual(self.before(), baseline)
+        self.assertEqual((self.work / "upstream-reuse/baseline.json").read_bytes(), raw)
+
+    def test_nonrel_invalid_headers_and_bitcode_remain_unknown(self):
+        files = {"obj/short.o": elf_object()[:63], "obj/other-machine.o": elf_object(40),
+                 "obj/raw-bitcode.o": b"BC\xc0\xdeaarch64-unknown-linux-gnu" + b"x" * 64,
+                 "obj/wrapped-bitcode.o": b"\xde\xc0\x17\x0baarch64-unknown-linux-gnu" + b"x" * 64}
+        for name, offset, value in (("class", 4, b"\x01"), ("endian", 5, b"\x02"),
+                ("ident-version", 6, b"\x02"), ("executable", 16, b"\x02\0"),
+                ("shared", 16, b"\x03\0"), ("version", 20, b"\x02\0\0\0"),
+                ("header-size", 52, b"\x3f\0"), ("magic", 0, b"nope")):
+            content = bytearray(elf_object())
+            content[offset:offset + len(value)] = value
+            files[f"obj/{name}.o"] = content
+        self.architecture_fixture(files)
+        self.before()
+        report = self.after()
+        self.assertEqual(report["retained_count"], len(files))
+        self.assertTrue(report["retention_proven"])
+        self.assertEqual(report["architecture_evidence"]["retained_by_arch"],
+                         {"x64": 0, "arm64": 0, "unknown": len(files)})
+        self.assertFalse(report["architecture_evidence"]["target_retention_proven"])
+
+    def test_architecture_proof_requires_linux_matching_target_and_successful_after(self):
+        for platform, arch, machine in (("linux", "arm64", 183), ("linux", "x64", 62),
+                                        ("linux", "arm64", 62), ("macos", "arm64", 183)):
+            with self.subTest(platform=platform, arch=arch, machine=machine):
+                shutil.rmtree(self.work / "upstream-reuse", ignore_errors=True)
+                self.architecture_fixture({"obj/a.o": elf_object(machine)}, platform=platform, arch=arch)
+                matching = platform == "linux" and evidence.ELF_ARCHITECTURES[machine] == arch
+                for code in (1, 124, -9, 0):
+                    self.before()
+                    self.assertFalse(self.result()["architecture_evidence"]["target_retention_proven"])
+                    report = self.after(code)
+                    data = report["architecture_evidence"]
+                    self.assertEqual(data["target_retained_count"], int(matching))
+                    self.assertEqual(data["target_retention_proven"], matching and code == 0)
+                    self.assertEqual(report["retention_proven"], code == 0)
+                    if platform != "linux":
+                        self.assertEqual(data["retained_by_arch"]["unknown"], 1)
+
+    def test_elf_header_and_body_changes_with_same_size_and_mtime_disqualify(self):
+        for changed in (elf_object(62) + b"old-body", elf_object() + b"new-body"):
+            with self.subTest(header_changed=changed[:64] != elf_object()):
+                shutil.rmtree(self.work / "upstream-reuse", ignore_errors=True)
+                original = elf_object() + b"old-body"
+                self.architecture_fixture({"obj/a.o": original})
+                self.before()
+                path = self.out / "obj/a.o"
+                info = path.stat()
+                path.write_bytes(changed)
+                os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+                report = self.after()
+                self.assertEqual(report["samples"][0]["status"], "content_changed")
+                self.assertEqual(report["object_hash_bytes"], len(changed))
+                self.assertEqual(report["architecture_evidence"]["retained_outputs"], {})
+                self.assertEqual(report["architecture_evidence"]["target_retained_count"], 0)
+                path.write_bytes(original)
+                os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+                self.before()
+                self.assertFalse(self.after()["architecture_evidence"]["target_retention_proven"])
+
+    def test_elf_architecture_disqualification_keeps_all_existing_log_and_graph_guards(self):
+        for kind, reason in (("repeat", "appended_record_repeated"), ("changed", "appended_record_changed"),
+                             ("alias", "unsupported_appended_output"), ("prefix", "log_prefix_mismatch"),
+                             ("graph", "target_inputs_changed")):
+            with self.subTest(kind=kind):
+                shutil.rmtree(self.work / "upstream-reuse", ignore_errors=True)
+                self.architecture_fixture({"obj/a.o": elf_object()})
+                self.before()
+                self.assertTrue(self.after()["architecture_evidence"]["target_retention_proven"])
+                self.before()
+                raw = self.log.read_bytes()
+                if kind == "graph":
+                    self.inputs.append("../../new-source.cc")
+                elif kind == "prefix":
+                    self.log.write_text(self.log.read_text().replace("deadbeef", "beefdead"))
+                else:
+                    with self.log.open("a") as stream:
+                        stream.write(self.records[0] if kind == "repeat" else
+                                     self.records[0].replace("10\t20\t", "30\t40\t") if kind == "changed" else
+                                     "1\t2\t3\t/absolute-alias.o\tabc\n")
+                report = self.after()
+                self.assertEqual(report["disqualified"], {"obj/a.o": reason})
+                self.assertEqual(report["architecture_evidence"]["retained_outputs"], {})
+                self.assertEqual(report["architecture_evidence"]["target_retained_count"], 0)
+                self.assertFalse(report["architecture_evidence"]["target_retention_proven"])
+                if kind == "prefix":
+                    self.log.write_bytes(raw)
+                if kind == "graph":
+                    self.inputs.pop()
+                self.before()
+                self.assertFalse(self.after()["architecture_evidence"]["target_retention_proven"])
+
+    def test_legacy_architecture_extension_absence_preserves_baseline_and_disqualification(self):
+        self.architecture_fixture({"obj/a.o": elf_object(), "obj/b.o": elf_object()})
+        baseline = self.before()
+        baseline_path = self.work / "upstream-reuse/baseline.json"
+        state_path = self.work / "upstream-reuse/result.json"
+        raw, info = baseline_path.read_bytes(), baseline_path.stat()
+        pending = self.result()
+        del pending["architecture_evidence"]
+        state_path.write_bytes(evidence.json_bytes(pending))
+        self.assertTrue(self.after()["architecture_evidence"]["target_retention_proven"])
+        self.before()
+        with self.log.open("a") as stream:
+            stream.write(self.records[0])
+        previous = self.after()
+        del previous["architecture_evidence"]
+        state_path.write_bytes(evidence.json_bytes(previous))
+        self.assertEqual(self.before(), baseline)
+        report = self.after()
+        self.assertEqual(report["disqualified"], {"obj/a.o": "appended_record_repeated"})
+        self.assertEqual(report["architecture_evidence"]["retained_outputs"], {"obj/b.o": "arm64"})
+        self.assertEqual(report["architecture_evidence"]["target_retained_count"], 1)
+        self.assertEqual(report["baseline_sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(baseline_path.read_bytes(), raw)
+        self.assertEqual(baseline_path.stat().st_mtime_ns, info.st_mtime_ns)
+
+    def test_architecture_classification_is_recomputed_not_carried_from_previous_result(self):
+        for machine, forged_arch in ((183, "x64"), (62, "arm64")):
+            with self.subTest(machine=machine, forged_arch=forged_arch):
+                shutil.rmtree(self.work / "upstream-reuse", ignore_errors=True)
+                self.architecture_fixture({"obj/a.o": elf_object(machine)})
+                baseline = self.before()
+                previous = self.after()
+                previous["architecture_evidence"] = evidence.architecture_report(
+                    previous["source"], {"obj/a.o": forged_arch}, successful=True)
+                evidence.state_valid(previous, baseline)
+                (self.work / "upstream-reuse/result.json").write_bytes(evidence.json_bytes(previous))
+                self.before()
+                actual = evidence.ELF_ARCHITECTURES[machine]
+                self.assertEqual(self.result()["architecture_evidence"]["retained_outputs"], {"obj/a.o": actual})
+                self.assertEqual(self.after()["architecture_evidence"]["target_retention_proven"], machine == 183)
+
+    def test_malformed_architecture_metadata_fails_closed_without_changing_baseline(self):
+        self.architecture_fixture({"obj/a.o": elf_object()})
+        self.before()
+        previous = self.after()
+        state_path = self.work / "upstream-reuse/result.json"
+        baseline_path = self.work / "upstream-reuse/baseline.json"
+        raw = baseline_path.read_bytes()
+        mutations = [
+            ((), None), (("schema_version",), 2), (("schema_version",), True),
+            (("method",), "path-guess"), (("extra",), 0),
+            (("retained_outputs",), []), (("retained_outputs",), {}),
+            (("retained_outputs",), {"../outside.o": "arm64"}),
+            (("retained_outputs", "obj/a.o"), "aarch64"), (("retained_outputs", "obj/a.o"), []),
+            (("retained_by_arch",), []), (("retained_by_arch",), {"arm64": 1}),
+            (("retained_by_arch", "other"), 0), (("retained_by_arch", "arm64"), True),
+            (("retained_by_arch", "arm64"), -1), (("retained_by_arch", "arm64"), 129),
+            (("retained_by_arch", "arm64"), 0), (("target_retained_count",), True),
+            (("target_retained_count",), -1), (("target_retained_count",), 0),
+            (("target_retention_proven",), 1), (("target_retention_proven",), False),
+        ]
+        for keys, value in mutations:
+            with self.subTest(keys=keys, value=value):
+                state = json.loads(evidence.json_bytes(previous))
+                parent = state
+                for key in ("architecture_evidence", *keys)[:-1]:
+                    parent = parent[key]
+                parent[("architecture_evidence", *keys)[-1]] = value
+                state_path.write_bytes(evidence.json_bytes(state))
+                self.assertEqual(self.cli("before"), 1)
+                self.assertEqual(self.result()["status"], "error")
+                self.assertFalse(self.result()["retention_proven"])
+                self.assertEqual(baseline_path.read_bytes(), raw)
+        for key in previous["architecture_evidence"]:
+            with self.subTest(missing=key):
+                state = json.loads(evidence.json_bytes(previous))
+                del state["architecture_evidence"][key]
+                state_path.write_bytes(evidence.json_bytes(state))
+                self.assertEqual(self.cli("before"), 1)
+        for keys, value in ((("samples",), []), (("samples",), None),
+                            (("samples", 0, "status"), "content_changed"),
+                            (("samples", 0, "file", "sha256"), "f" * 64),
+                            (("samples", 0, "record", "hash"), "beefdead"),
+                            (("retained_count",), True), (("retained_count",), 0),
+                            (("exit_code",), True), (("exit_code",), 124)):
+            with self.subTest(state_keys=keys, value=value):
+                state = json.loads(evidence.json_bytes(previous))
+                parent = state
+                for key in keys[:-1]:
+                    parent = parent[key]
+                parent[keys[-1]] = value
+                state_path.write_bytes(evidence.json_bytes(state))
+                self.assertEqual(self.cli("before"), 1)
+        state = json.loads(evidence.json_bytes(previous))
+        state.update(disqualified={"obj/a.o": "content_changed"}, disqualified_count=1,
+                     disqualification_reasons={"content_changed": 1})
+        state_path.write_bytes(evidence.json_bytes(state))
+        self.assertEqual(self.cli("before"), 1)
+        self.assertEqual(baseline_path.read_bytes(), raw)
+        state_path.write_bytes(evidence.json_bytes(previous))
+        self.before()
+        pending = self.result()
+        pending["architecture_evidence"]["target_retention_proven"] = True
+        state_path.write_bytes(evidence.json_bytes(pending))
+        self.assertEqual(self.cli("after", 0), 1)
+
+    def test_architecture_header_uses_single_full_hash_read_and_stable_file_check(self):
+        self.architecture_fixture({"obj/a.o": elf_object() + b"x" * (1024 * 1024)})
+        path = self.out / "obj/a.o"
+        header = bytearray()
+        original_open = Path.open
+        opened = []
+
+        def tracked_open(candidate, *args, **kwargs):
+            opened.append(candidate)
+            return original_open(candidate, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", tracked_open):
+            record = evidence.file_record(path, header=header)
+        self.assertEqual(opened, [path])
+        self.assertEqual(header, elf_object())
+        self.assertEqual(record["size"], 64 + 1024 * 1024)
+        self.assertEqual(record["sha256"], hashlib.sha256(elf_object() + b"x" * (1024 * 1024)).hexdigest())
+        regular = evidence.regular
+        calls = 0
+
+        def changing_regular(candidate):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                info = candidate.stat()
+                os.utime(candidate, ns=(info.st_atime_ns, info.st_mtime_ns + 1))
+            return regular(candidate)
+
+        header = bytearray()
+        with mock.patch.object(evidence, "regular", side_effect=changing_regular):
+            with self.assertRaisesRegex(evidence.EvidenceError, "changed during hashing"):
+                evidence.file_record(path, header=header)
+        self.assertEqual(header, b"")
 
     def test_rebuild_only_start_end_changed_does_not_count(self):
         self.before()
@@ -267,6 +573,68 @@ class RestoredReuseEvidenceTest(unittest.TestCase):
         report = evidence.after(self.work, "windows", "x64", self.ninja, targets=("other", "chrome"), exit_code=0)
         self.assertEqual(first["targets"], ["chrome", "other"])
         self.assertTrue(report["retention_proven"])
+
+    def test_raw_equals_unselected_log_append_preserves_selected_object(self):
+        for version in (5, 6, 7):
+            with self.subTest(version=version):
+                shutil.rmtree(self.work / "upstream-reuse", ignore_errors=True)
+                self.version = version
+                self.make_log(names=("keep.o",), extra=(XNNPACK_OBJECT,))
+                self.inputs = ["keep.o", f"'{XNNPACK_OBJECT}'"]
+                baseline = self.before()
+                baseline_path = self.work / "upstream-reuse/baseline.json"
+                saved = baseline_path.read_bytes()
+                self.assertEqual([sample["output"] for sample in baseline["samples"]], ["keep.o"])
+                self.assertEqual(baseline["membership"]["excluded_object_inputs"], 1)
+                self.assertEqual(baseline["log"]["unselected_unsupported_object_records"], 0)
+                with self.log.open("a") as stream:
+                    stream.write(self.records[1].replace("11\t21\t", "31\t41\t"))
+                report = self.after()
+                self.assertEqual(report["retained_count"], 1)
+                self.assertTrue(report["retention_proven"])
+                self.assertEqual(report["disqualified"], {})
+                self.assertTrue(report["log"]["prefix_matches_previous"])
+                self.assertEqual(report["log"]["unselected_unsupported_object_records"], 0)
+                self.assertEqual(self.before(), baseline)
+                self.assertTrue(self.after()["retention_proven"])
+                self.assertEqual(baseline_path.read_bytes(), saved)
+
+    def test_selected_raw_equals_output_append_still_permanently_disqualifies(self):
+        for repeated in (False, True):
+            with self.subTest(repeated=repeated):
+                shutil.rmtree(self.work / "upstream-reuse", ignore_errors=True)
+                self.make_log(names=("keep.o", XNNPACK_OBJECT))
+                self.inputs = ["keep.o", XNNPACK_OBJECT]
+                baseline = self.before()
+                self.assertEqual({sample["output"] for sample in baseline["samples"]}, set(self.inputs))
+                with self.log.open("a") as stream:
+                    stream.write(self.records[1] if repeated else
+                                 self.records[1].replace("11\t21\t", "31\t41\t"))
+                report = self.after()
+                reason = "appended_record_repeated" if repeated else "appended_record_changed"
+                self.assertEqual(report["disqualified"], {XNNPACK_OBJECT: reason})
+                self.assertEqual(report["retained_count"], 1)
+                self.assertEqual(self.before(), baseline)
+                self.assertEqual(self.after()["disqualified"], {XNNPACK_OBJECT: reason})
+
+    def test_equals_paths_keep_canonical_and_shell_quoted_input_restrictions(self):
+        self.assertEqual(evidence.object_name(XNNPACK_OBJECT), XNNPACK_OBJECT)
+        for name in (f"'{XNNPACK_OBJECT}'", f'"{XNNPACK_OBJECT}"', f"/{XNNPACK_OBJECT}",
+                     f"../{XNNPACK_OBJECT}", f"./{XNNPACK_OBJECT}", f"obj/../{XNNPACK_OBJECT}",
+                     XNNPACK_OBJECT.replace("obj/", "obj//", 1), f"C:/{XNNPACK_OBJECT}",
+                     XNNPACK_OBJECT.replace("/", "\\")):
+            with self.subTest(name=name):
+                with self.assertRaises(evidence.EvidenceError):
+                    evidence.object_name(name)
+        self.inputs = ["obj/a.o", f"'{XNNPACK_OBJECT}'", f'"{XNNPACK_OBJECT}"']
+        with mock.patch.object(evidence, "object_path", wraps=evidence.object_path) as paths:
+            baseline = self.before()
+            report = self.after()
+        self.assertEqual({call.args[1] for call in paths.call_args_list}, {"obj/a.o"})
+        self.assertEqual(baseline["membership"]["excluded_object_inputs"], 2)
+        self.assertEqual(baseline["membership"]["sha256"],
+                         hashlib.sha256(("\n".join(self.inputs) + "\n").encode()).hexdigest())
+        self.assertEqual(report["retained_count"], 1)
 
     def test_unsupported_inputs_excluded_without_normalization_or_file_access(self):
         for name in UNSUPPORTED_OBJECT_NAMES:
@@ -989,6 +1357,47 @@ class RealNinjaEvidenceTest(unittest.TestCase):
                 self.assertEqual(report["samples"][0]["status"], "appended_record_changed")
                 baseline_path = work / "upstream-reuse/baseline.json"
                 self.assertEqual(json.loads(baseline_path.read_text()), baseline)
+
+    def test_real_equals_input_quoting_and_raw_log_append_preserve_retention_v5_v6_v7(self):
+        for ninja in AVAILABLE:
+            with self.subTest(ninja=ninja), tempfile.TemporaryDirectory() as tmp:
+                work, out = self.make_work(Path(tmp), ninja)
+                build = out / "build.ninja"
+                text = build.read_text().replace("build chrome: phony archive\n",
+                                                "build chrome: phony equals-archive\n")
+                text += (f"build keep.o: copy source\nbuild {XNNPACK_OBJECT}: copy source\n"
+                         f"build equals-archive: copy keep.o | {XNNPACK_OBJECT}\n")
+                build.write_text(text)
+                subprocess.run([str(ninja), "chrome"], cwd=out, check=True, capture_output=True)
+                raw_inputs = evidence.query(ninja, out, ["-t", "inputs", "chrome"], evidence.MAX_INPUT_BYTES)
+                self.assertIn(f"'{XNNPACK_OBJECT}'".encode(), raw_inputs.splitlines())
+                self.assertNotIn(XNNPACK_OBJECT.encode(), raw_inputs.splitlines())
+                names, membership = evidence.target_inputs(ninja, out, ["chrome"])
+                self.assertEqual(names, {"keep.o"})
+                self.assertEqual(membership["excluded_object_inputs"], 1)
+                self.assertEqual(membership["sha256"], hashlib.sha256(raw_inputs).hexdigest())
+                baseline = evidence.before(work, "linux", "x64", ninja)
+                expected = {"chromix-ninja-v1.11.1": 5, "chromix-ninja-v1.12.1": 6, "chromix-ninja-v1.13.2": 7}
+                self.assertEqual(baseline["log"]["version"], expected[ninja.parent.name])
+                self.assertEqual([sample["output"] for sample in baseline["samples"]], ["keep.o"])
+                self.assertEqual(baseline["log"]["unselected_unsupported_object_records"], 0)
+                baseline_path = work / "upstream-reuse/baseline.json"
+                saved = baseline_path.read_bytes()
+                prefix = (out / ".ninja_log").read_bytes()
+                (out / XNNPACK_OBJECT).unlink()
+                result = subprocess.run([str(ninja), "chrome"], cwd=out, check=True, capture_output=True)
+                raw_log = (out / ".ninja_log").read_bytes()
+                self.assertEqual(raw_log[:len(prefix)], prefix)
+                suffix = raw_log[len(prefix):]
+                self.assertIn(f"\t{XNNPACK_OBJECT}\t".encode(), suffix)
+                self.assertNotIn(f"\t'{XNNPACK_OBJECT}'\t".encode(), suffix)
+                report = evidence.after(work, "linux", "x64", ninja, exit_code=result.returncode)
+                self.assertEqual(report["retained_count"], 1)
+                self.assertTrue(report["retention_proven"])
+                self.assertEqual(report["disqualified"], {})
+                self.assertTrue(report["log"]["prefix_matches_previous"])
+                self.assertEqual(report["log"]["unselected_unsupported_object_records"], 0)
+                self.assertEqual(baseline_path.read_bytes(), saved)
 
     def test_real_unsupported_closure_and_log_outputs_never_sampled_v5_v6_v7(self):
         for ninja in AVAILABLE:

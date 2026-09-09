@@ -518,12 +518,12 @@ class GenPosixWorkflowTest(unittest.TestCase):
         import yaml
         data = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
         jobs = data["jobs"]
-        self.assertEqual(list(jobs), [f"posix-{i}" for i in range(1, 9)])
+        self.assertEqual(list(jobs), [f"posix-{i}" for i in range(1, 9)] + ["verify-linux-arm64"])
         stub = re.compile(r"\$\{\{[^}]*\}\}")
         checked = 0
         for name, job in jobs.items():
             needs = job.get("needs")
-            if needs:
+            if needs and name.startswith("posix-"):
                 self.assertIn("always()", job["if"])
                 self.assertIn(f"needs.{needs}.result == 'success'", job["if"])
                 self.assertIn(f"needs.{needs}.outputs.finished != 'true'",
@@ -572,8 +572,8 @@ class GenPosixWorkflowTest(unittest.TestCase):
     def test_every_stage_selects_sdk_and_only_uploads_successful_handoffs(self):
         import yaml
         data = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
-        for job in data["jobs"].values():
-            steps = job["steps"]
+        for index in range(1, 9):
+            steps = data["jobs"][f"posix-{index}"]["steps"]
             names = [step.get("name", "") for step in steps]
             self.assertLess(names.index("Select compatible Xcode"),
                             names.index("Inspect macOS toolchain"))

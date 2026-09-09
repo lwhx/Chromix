@@ -130,8 +130,10 @@ def select_ninja(work: Path, system: str, arch: str) -> Path:
         if (system, arch) not in (("linux", "x64"), ("linux", "arm64"),
                                  ("macos", "x64"), ("macos", "arm64"), ("windows", "x64")):
             raise ValueError("unsupported restored build target")
-        if report["host"] != [system, arch]:
-            raise ValueError(f"a native {system} {arch} runner is required")
+        if (report["host"] != [system, arch]
+                and (system, arch, *report["host"]) != ("linux", "arm64", "linux", "x64")):
+            raise ValueError(f"a native {system} {arch} runner is required (Linux ARM64 also supports Linux x64 hosts)")
+        host_arch = report["host"][1]
         if not (src / ".chromix-upstream-restored.json").is_file():
             raise ValueError("restored source receipt is required")
         log = src / "out/Default/.ninja_log"
@@ -166,7 +168,7 @@ def select_ninja(work: Path, system: str, arch: str) -> Path:
                     raise ValueError("candidate is not an executable file")
                 architectures = binary_architectures(path, system)
                 entry["architectures"] = sorted(architectures)
-                if arch not in architectures:
+                if host_arch not in architectures:
                     raise ValueError("candidate header does not match the native platform/architecture")
                 version = probe_version(path, work)
                 supported = version_format(version)
