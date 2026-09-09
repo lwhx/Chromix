@@ -35,13 +35,15 @@ def digest(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def parse_manifest(text: str) -> dict[str, str]:
+def parse_manifest(text: str, allowed_assets: set[str] | None = None) -> dict[str, str]:
+    allowed_assets = ASSETS if allowed_assets is None else allowed_assets
     result = {}
     for line in text.splitlines():
         if not line.strip():
             continue
-        match = re.fullmatch(r"([a-fA-F0-9]{64})\s+\*?(chromix-[\w-]+\.zip)", line.strip())
-        if not match or match[2] not in ASSETS or match[2] in result:
+        match = re.fullmatch(r"([a-fA-F0-9]{64})[ \t]+\*?([A-Za-z0-9][A-Za-z0-9._-]*)", line.strip())
+        if (not match or match[2] not in allowed_assets or match[2] == "SHA256SUMS"
+                or match[2] in result):
             raise ValueError("Invalid or duplicate SHA256SUMS entry")
         result[match[2]] = match[1].lower()
     return result
@@ -89,17 +91,6 @@ def validate_run(run: dict, repo: str, head_sha: str | None = None) -> tuple[str
     return WORKFLOWS[run["name"]]
 
 
-def validate_runs(runs: dict[str, dict], repo: str) -> str:
-    if set(runs) != set(WORKFLOWS):
-        raise ValueError("All five platform workflows are required")
-    head_sha = runs[next(iter(WORKFLOWS))]["head_sha"]
-    for name, run in runs.items():
-        validate_run(run, repo, head_sha)
-        if run["name"] != name:
-            raise ValueError("Workflow run does not match its platform")
-    return head_sha
-
-
 def validate_bundle(path: Path) -> None:
     with zipfile.ZipFile(path) as archive:
         names = archive.namelist()
@@ -134,7 +125,7 @@ def collect(repo: str, run: dict, root: Path) -> dict[str, Path]:
             raise ValueError(f"Unexpected artifact contents: {name}")
         checksum = digest(files[asset])
         if "SHA256SUMS" in files:
-            sums = parse_manifest(files["SHA256SUMS"].read_text(encoding="ascii"))
+            sums = parse_manifest(files["SHA256SUMS"].read_text(encoding="ascii"), {asset})
             if sums.get(asset) != checksum:
                 raise ValueError(f"Checksum mismatch: {asset}")
         else:
@@ -144,9 +135,24 @@ def collect(repo: str, run: dict, root: Path) -> dict[str, Path]:
     return result
 
 
-def validate_release_revision(repo: str, tag: str, head_sha: str, release: dict | None) -> None:
+def source_version(repo: str, sha: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise ValueError("Invalid source commit")
+    version = gh("api", f"repos/{repo}/contents/CHROMIUM_VERSION?ref={sha}",
+                 "-H", "Accept: application/vnd.github.raw+json")
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise ValueError("Invalid Chromium version in the built commit")
+    return version
+
+
+def validate_release_revision(repo: str, tag: str, head_sha: str | None, release: dict | None) -> str:
+    if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+", tag):
+        raise ValueError("Invalid release version tag")
+    if head_sha is not None and source_version(repo, head_sha) != tag[1:]:
+        raise ValueError("Incoming source Chromium version does not match release tag")
     refs = api(repo, f"git/matching-refs/tags/{tag}")
     ref = next((ref for ref in refs if ref["ref"] == f"refs/tags/{tag}"), None)
+    pinned_sha = head_sha
     if ref:
         obj = ref["object"]
         seen = set()
@@ -155,96 +161,211 @@ def validate_release_revision(repo: str, tag: str, head_sha: str, release: dict 
                 raise ValueError("Invalid annotated release tag chain")
             seen.add(obj["sha"])
             obj = api(repo, f"git/tags/{obj['sha']}")["object"]
-        if obj["type"] != "commit" or obj["sha"] != head_sha:
-            raise ValueError(f"Release tag {tag} does not point to the built commit")
-    elif release and (not release.get("draft") or release.get("target_commitish") != head_sha):
-        raise ValueError("Existing release has no verifiable tag or draft commit")
+        if obj["type"] != "commit":
+            raise ValueError("Release tag does not point to a commit")
+        pinned_sha = obj["sha"]
+    elif release:
+        target = release.get("target_commitish", "")
+        if not release.get("draft") or not re.fullmatch(r"[0-9a-f]{40}", target):
+            raise ValueError("Existing release has no verifiable tag or draft commit")
+        pinned_sha = target
+    if pinned_sha is None:
+        raise ValueError("No verifiable release commit")
+    if pinned_sha != head_sha and source_version(repo, pinned_sha) != tag[1:]:
+        raise ValueError("Pinned tag commit Chromium version does not match release tag")
     if release:
         target = release.get("target_commitish", "")
-        if re.fullmatch(r"[0-9a-fA-F]{40}", target) and target.lower() != head_sha:
-            raise ValueError("Existing release targets a different commit")
-        commits = re.findall(r"Source commit:\s*`?([0-9a-fA-F]{40})", release.get("body") or "")
-        if any(commit.lower() != head_sha for commit in commits):
-            raise ValueError("Existing release provenance references a different commit")
+        if re.fullmatch(r"[0-9a-fA-F]{40}", target) and target.lower() != pinned_sha:
+            raise ValueError("Existing release target conflicts with its pinned tag commit")
+    return pinned_sha
 
 
-def publish(repo: str, runs: dict[str, dict], tag: str, bundles: dict[str, Path], root: Path) -> None:
-    head_sha = validate_runs(runs, repo)
-    if set(bundles) != ASSETS:
-        raise ValueError("All five verified browser bundles are required before publishing")
-    releases = json.loads(gh("api", "--paginate", "--slurp", f"repos/{repo}/releases?per_page=100"))
-    release = next((r for page in releases for r in page if r["tag_name"] == tag), None)
-    validate_release_revision(repo, tag, head_sha, release)
-    existing = {a["name"]: a for a in release["assets"]} if release else {}
-    hashes = {}
-    old_dir = root / "existing"
-    old_dir.mkdir()
-    if "SHA256SUMS" in existing:
-        gh("release", "download", tag, "--repo", repo, "--pattern", "SHA256SUMS", "--dir", str(old_dir))
-        hashes = parse_manifest((old_dir / "SHA256SUMS").read_text(encoding="ascii"))
+def recover_release_manifest(repo: str, tag: str, existing: dict, directory: Path,
+                             *, include_backups: bool = False) -> tuple[str, dict[str, str]]:
+    backups = {name for name in existing if re.fullmatch(r"SHA256SUMS\.backup\.[0-9a-f]{64}", name)}
+    names = ["SHA256SUMS"] if "SHA256SUMS" in existing else []
+    if include_backups or not names:
+        names += sorted(backups)
+    candidates = []
+    for name in names:
+        gh("release", "download", tag, "--repo", repo, "--pattern", name, "--dir", str(directory))
+        path = directory / name
+        if name in backups and digest(path) != name.rsplit(".", 1)[1]:
+            raise ValueError(f"Existing manifest backup digest mismatch: {name}")
+        text = path.read_bytes().decode("ascii")
+        hashes = parse_manifest(text, (set(existing) | ASSETS) - backups)
         if set(hashes) - set(existing):
             raise ValueError("Existing manifest references missing release assets")
-    for name in sorted(set(existing) & ASSETS):
+        candidates.append((text, hashes))
+    if not candidates:
+        return "", {}
+    text, hashes = max(candidates, key=lambda candidate: len(candidate[0]))
+    if any(not text.startswith(candidate[0]) for candidate in candidates):
+        raise ValueError("Existing manifest backups do not form an append-only history")
+    if include_backups and "SHA256SUMS" in existing:
+        primary = directory / "primary"
+        primary.mkdir()
+        (directory / "SHA256SUMS").rename(primary / "SHA256SUMS")
+    # Keep the recovered bytes available for rollback even when the primary was lost.
+    (directory / "SHA256SUMS").write_bytes(text.encode("ascii"))
+    return text, hashes
+
+
+def restore_release_manifest(repo: str, tag: str, release: dict, directory: Path) -> dict[str, str]:
+    existing = {asset["name"]: asset for asset in release["assets"]}
+    if len(existing) != len(release["assets"]):
+        raise ValueError("Duplicate existing release asset names")
+    pinned_sha = validate_release_revision(repo, tag, None, release)
+    _, hashes = recover_release_manifest(repo, tag, existing, directory, include_backups=True)
+    manifest = directory / "SHA256SUMS"
+    primary = directory / "primary" / "SHA256SUMS"
+    if not manifest.exists() or (primary.exists() and primary.read_bytes() == manifest.read_bytes()):
+        return hashes
+    assets_dir = directory / "assets"
+    assets_dir.mkdir()
+    for name, checksum in sorted(hashes.items()):
+        gh("release", "download", tag, "--repo", repo, "--pattern", name, "--dir", str(assets_dir))
+        if digest(assets_dir / name) != checksum:
+            raise ValueError(f"Existing release checksum mismatch: {name}")
+    if validate_release_revision(repo, tag, None, release) != pinned_sha:
+        raise ValueError("Pinned release commit changed during manifest verification")
+    try:
+        gh("release", "upload", tag, str(manifest), "--repo", repo, "--clobber")
+    except subprocess.CalledProcessError:
+        if primary.exists():
+            gh("release", "upload", tag, str(primary), "--repo", repo, "--clobber")
+        raise
+    return hashes
+
+
+def backup_release_manifest(repo: str, tag: str, manifest: Path, existing: dict, directory: Path) -> None:
+    name = "SHA256SUMS.backup." + digest(manifest)
+    directory.mkdir(exist_ok=True)
+    backup = directory / name
+    backup.write_bytes(manifest.read_bytes())
+    if name not in existing:
+        gh("release", "upload", tag, str(backup), "--repo", repo)
+        existing[name] = {"name": name}
+    verified = directory / "verified"
+    verified.mkdir(exist_ok=True)
+    path = verified / name
+    if not path.exists():
+        gh("release", "download", tag, "--repo", repo, "--pattern", name, "--dir", str(verified))
+    if path.read_bytes() != backup.read_bytes():
+        raise ValueError(f"Existing manifest backup digest mismatch: {name}")
+
+
+def publish(repo: str, run: dict, tag: str, bundles: dict[str, Path], root: Path) -> None:
+    assets = {name + ".zip" for name in validate_run(run, repo)}
+    if set(bundles) != assets or any(path.name != name for name, path in bundles.items()):
+        raise ValueError("Only the triggering platform's verified browser bundles may be published")
+    head_sha = run["head_sha"]
+    releases = json.loads(gh("api", "--paginate", "--slurp", f"repos/{repo}/releases?per_page=100"))
+    release = next((r for page in releases for r in page if r["tag_name"] == tag), None)
+    pinned_sha = validate_release_revision(repo, tag, head_sha, release)
+    existing = {a["name"]: a for a in release["assets"]} if release else {}
+    if release and len(existing) != len(release["assets"]):
+        raise ValueError("Duplicate existing release asset names")
+    old_dir = root / "existing"
+    old_dir.mkdir()
+    old_text, hashes = recover_release_manifest(repo, tag, existing, old_dir)
+    old_hashes = dict(hashes)
+    orphans = (set(existing) & ASSETS) - set(hashes)
+    if orphans - assets:
+        raise ValueError("Unrelated published browser assets are missing existing checksums")
+    verified_incoming = {}
+    if orphans:
+        if not ready_run(repo, run):
+            print(f"Pending release for {head_sha}: cannot recover an orphan from a stale platform run")
+            return
+        verified_incoming = collect(repo, run, root / "recovery-artifact")
+    # Verify every recorded hash, including sidecar licenses, without rewriting old ZIPs.
+    for name in sorted(set(hashes) | (set(existing) & ASSETS)):
         gh("release", "download", tag, "--repo", repo, "--pattern", name, "--dir", str(old_dir))
         actual = digest(old_dir / name)
         if name in hashes and hashes[name] != actual:
             raise ValueError(f"Existing release checksum mismatch: {name}")
+        if name in orphans and actual != digest(verified_incoming[name]):
+            raise ValueError(f"Unmanifested browser differs from verified incoming artifact: {name}")
         hashes[name] = actual
     for name, path in bundles.items():
         checksum = digest(path)
         if name in existing and hashes[name] != checksum:
             raise ValueError(f"Refusing to replace a different published browser: {name}")
         hashes[name] = checksum
-    # Recheck after all downloads, including existing release assets, before any write to GitHub.
-    current = successful_runs(repo, head_sha)
-    if (set(current) != set(WORKFLOWS)
-            or any(run_identity(current[name]) != run_identity(runs[name]) for name in WORKFLOWS)):
-        print(f"Pending release for {head_sha}: platform runs changed during artifact verification")
+    # Recheck the exact triggering attempt after all CI-side downloads and before any write.
+    if not ready_run(repo, run):
+        print(f"Pending release for {head_sha}: platform run changed during artifact verification")
         return
+    if validate_release_revision(repo, tag, head_sha, release) != pinned_sha:
+        raise ValueError("Pinned release commit changed during artifact verification")
     manifest = root / "SHA256SUMS"
-    manifest.write_text("".join(f"{hashes[name]}  {name}\n" for name in sorted(hashes)), encoding="ascii")
+    additions = "".join(f"{hashes[name]}  {name}\n" for name in sorted(set(hashes) - set(old_hashes)))
+    manifest_text = old_text + ("\n" if old_text and not old_text.endswith("\n") and additions else "") + additions
+    manifest.write_bytes(manifest_text.encode("ascii"))
     notes = root / "notes.md"
     body = (release.get("body") or "") if release else (
-        f"Chromix {tag[1:]} browser bundles. All five platforms are verified at one source commit. "
+        f"Chromix {tag[1:]} browser bundles. "
         "Browser assets are ZIP archives; verify downloads against SHA256SUMS.\n\n"
         "macOS bundles are not Developer ID signed or notarized. Gatekeeper may block them."
     )
-    for name in WORKFLOWS:
-        run = runs[name]
-        provenance = (f"\n\nVerified build: {run['html_url']}\n"
-                      f"Workflow: {name} (attempt {run.get('run_attempt', 1)})\n"
-                      f"Source commit: `{head_sha}`\n"
-                      f"Assets: {', '.join(asset + '.zip' for asset in WORKFLOWS[name])}.\n")
-        if provenance not in body:
-            body += provenance
+    body = body.replace("All five platforms are verified at one source commit. ", "")
+    policy = ("Platforms are published independently for this Chromium version and may use different "
+              "source commits. The version tag stays pinned to its initial source commit; "
+              "per-platform provenance below identifies each incoming build.")
+    if policy not in body:
+        body += "\n\n" + policy
+    provenance = (f"\n\nVerified build: https://github.com/{repo}/actions/runs/{run['id']}\n"
+                  f"Workflow: {run['name']} (attempt {run.get('run_attempt', 1)})\n"
+                  f"Source commit: `{head_sha}`\n"
+                  f"Assets: {', '.join(sorted(assets))}.\n")
+    if provenance not in body:
+        body += provenance
     notes.write_text(body, encoding="utf-8")
     if not release:
-        gh("release", "create", tag, "--repo", repo, "--target", head_sha,
+        gh("release", "create", tag, "--repo", repo, "--target", pinned_sha,
            "--title", f"Chromix {tag[1:]}", "--draft", "--notes-file", str(notes))
+    manifest_changed = "SHA256SUMS" not in existing or manifest_text != old_text
+    if manifest_changed and (old_dir / "SHA256SUMS").exists():
+        backup_release_manifest(repo, tag, old_dir / "SHA256SUMS", existing, root / "backups")
     for name, path in sorted(bundles.items()):
         if name not in existing:
             gh("release", "upload", tag, str(path), "--repo", repo)
-    gh("release", "upload", tag, str(manifest), "--repo", repo, "--clobber")
-    gh("release", "edit", tag, "--repo", repo, "--draft=false", "--notes-file", str(notes))
+    if manifest_changed:
+        if release and not release.get("draft"):
+            # Recovered manifests must also retain each platform's build provenance.
+            gh("release", "edit", tag, "--repo", repo, "--title", f"Chromix {tag[1:]}",
+               "--notes-file", str(notes))
+        backup_release_manifest(repo, tag, manifest, existing, root / "backups")
+        try:
+            gh("release", "upload", tag, str(manifest), "--repo", repo, "--clobber")
+        except subprocess.CalledProcessError:
+            # Immutable backups survive both delete-before-upload and failed rollback.
+            if (old_dir / "SHA256SUMS").exists():
+                gh("release", "upload", tag, str(old_dir / "SHA256SUMS"), "--repo", repo, "--clobber")
+            raise
+    gh("release", "edit", tag, "--repo", repo, "--title", f"Chromix {tag[1:]}",
+       "--draft=false", "--notes-file", str(notes))
     print(f"Published {tag}: {', '.join(sorted(bundles))}")
 
 
-def ready_runs(repo: str, event_run: dict) -> dict[str, dict]:
+def ready_run(repo: str, event_run: dict) -> dict | None:
     validate_run(event_run, repo)
     head_sha = event_run["head_sha"]
     run = api(repo, f"actions/runs/{int(event_run['id'])}")
     if (not matches_run(run, repo, head_sha) or run["name"] != event_run["name"]
-            or int(run["id"]) != int(event_run["id"])):
+            or run.get("event") != event_run["event"] or int(run["id"]) != int(event_run["id"])):
         raise ValueError("Triggering workflow run identity changed")
-    if run.get("status") != "completed" or run.get("conclusion") != "success":
-        print(f"Pending release for {head_sha}: triggering run is no longer successful")
-        return {}
-    runs = successful_runs(repo, head_sha)
-    if set(runs) != set(WORKFLOWS):
-        print(f"Pending release for {head_sha}: waiting for {', '.join(sorted(set(WORKFLOWS) - set(runs)))}")
-        return {}
-    validate_runs(runs, repo)
-    return runs
+    if (run.get("status") != "completed" or run.get("conclusion") != "success"
+            or run_identity(run) != run_identity(event_run)):
+        print(f"Pending release for {head_sha}: triggering attempt is no longer the successful event attempt")
+        return None
+    latest = successful_runs(repo, head_sha).get(run["name"])
+    if (latest is None or run_identity(latest) != run_identity(event_run)
+            or latest.get("event") != event_run["event"]):
+        print(f"Pending release for {head_sha}: {run['name']} event is not its latest successful run/attempt")
+        return None
+    return run
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -254,26 +375,20 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     repo = os.environ["GITHUB_REPOSITORY"]
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
-    runs = ready_runs(repo, event["workflow_run"])
+    run = ready_run(repo, event["workflow_run"])
     if args.check_ready:
-        ready = "true" if runs else "false"
+        ready = "true" if run else "false"
         with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
             output.write(f"ready={ready}\n")
         print(f"Release readiness: {ready}")
         return
-    if not runs:
+    if not run:
         return
-    head_sha = event["workflow_run"]["head_sha"]
-    version = gh("api", f"repos/{repo}/contents/CHROMIUM_VERSION?ref={head_sha}",
-                 "-H", "Accept: application/vnd.github.raw+json")
-    if not re.fullmatch(r"\d+\.\d+\.\d+\.\d+", version):
-        raise ValueError("Invalid Chromium version in the built commit")
+    version = source_version(repo, run["head_sha"])
     with tempfile.TemporaryDirectory(prefix="chromix-release-") as directory:
         root = Path(directory)
-        bundles = {}
-        for name in WORKFLOWS:
-            bundles.update(collect(repo, runs[name], root))
-        publish(repo, runs, "v" + version, bundles, root)
+        bundles = collect(repo, run, root)
+        publish(repo, run, "v" + version, bundles, root)
 
 
 if __name__ == "__main__":

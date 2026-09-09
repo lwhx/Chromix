@@ -12,9 +12,10 @@ per-launch browser persona across JavaScript-visible surfaces. It is built on
 pinned `ungoogled-chromium` sources and the matching Windows/Linux/macOS platform
 layer, then adds a reviewed Chromium 152 patch series and lightweight Python and
 Node SDKs. Five independent workflows build Windows x64, Linux x64/arm64,
-and macOS x64/arm64. Releases require all five workflows to succeed for the
-same source commit and all five ZIP bundles to pass checksum, extraction,
-version, and headless smoke checks.
+and macOS x64/arm64. Each platform publishes independently after its build,
+checksum, extraction, version, and headless smoke checks succeed. Successful
+platforms append to the same Chromium-version release tag; they need not share
+a source commit or wait for other platforms.
 
 > Chromix is intended for browser automation, compatibility testing, privacy
 > research, and controlled fingerprinting experiments. A custom browser does
@@ -44,13 +45,27 @@ version, and headless smoke checks.
 
 Prebuilt **Windows x64, Linux x64/arm64, and macOS x64/arm64** packages are
 published on the [GitHub Releases page](https://github.com/xiaozhou26/Chromix/releases)
-after all five independent platform workflows succeed for the same source commit.
-Every browser bundle is a ZIP accompanied by `SHA256SUMS`. macOS bundles remain
-unsigned and are not notarized because Apple signing credentials are not part of
-this build.
+as each independent platform succeeds, without waiting for the others. Available
+platforms accumulate under one `v<CHROMIUM_VERSION>` tag, titled `Chromix <version>`.
+The tag stays pinned to its initial source commit; notes identify each platform's
+actual source SHA and build run, which may differ for the same Chromium version.
+Existing assets and checksums are preserved, and an already published ZIP is never
+replaced with different bytes. Every browser bundle is accompanied by `SHA256SUMS`.
+macOS bundles remain unsigned and are not notarized because Apple signing
+credentials are not part of this build.
+
+Old aggregate runs are not automatically adopted. The selected Windows run `34080799322`
+(artifact `10066146011`, source `23fd0a7a0c63cd452cfaec6b2aba8469ef5d4123`) was
+verified and published manually to `v152.0.7977.82` as `Chromix 152.0.7977.82`, with
+the original ZIP unchanged and licenses supplied as sidecars. Successful artifacts
+from the old POSIX aggregate run `34308090891` likewise require manual verification
+before appending to that tag; a failed aggregate event cannot publish them. Future
+independent platform successes append automatically. See the release assets for
+current availability; this transition does not require another Windows build.
 
 | Browser version | Platform | Release |
 |---|---|---|
+| `152.0.7977.82` | Windows x64; other platforms pending | [`v152.0.7977.82`](https://github.com/xiaozhou26/Chromix/releases/tag/v152.0.7977.82) |
 | `152.0.7977.75` | Windows x64 | [`v152.0.7977.75`](https://github.com/xiaozhou26/Chromix/releases/tag/v152.0.7977.75) |
 | `151.0.7922.173` | Windows x64 | [`v151.0.7922.173`](https://github.com/xiaozhou26/Chromix/releases/tag/v151.0.7922.173) |
 

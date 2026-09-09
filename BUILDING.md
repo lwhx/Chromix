@@ -1,8 +1,9 @@
 # Building Chromix for Windows x64, Linux x64/arm64, and macOS x64/arm64
 
 The build scripts target Windows x64, Linux x64/arm64, and macOS x64/arm64 using
-pinned `ungoogled-chromium` sources. Releases are published only when the unified
-cross-platform workflow produces and verifies all five ZIP bundles.
+pinned `ungoogled-chromium` sources. Each successful platform is verified and
+published independently to its Chromium version's release tag; other platforms
+append as they succeed, without a five-platform or shared-source-SHA gate.
 
 Every platform uses this source-layer order:
 **Chromium archive → ungoogled core patches → matching platform patches →
@@ -499,16 +500,69 @@ packaging/extraction trees. Do not treat cleanup or a 100 GB estimate as proof
 of capacity.
 
 Each successful platform run uploads its browser ZIP and `SHA256SUMS` as an
-Actions artifact retained for 14 days. `release-browser.yml` reacts to each
-platform's successful completion, waits for all five workflows to succeed at
-the same source SHA, and validates every checksum, ZIP layout, and archive
-before publishing. Read-only readiness checks are isolated by source SHA; only
-a complete successful set enters the shared publication queue. Runs from
-different commits are never combined; a platform
-that is still running or failed leaves the release pending. Existing runs keep
-the workflow definition of their original commit, including any older unified
-run; preserving such builds does not make their artifacts eligible for a new
-commit's release. SDK package versions and release-channel pins are unchanged.
+Actions artifact retained for 14 days. `release-browser.yml` reacts only to
+successful completions of the five named platform entrypoints on this
+repository's `main` branch, from push or manual-dispatch events. A read-only
+readiness job validates the original successful event's workflow path, repository,
+source SHA, run, and attempt, then derives its Chromium version. Publication jobs
+are serialized per validated version, so different versions cannot replace one
+another in GitHub's pending queue. A later rerun does not discard the original
+event's version-wide reconciliation. Each discovered platform candidate must
+still be the latest successful run/attempt at its own SHA; a newer failed or
+running attempt blocks older success at that SHA, without hiding eligible success
+at another SHA. Other platforms' states and source SHAs do not gate publication.
+Candidate readiness is checked again after the queue and after all CI-side
+downloads. Release tooling is checked out from trusted `main` once, then pinned
+to that same tooling commit for publication; build-source SHAs remain separate
+provenance inputs.
+
+GitHub keeps only one pending job per concurrency group. Every surviving release
+job therefore reconciles all missing platform slots for the requested Chromium
+version, including eligible independent runs from different source SHAs, instead
+of relying only on its triggering event. Discovery inspects at most ten 100-run
+pages per platform and 200 distinct source versions, and fails explicitly on an
+incomplete scan before publication. Existing checksummed slots are preserved.
+A platform-local artifact download or validation failure is reported while other
+eligible platforms are still processed; shared release-integrity errors stop
+publication. A release-only catch-up can be dispatched without starting or
+retrying any build:
+
+```bash
+gh workflow run release-browser.yml --ref main -f version=152.0.7977.82
+```
+
+Publication validates the incoming checksum, required ZIP layout and licenses,
+and every member's CRC before appending that platform's ZIP to `v<CHROMIUM_VERSION>`.
+The incoming source and the existing tag's commit must both declare the tag's
+Chromium version. Different source SHAs are explicitly allowed for that version;
+notes record each platform's exact workflow, run, attempt, and source commit,
+without claiming a common source revision. The tag remains pinned to its initial
+source commit and the title remains `Chromix <version>`. Existing browser ZIPs,
+sidecar licenses, other assets, and recorded hashes are retained; different bytes
+under an existing browser asset name are rejected. Existing manifest entries
+are verified and preserved when new checksums are appended. Before replacing
+`SHA256SUMS`, publication stores and verifies immutable
+`SHA256SUMS.backup.<sha256>` assets for both manifest versions. A consistent
+append-only backup history can restore a missing primary or complete an
+interrupted append after rollback, independently of the next incoming platform.
+All recovered entries must match the existing release files before restoration.
+An uploaded browser without a recorded checksum is recoverable only by matching
+the exact incoming successful run's freshly downloaded and validated artifact;
+unrelated unrecorded browser assets stop publication. Public build provenance
+is written before saving the new manifest backup. New releases stay
+drafts until the incoming assets and manifest are uploaded successfully.
+
+Old aggregate runs are not automatically adopted by this change. In particular,
+POSIX aggregate run `34308090891` retains its old workflow name; a failed aggregate
+completion is never consumed even if an individual platform uploaded an artifact.
+The user-selected Windows artifact `10066146011` from successful run `34080799322`
+(source `23fd0a7a0c63cd452cfaec6b2aba8469ef5d4123`) is a separate manual verification
+and publication to `v152.0.7977.82`, titled `Chromix 152.0.7977.82`, with its ZIP
+unchanged, sidecar licenses, and `SHA256SUMS`. Successful platform artifacts from
+old aggregate runs also require manual verification and append to that same tag.
+Future independent platform successes use the automatic path above. No Windows
+retry is authorized as part of this release change; SDK package versions and
+release-channel pins are unchanged.
 
 ### Verify and run a POSIX candidate
 

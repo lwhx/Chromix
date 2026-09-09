@@ -1,9 +1,11 @@
 """Release orchestration tests use tiny ZIP fixtures and a mocked GitHub CLI."""
 import copy
+import hashlib
 import io
 import json
 import os
 import re
+import subprocess
 import tempfile
 import unittest
 import warnings
@@ -25,6 +27,10 @@ EXPECTED_WORKFLOWS = {
     "build-macos-arm64": ("chromix-mac-arm64",),
     "build-win-x64-github": ("chromix-win-x64",),
 }
+
+
+def backup_name(data):
+    return "SHA256SUMS.backup." + hashlib.sha256(data).hexdigest()
 
 
 def make_run(name="build-linux-x64", run_id=100, **changes):
@@ -54,9 +60,9 @@ def write_bundle(path, missing=None, extra=None, corrupt=False):
         with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
             for name in members:
                 if name != missing:
-                    archive.writestr(name, "fixture")
+                    archive.writestr(zipfile.ZipInfo(name), "fixture")
             if extra:
-                archive.writestr(*extra)
+                archive.writestr(zipfile.ZipInfo(extra[0]), extra[1])
     if corrupt:
         data = path.read_bytes()
         path.write_bytes(data.replace(b"fixture", b"corrupt", 1))
@@ -77,6 +83,11 @@ class ReleaseFixtureTest(unittest.TestCase):
         self.release_files = {}
         self.artifact_errors = {}
         self.version = "1.2.3.4"
+        self.source_versions = {}
+        self.uploaded_files = {}
+        self.notes = []
+        self.fail_upload = None
+        self.release_downloads = []
         self.event_run = self.runs["build-win-x64-github"]
         self.event_response = self.event_run
         self.listing_responses = []
@@ -85,7 +96,7 @@ class ReleaseFixtureTest(unittest.TestCase):
 
     def fake_gh(self, *args):
         if args[:3] == ("api", "--paginate", "--slurp"):
-            if args[3] == f"repos/{REPO}/actions/runs?head_sha={SHA}&per_page=100":
+            if re.fullmatch(f"repos/{REPO}/actions/runs\\?head_sha=[a-f0-9]{{40}}&per_page=100", args[3]):
                 pages = self.listing_responses.pop(0) if self.listing_responses else self.pages
                 return json.dumps(pages)
             if args[3] == f"repos/{REPO}/releases?per_page=100":
@@ -93,8 +104,10 @@ class ReleaseFixtureTest(unittest.TestCase):
         if args[0] == "api":
             if args[1] == f"repos/{REPO}/actions/runs/{self.event_run['id']}":
                 return json.dumps(self.event_response)
-            if args[1] == f"repos/{REPO}/contents/CHROMIUM_VERSION?ref={SHA}":
-                return self.version
+            prefix = f"repos/{REPO}/contents/CHROMIUM_VERSION?ref="
+            if args[1].startswith(prefix):
+                self.assertIn("Accept: application/vnd.github.raw+json", args)
+                return self.source_versions.get(args[1][len(prefix):], self.version)
             if args[1] == f"repos/{REPO}/git/matching-refs/tags/{TAG}":
                 return json.dumps(self.refs)
             for sha, obj in self.tags.items():
@@ -114,6 +127,9 @@ class ReleaseFixtureTest(unittest.TestCase):
             if error != "missing-checksum":
                 checksum = "0" * 64 if error == "checksum" else release.digest(asset)
                 (dest / "SHA256SUMS").write_text(f"{checksum}  {asset.name}\n")
+                if error == "foreign-checksum":
+                    with (dest / "SHA256SUMS").open("a") as stream:
+                        stream.write(f"{'a' * 64}  chromix-linux-x64.zip\n")
             if error == "unexpected":
                 (dest / "unrelated.txt").write_text("unexpected")
             return ""
@@ -121,10 +137,45 @@ class ReleaseFixtureTest(unittest.TestCase):
             name = args[args.index("--pattern") + 1]
             dest = Path(args[args.index("--dir") + 1])
             dest.mkdir(parents=True, exist_ok=True)
+            self.assertEqual(args[args.index("--repo") + 1], REPO)
+            self.assertFalse((dest / name).exists(), "gh download cannot overwrite an existing file")
+            self.release_downloads.append(name)
             (dest / name).write_bytes(self.release_files[name])
             return ""
         if args[:2] in (("release", "create"), ("release", "upload"), ("release", "edit")):
             self.mutations.append(args)
+            self.assertEqual(args[args.index("--repo") + 1], REPO)
+            if args[1] == "create":
+                self.assertIsNone(self.release)
+                self.release = {
+                    "tag_name": args[2], "target_commitish": args[args.index("--target") + 1],
+                    "draft": "--draft" in args, "body": "", "assets": [],
+                }
+            elif args[1] == "upload":
+                path = Path(args[3])
+                if "--clobber" in args:
+                    self.assertEqual(path.name, "SHA256SUMS", "ZIPs and backup assets must remain immutable")
+                    self.release_files.pop(path.name, None)
+                    self.release["assets"] = [asset for asset in self.release["assets"]
+                                              if asset["name"] != path.name]
+                elif path.name in self.release_files:
+                    raise subprocess.CalledProcessError(1, ["gh", *args])
+                if path.name == self.fail_upload:
+                    self.fail_upload = None
+                    raise subprocess.CalledProcessError(1, ["gh", *args])
+                data = path.read_bytes()
+                self.uploaded_files[path.name] = data
+                self.release_files[path.name] = data
+                self.release["assets"].append({"name": path.name})
+            elif "--draft=false" in args:
+                self.release["draft"] = False
+                if not any(ref["ref"] == f"refs/tags/{args[2]}" for ref in self.refs):
+                    self.refs.append({"ref": f"refs/tags/{args[2]}",
+                                      "object": {"type": "commit", "sha": self.release["target_commitish"]}})
+            if "--notes-file" in args:
+                notes = Path(args[args.index("--notes-file") + 1]).read_text()
+                self.notes.append(notes)
+                self.release["body"] = notes
             return ""
         raise AssertionError(f"Unexpected GitHub CLI invocation: {args}")
 
@@ -143,15 +194,21 @@ class ReleaseFixtureTest(unittest.TestCase):
             bundles[name] = path
         return bundles
 
-    def existing_release(self, bundles, draft=False):
-        self.refs = [{"ref": f"refs/tags/{TAG}", "object": {"type": "commit", "sha": SHA}}]
+    def incoming(self):
+        name = EXPECTED_WORKFLOWS[self.event_run["name"]][0] + ".zip"
+        path = self.root / "incoming" / name
+        write_bundle(path)
+        return {name: path}
+
+    def existing_release(self, bundles, draft=False, sha=SHA):
+        self.refs = [{"ref": f"refs/tags/{TAG}", "object": {"type": "commit", "sha": sha}}]
         self.release_files = {name: path.read_bytes() for name, path in bundles.items()}
         self.release_files["SHA256SUMS"] = "".join(
             f"{release.digest(path)}  {name}\n" for name, path in sorted(bundles.items())
         ).encode("ascii")
         self.release = {
-            "tag_name": TAG, "target_commitish": SHA, "draft": draft,
-            "body": f"Existing release\nSource commit: `{SHA}`\n",
+            "tag_name": TAG, "target_commitish": sha, "draft": draft,
+            "body": f"Existing release\nSource commit: `{sha}`\n",
             "assets": [{"name": name} for name in self.release_files],
         }
 
@@ -177,33 +234,36 @@ class RunSelectionTest(ReleaseFixtureTest):
         ):
             self.assertIn(condition, source)
         self.assertNotIn("build-cross-platform", source)
-        self.assertIn("group: release-browser-${{ github.event.workflow_run.head_sha }}", source)
+        self.assertNotIn("build-posix-github", source)
+        self.assertNotIn("group: release-browser-${{ github.event.workflow_run.head_sha }}", source)
         self.assertIn("cancel-in-progress: false", source)
 
-    def test_incomplete_events_cannot_enter_global_publish_queue(self):
+    def test_invalid_events_cannot_enter_validated_version_publish_queue(self):
         path = Path(__file__).resolve().parents[2] / ".github/workflows/release-browser.yml"
         source = path.read_text()
         defaults, jobs = source.split("\njobs:\n", 1)
         readiness, publishing = jobs.split("\n  release:\n", 1)
         self.assertIn("permissions:\n  actions: read\n  contents: read\n", defaults)
-        self.assertIn("group: release-browser-${{ github.event.workflow_run.head_sha }}", defaults)
+        self.assertNotIn("concurrency:", defaults)
         self.assertNotIn("contents: write", readiness)
         self.assertNotIn("concurrency:", readiness)
-        self.assertIn("  readiness:\n", readiness)
         self.assertIn("ready: ${{ steps.check.outputs.ready }}", readiness)
-        self.assertIn("id: check", readiness)
-        self.assertIn("python3 tools/release_browser.py --check-ready", readiness)
-        self.assertIn("github.event.workflow_run.conclusion == 'success'", readiness)
+        self.assertIn("version: ${{ steps.check.outputs.version }}", readiness)
+        self.assertIn("python3 tools/reconcile_browser_release.py --check-ready", readiness)
         self.assertIn("needs: readiness\n    if: needs.readiness.outputs.ready == 'true'", publishing)
-        self.assertIn("    concurrency:\n      group: release-browser-publish\n      cancel-in-progress: false", publishing)
+        self.assertIn("    concurrency:\n      group: release-browser-publish-${{ needs.readiness.outputs.version }}\n"
+                      "      cancel-in-progress: false", publishing)
+        self.assertIn("RELEASE_VERSION: ${{ needs.readiness.outputs.version }}", publishing)
+        self.assertNotIn("inputs.version", publishing)
+        self.assertNotIn("github.event.workflow_run.head_sha", publishing)
         self.assertIn("contents: write", publishing)
-        self.assertIn("run: python3 tools/release_browser.py\n", publishing)
-        self.assertNotIn("--check-ready", publishing)
+        self.assertIn("run: python3 tools/reconcile_browser_release.py\n", publishing)
+        self.assertIn("ref: main", readiness)
+        self.assertIn("controller_sha: ${{ steps.controller.outputs.sha }}", readiness)
+        self.assertIn("ref: ${{ needs.readiness.outputs.controller_sha }}", publishing)
+        self.assertNotIn("ref: ${{ github.event.workflow_run.head_sha }}", source)
         for job in (readiness, publishing):
-            self.assertIn("uses: actions/checkout@v4", job)
-            self.assertIn("ref: ${{ github.event.workflow_run.head_sha }}", job)
             self.assertIn("persist-credentials: false", job)
-            self.assertIn("uses: actions/setup-python@v5", job)
             self.assertIn("python-version: '3.13'", job)
 
     def test_listing_checks_sha_both_repositories_branch_event_name_and_path(self):
@@ -253,18 +313,6 @@ class RunSelectionTest(ReleaseFixtureTest):
             self.pages = [{"workflow_runs": [run]} for run in runs]
             self.assertEqual(release.successful_runs(REPO, SHA), {})
 
-    def test_validation_rejects_mixed_sha_or_workflow_mapping(self):
-        self.assertEqual(release.validate_runs(self.runs, REPO), SHA)
-        for changes in ({"head_sha": OTHER_SHA}, {"conclusion": "failure"}, {"status": "in_progress"}):
-            runs = copy.deepcopy(self.runs)
-            runs["build-linux-arm64"].update(changes)
-            with self.subTest(changes=changes), self.assertRaises(ValueError):
-                release.validate_runs(runs, REPO)
-        runs = dict(self.runs)
-        runs["build-linux-x64"] = runs["build-macos-x64"]
-        with self.assertRaises(ValueError):
-            release.validate_runs(runs, REPO)
-
 
 class BundleValidationTest(ReleaseFixtureTest):
     def test_manifest_accepts_named_assets_and_rejects_invalid_entries(self):
@@ -274,6 +322,11 @@ class BundleValidationTest(ReleaseFixtureTest):
                      f"{'a' * 64}  chromix-linux-x64.zip\n{'b' * 64}  chromix-linux-x64.zip\n"):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 release.parse_manifest(text)
+
+    def test_manifest_rejects_unsafe_paths_even_when_listed_as_existing_assets(self):
+        for name in ("../LICENSE", "/LICENSE", "dir/LICENSE", "LICENSE\\outside", "LICENSE:stream", "SHA256SUMS"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                release.parse_manifest(f"{'a' * 64}  {name}\n", {name})
 
     def test_all_five_platform_layouts(self):
         for path in self.bundles().values():
@@ -321,31 +374,49 @@ class ReadinessTest(ReleaseFixtureTest):
             self.assertTrue(any(f"repos/{REPO}/actions/runs" in arg for arg in call.args))
 
     def test_ready_mode_outputs_true_without_downloads_or_github_writes(self):
+        self.pages = [{"workflow_runs": [self.event_run]}]
         (self.root / "output").write_text("existing=value\n")
         self.run_main("--check-ready")
         self.assertEqual((self.root / "output").read_text(), "existing=value\nready=true\n")
         self.assertEqual(self.gh.call_count, 2)
         self.assert_read_only()
 
-    def test_missing_failed_running_or_foreign_sha_platform_outputs_false(self):
-        for state in ("missing", "failure", "in_progress", "other-sha", "trigger-rerun"):
-            with self.subTest(state=state):
-                self.pages = [{"workflow_runs": copy.deepcopy(list(self.runs.values()))}]
-                self.event_response = self.event_run
-                if state == "missing":
-                    self.pages[0]["workflow_runs"].pop(0)
-                elif state == "other-sha":
-                    self.pages[0]["workflow_runs"][0]["head_sha"] = OTHER_SHA
-                elif state == "trigger-rerun":
-                    self.event_response = {**self.event_run, "status": "in_progress", "conclusion": None}
-                else:
-                    self.pages[0]["workflow_runs"].append(make_run(
-                        run_id=100, run_attempt=2, status="completed" if state == "failure" else state,
-                        conclusion="failure" if state == "failure" else None))
+    def test_other_platforms_missing_failed_running_or_foreign_sha_do_not_gate(self):
+        for changes in (None, {"conclusion": "failure"}, {"status": "in_progress"}, {"head_sha": OTHER_SHA}):
+            with self.subTest(changes=changes):
+                runs = [self.event_run]
+                if changes:
+                    runs.append(make_run(**changes))
+                self.pages = [{"workflow_runs": runs}]
+                (self.root / "output").write_text("")
+                self.run_main("--check-ready")
+                self.assertEqual((self.root / "output").read_text(), "ready=true\n")
+                self.assert_read_only()
+
+    def test_missing_stale_or_failed_trigger_is_not_ready(self):
+        for latest in (None, {"id": 200}, {"run_attempt": 2}, {"conclusion": "failure"},
+                       {"status": "in_progress", "conclusion": None}):
+            with self.subTest(latest=latest):
+                runs = [{**self.event_run, **latest}] if latest else []
+                self.pages = [{"workflow_runs": runs}]
                 (self.root / "output").write_text("")
                 self.run_main("--check-ready")
                 self.assertEqual((self.root / "output").read_text(), "ready=false\n")
                 self.assert_read_only()
+
+    def test_rerun_success_is_not_consumed_by_previous_attempt_event(self):
+        self.event_response = {**self.event_run, "run_attempt": 2}
+        self.pages = [{"workflow_runs": [self.event_response]}]
+        self.run_main("--check-ready")
+        self.assertEqual((self.root / "output").read_text(), "ready=false\n")
+        self.assert_read_only()
+
+    def test_newer_same_platform_other_sha_does_not_block(self):
+        self.pages = [{"workflow_runs": [self.event_run, {**self.event_run, "id": 200,
+                                                        "head_sha": OTHER_SHA, "conclusion": "failure"}]}]
+        self.run_main("--check-ready")
+        self.assertEqual((self.root / "output").read_text(), "ready=true\n")
+        self.assert_read_only()
 
     def test_invalid_trigger_does_not_emit_ready_output(self):
         self.event_response = {**self.event_run, "head_sha": OTHER_SHA}
@@ -357,7 +428,7 @@ class ReadinessTest(ReleaseFixtureTest):
     def test_publish_rechecks_readiness_after_waiting_for_global_queue(self):
         self.run_main("--check-ready")
         self.assertEqual((self.root / "output").read_text(), "ready=true\n")
-        self.pages[0]["workflow_runs"].append(make_run(run_id=100, run_attempt=2, conclusion="failure"))
+        self.pages[0]["workflow_runs"].append({**self.event_run, "run_attempt": 2, "conclusion": "failure"})
         self.run_main()
         self.assertIn("Pending release", self.stdout.getvalue())
         self.assertEqual(self.gh.call_count, 4)
@@ -365,31 +436,57 @@ class ReadinessTest(ReleaseFixtureTest):
 
 
 class MainTest(ReleaseFixtureTest):
-    def test_incomplete_set_is_normal_pending_without_download_or_publish(self):
-        self.pages[0]["workflow_runs"] = list(self.runs.values())[:-1]
-        self.run_main()
-        self.assertIn("Pending release", self.stdout.getvalue())
-        self.assertIn("build-win-x64-github", self.stdout.getvalue())
-        self.assertEqual(self.downloads, [])
-        self.assertEqual(self.mutations, [])
-        self.assertFalse(any("contents/CHROMIUM_VERSION" in str(call) for call in self.gh.call_args_list))
-
-    def test_old_trigger_is_pending_when_latest_platform_attempt_failed(self):
-        self.pages[0]["workflow_runs"].append(make_run(run_id=100, run_attempt=2, conclusion="failure"))
-        self.run_main()
-        self.assertIn("Pending release", self.stdout.getvalue())
-        self.assertEqual(self.downloads, [])
-        self.assertEqual(self.mutations, [])
+    def test_each_independent_platform_creates_a_draft_then_publishes_only_its_asset(self):
+        for name, run in self.runs.items():
+            with self.subTest(platform=name):
+                self.event_run = self.event_response = run
+                self.pages = [{"workflow_runs": [run]}]
+                self.downloads.clear()
+                self.mutations.clear()
+                self.uploaded_files.clear()
+                self.release = None
+                self.release_files.clear()
+                self.refs = []
+                self.run_main()
+                asset = EXPECTED_WORKFLOWS[name][0] + ".zip"
+                self.assertEqual(self.downloads, [(run["id"], asset[:-4])])
+                manifest_bytes = self.uploaded_files["SHA256SUMS"]
+                backup = backup_name(manifest_bytes)
+                self.assertEqual(set(self.uploaded_files), {asset, "SHA256SUMS", backup})
+                self.assertEqual(self.release_files[backup], manifest_bytes)
+                self.assertIn(backup, self.release_downloads)
+                manifest = release.parse_manifest(manifest_bytes.decode())
+                self.assertEqual(set(manifest), {asset})
+                self.assertEqual(self.mutations[0][:2], ("release", "create"))
+                self.assertIn("--draft", self.mutations[0])
+                self.assertEqual(self.mutations[0][self.mutations[0].index("--target") + 1], SHA)
+                self.assertEqual(self.mutations[0][self.mutations[0].index("--title") + 1], "Chromix 1.2.3.4")
+                self.assertEqual([args[1] for args in self.mutations], ["create", "upload", "upload", "upload", "edit"])
+                self.assertEqual([Path(args[3]).name for args in self.mutations if args[1] == "upload"],
+                                 [asset, backup, "SHA256SUMS"])
+                self.assertFalse(self.release["draft"])
+                self.assertIn("--draft=false", self.mutations[-1])
+                notes = self.notes[-1]
+                self.assertEqual(notes.count("Verified build:"), 1)
+                self.assertIn(f"Workflow: {name} (attempt 1)", notes)
+                self.assertIn(f"Source commit: `{SHA}`", notes)
+                self.assertIn(f"Assets: {asset}", notes)
+                self.assertIn(run["html_url"], notes)
+                self.assertNotIn("All five", notes)
+                self.assertNotIn("only Windows", notes)
 
     def test_trigger_that_has_started_rerunning_is_pending(self):
         self.event_response = {**self.event_run, "status": "in_progress", "conclusion": None, "run_attempt": 2}
         self.run_main()
         self.assertIn("Pending release", self.stdout.getvalue())
         self.assertEqual(self.downloads, [])
+        self.assertEqual(self.mutations, [])
 
-    def test_trigger_api_cannot_change_commit_or_workflow(self):
-        for changes in ({"head_sha": OTHER_SHA}, {"name": "build-linux-x64"},
-                        {"repository": {"full_name": "other/chromix"}}):
+    def test_trigger_api_cannot_change_commit_workflow_path_id_or_event(self):
+        for changes in ({"head_sha": OTHER_SHA}, {"name": "build-linux-x64"}, {"id": 999},
+                        {"event": "workflow_dispatch"}, {"path": ".github/workflows/copied.yml"},
+                        {"repository": {"full_name": "other/chromix"}},
+                        {"head_repository": {"full_name": "other/chromix"}}, {"head_branch": "feature"}):
             with self.subTest(changes=changes):
                 self.event_response = {**self.event_run, **changes}
                 with self.assertRaisesRegex(ValueError, "identity changed"):
@@ -397,53 +494,38 @@ class MainTest(ReleaseFixtureTest):
         self.assertEqual(self.downloads, [])
         self.assertEqual(self.mutations, [])
 
-    def test_any_invalid_artifact_blocks_all_publication_including_bad_fifth(self):
-        for error in ("layout", "checksum", "missing-checksum", "unexpected", "corrupt", "expired"):
+    def test_old_aggregate_event_is_never_consumed_even_with_successful_platform_artifacts(self):
+        for name in ("build-cross-platform", "build-posix-github"):
+            for conclusion in ("failure", "success"):
+                with self.subTest(name=name, conclusion=conclusion):
+                    self.event_run = make_run(name, 34308090891, conclusion=conclusion)
+                    with self.assertRaises(ValueError):
+                        self.run_main()
+        self.gh.assert_not_called()
+
+    def test_invalid_incoming_artifact_blocks_all_mutations(self):
+        for error in ("layout", "checksum", "missing-checksum", "foreign-checksum", "unexpected", "corrupt", "expired"):
             with self.subTest(error=error):
                 self.downloads.clear()
                 self.artifact_errors["chromix-win-x64"] = error
                 with self.assertRaises((ValueError, zipfile.BadZipFile, RuntimeError)):
                     self.run_main()
-                self.assertEqual(len(self.downloads), 5)
+                self.assertEqual(self.downloads, [(self.event_run["id"], "chromix-win-x64")])
                 self.assertEqual(self.mutations, [])
 
     def test_run_changes_during_download_remain_pending(self):
-        for status, conclusion in (("in_progress", None), ("completed", "failure"), ("completed", "success")):
-            with self.subTest(status=status, conclusion=conclusion):
-                current = copy.deepcopy(self.pages)
-                current[0]["workflow_runs"][0].update(run_attempt=2, status=status, conclusion=conclusion)
-                self.listing_responses = [self.pages, current]
+        for changes in ({"run_attempt": 2, "status": "in_progress", "conclusion": None},
+                        {"run_attempt": 2, "conclusion": "failure"}, {"run_attempt": 2}, {"id": 200}):
+            with self.subTest(changes=changes):
+                self.listing_responses = [self.pages, [{"workflow_runs": [{**self.event_run, **changes}]}]]
                 self.run_main()
                 self.assertEqual(self.mutations, [])
-                self.assertIn("platform runs changed", self.stdout.getvalue())
+                self.assertIn("platform run changed", self.stdout.getvalue())
 
-    def test_last_completed_event_publishes_only_after_all_five_validate(self):
-        real_publish = release.publish
-
-        def checked_publish(repo, runs, tag, bundles, root):
-            self.assertEqual(len(self.downloads), 5)
-            self.assertEqual(set(bundles), release.ASSETS)
-            self.assertEqual(self.mutations, [])
-            for path in bundles.values():
-                release.validate_bundle(path)
-            real_publish(repo, runs, tag, bundles, root)
-            notes = (root / "notes.md").read_text()
-            self.assertEqual(notes.count(f"Source commit: `{SHA}`"), 5)
-            for name, run in self.runs.items():
-                self.assertIn(run["html_url"], notes)
-                self.assertIn(f"Workflow: {name} (attempt 1)", notes)
-                self.assertIn(f"Assets: {EXPECTED_WORKFLOWS[name][0]}.zip", notes)
-            self.assertEqual(set(release.parse_manifest((root / "SHA256SUMS").read_text())), release.ASSETS)
-
-        with patch.object(release, "publish", side_effect=checked_publish) as publish:
-            self.run_main()
-        publish.assert_called_once()
-        self.assertEqual(self.mutations[0][:2], ("release", "create"))
-        self.assertIn("--draft", self.mutations[0])
-        self.assertEqual(self.mutations[0][self.mutations[0].index("--target") + 1], SHA)
-        self.assertEqual(len([args for args in self.mutations if args[:2] == ("release", "upload")]), 6)
-        self.assertEqual(self.mutations[-1][:2], ("release", "edit"))
-        self.assertIn("--draft=false", self.mutations[-1])
+    def test_other_platform_changes_during_download_do_not_block(self):
+        self.listing_responses = [self.pages, [{"workflow_runs": [self.event_run, make_run(conclusion="failure")]}]]
+        self.run_main()
+        self.assertEqual(self.mutations[-1][1], "edit")
 
     def test_invalid_version_blocks_collection_and_publication(self):
         self.version = "not-a-version"
@@ -452,145 +534,404 @@ class MainTest(ReleaseFixtureTest):
         self.assertEqual(self.downloads, [])
         self.assertEqual(self.mutations, [])
 
+    def test_new_release_upload_failure_leaves_draft_not_partial_public_release(self):
+        for asset in ("chromix-win-x64.zip", "SHA256SUMS"):
+            with self.subTest(asset=asset):
+                self.fail_upload = asset
+                self.mutations.clear()
+                self.release = None
+                self.release_files.clear()
+                self.refs = []
+                with self.assertRaises(subprocess.CalledProcessError):
+                    self.run_main()
+                self.assertTrue(self.release["draft"])
+                self.assertNotIn("SHA256SUMS", self.release_files)
+                self.assertEqual(self.mutations[0][1], "create")
+                self.assertIn("--draft", self.mutations[0])
+                self.assertNotIn("edit", [args[1] for args in self.mutations])
 
-class PublicationTest(ReleaseFixtureTest):
-    def test_publishing_requires_complete_same_sha_runs_and_assets(self):
-        bundles = self.bundles()
-        incomplete = dict(bundles)
-        incomplete.pop("chromix-win-x64.zip")
-        with self.assertRaisesRegex(ValueError, "All five verified"):
-            release.publish(REPO, self.runs, TAG, incomplete, self.root)
-        self.runs["build-macos-arm64"]["head_sha"] = OTHER_SHA
-        with self.assertRaises(ValueError):
-            release.publish(REPO, self.runs, TAG, bundles, self.root)
-        self.gh.assert_not_called()
 
-    def test_existing_tag_must_resolve_to_built_sha_even_without_release(self):
-        bundles = self.bundles()
+class RevisionTest(ReleaseFixtureTest):
+    def test_incoming_version_must_match_valid_tag_before_downloads_or_writes(self):
+        bundles = self.incoming()
+        for tag, version in ((TAG, "9.9.9.9"), ("v1.2.3.4-other", "1.2.3.4"), (TAG, "not-a-version")):
+            with self.subTest(tag=tag, version=version):
+                self.version = version
+                with self.assertRaises(ValueError):
+                    release.publish(REPO, self.event_run, tag, bundles, self.root)
+                self.assertEqual(self.release_downloads, [])
+                self.assertEqual(self.mutations, [])
+
+    def test_existing_tag_can_point_to_other_sha_only_for_same_chromium_version(self):
         self.refs = [{"ref": f"refs/tags/{TAG}", "object": {"type": "commit", "sha": OTHER_SHA}}]
-        with self.assertRaisesRegex(ValueError, "does not point to the built commit"):
-            release.publish(REPO, self.runs, TAG, bundles, self.root)
+        self.assertEqual(release.validate_release_revision(REPO, TAG, SHA, None), OTHER_SHA)
+        self.source_versions[OTHER_SHA] = "1.2.3.5"
+        with self.assertRaisesRegex(ValueError, "Pinned tag commit Chromium version"):
+            release.publish(REPO, self.event_run, TAG, self.incoming(), self.root)
+        self.assertEqual(self.release_downloads, [])
         self.assertEqual(self.mutations, [])
 
-    def test_annotated_tags_are_peeled_and_checked(self):
+    def test_annotated_tags_are_peeled_and_version_checked(self):
         tag_sha = "c" * 40
         nested_sha = "d" * 40
         self.refs = [{"ref": f"refs/tags/{TAG}", "object": {"type": "tag", "sha": tag_sha}}]
         self.tags[tag_sha] = {"type": "tag", "sha": nested_sha}
-        self.tags[nested_sha] = {"type": "commit", "sha": SHA}
-        release.validate_release_revision(REPO, TAG, SHA, None)
-        self.tags[nested_sha]["sha"] = OTHER_SHA
-        with self.assertRaisesRegex(ValueError, "does not point"):
+        self.tags[nested_sha] = {"type": "commit", "sha": OTHER_SHA}
+        self.assertEqual(release.validate_release_revision(REPO, TAG, SHA, None), OTHER_SHA)
+        self.source_versions[OTHER_SHA] = "2.3.4.5"
+        with self.assertRaisesRegex(ValueError, "Pinned tag commit Chromium version"):
             release.validate_release_revision(REPO, TAG, SHA, None)
         self.tags[nested_sha] = {"type": "tag", "sha": tag_sha}
         with self.assertRaisesRegex(ValueError, "Invalid annotated"):
             release.validate_release_revision(REPO, TAG, SHA, None)
 
+    def test_noncommit_tag_is_rejected(self):
+        self.refs = [{"ref": f"refs/tags/{TAG}", "object": {"type": "tree", "sha": SHA}}]
+        with self.assertRaisesRegex(ValueError, "does not point to a commit"):
+            release.validate_release_revision(REPO, TAG, SHA, None)
+
     def test_similar_prefix_tag_is_not_treated_as_release_tag(self):
         self.refs = [{"ref": f"refs/tags/{TAG}-other", "object": {"type": "commit", "sha": OTHER_SHA}}]
-        release.validate_release_revision(REPO, TAG, SHA, None)
+        self.assertEqual(release.validate_release_revision(REPO, TAG, SHA, None), SHA)
 
-    def test_existing_release_commit_and_provenance_cannot_conflict(self):
-        bundles = self.bundles()
-        for mismatch in ("tag", "target", "provenance", "missing-tag"):
-            with self.subTest(mismatch=mismatch):
-                self.existing_release(bundles)
-                if mismatch == "tag":
-                    self.refs[0]["object"]["sha"] = OTHER_SHA
-                elif mismatch == "target":
-                    self.release["target_commitish"] = OTHER_SHA
-                elif mismatch == "provenance":
-                    self.release["body"] = f"Source commit: `{OTHER_SHA}`"
-                else:
-                    self.refs = []
-                with self.assertRaises(ValueError):
-                    release.publish(REPO, self.runs, TAG, bundles, self.root)
-                self.assertEqual(self.mutations, [])
-                self.assertFalse((self.root / "existing").exists())
-
-    def test_published_branch_target_uses_immutable_tag_not_branch_tip(self):
-        bundles = self.bundles()
-        self.existing_release(bundles)
+    def test_release_target_must_match_immutable_tag_not_incoming_sha(self):
+        self.existing_release({}, sha=OTHER_SHA)
+        self.assertEqual(release.validate_release_revision(REPO, TAG, SHA, self.release), OTHER_SHA)
+        self.release["target_commitish"] = SHA
+        with self.assertRaisesRegex(ValueError, "target conflicts"):
+            release.validate_release_revision(REPO, TAG, SHA, self.release)
         self.release["target_commitish"] = "main"
-        release.publish(REPO, self.runs, TAG, bundles, self.root)
-        self.assertEqual([args[1] for args in self.mutations], ["upload", "edit"])
-        self.assertEqual(Path(self.mutations[0][3]).name, "SHA256SUMS")
+        self.assertEqual(release.validate_release_revision(REPO, TAG, SHA, self.release), OTHER_SHA)
 
-    def test_unpublished_draft_without_tag_requires_exact_commit(self):
-        bundles = self.bundles()
-        self.existing_release(bundles, draft=True)
+    def test_published_release_requires_tag_and_untagged_draft_requires_commit_version(self):
+        self.existing_release({}, sha=OTHER_SHA)
         self.refs = []
+        with self.assertRaisesRegex(ValueError, "no verifiable tag or draft commit"):
+            release.validate_release_revision(REPO, TAG, SHA, self.release)
+        self.release["draft"] = True
+        self.assertEqual(release.validate_release_revision(REPO, TAG, SHA, self.release), OTHER_SHA)
         self.release["target_commitish"] = "main"
         with self.assertRaisesRegex(ValueError, "no verifiable tag or draft commit"):
-            release.publish(REPO, self.runs, TAG, bundles, self.root)
-        self.release["target_commitish"] = SHA
-        release.publish(REPO, self.runs, TAG, bundles, self.root)
-        self.assertEqual([args[1] for args in self.mutations], ["upload", "edit"])
+            release.validate_release_revision(REPO, TAG, SHA, self.release)
+        self.release["target_commitish"] = OTHER_SHA
+        self.source_versions[OTHER_SHA] = "1.2.3.5"
+        with self.assertRaisesRegex(ValueError, "Pinned tag commit Chromium version"):
+            release.validate_release_revision(REPO, TAG, SHA, self.release)
 
-    def test_same_revision_retry_preserves_all_provenance_without_duplicates(self):
+    def test_new_release_uses_existing_tag_commit_without_moving_tag(self):
+        self.refs = [{"ref": f"refs/tags/{TAG}", "object": {"type": "commit", "sha": OTHER_SHA}}]
+        release.publish(REPO, self.event_run, TAG, self.incoming(), self.root)
+        create = self.mutations[0]
+        self.assertEqual(create[create.index("--target") + 1], OTHER_SHA)
+        self.assertTrue(all(args[0] == "release" for args in self.mutations))
+        self.assertNotIn("--target", self.mutations[-1])
+
+    def test_changed_pinned_commit_during_download_fails_before_mutation(self):
+        self.existing_release({}, sha=OTHER_SHA)
+        self.release["target_commitish"] = "main"
+        original_gh = self.fake_gh
+
+        def download_then_move_tag(*args):
+            result = original_gh(*args)
+            if args[:2] == ("release", "download"):
+                self.refs[0]["object"]["sha"] = "c" * 40
+            return result
+
+        self.gh.side_effect = download_then_move_tag
+        with self.assertRaisesRegex(ValueError, "Pinned release commit changed"):
+            release.publish(REPO, self.event_run, TAG, self.incoming(), self.root)
+        self.assertEqual(self.mutations, [])
+
+
+class PublicationTest(ReleaseFixtureTest):
+    def test_publishing_accepts_only_triggering_platform_asset(self):
+        for bundles in ({}, self.bundles(), {"chromix-win-x64.zip": self.root / "chromix-mac-x64.zip"}):
+            with self.subTest(assets=set(bundles)), self.assertRaisesRegex(ValueError, "triggering platform"):
+                release.publish(REPO, self.event_run, TAG, bundles, self.root)
+        self.gh.assert_not_called()
+
+    def test_append_to_different_sha_release_preserves_all_assets_hashes_and_provenance(self):
         bundles = self.bundles()
-        self.existing_release(bundles)
-        release.publish(REPO, self.runs, TAG, bundles, self.root)
-        notes = (self.root / "notes.md").read_text()
-        self.assertEqual(notes.count("Verified build:"), 5)
+        incoming = {"chromix-win-x64.zip": bundles.pop("chromix-win-x64.zip")}
+        sidecar = self.root / "LICENSE.chromium"
+        sidecar.write_text("license fixture")
+        bundles[sidecar.name] = sidecar
+        self.existing_release(bundles, sha=OTHER_SHA)
+        self.release_files["unlisted.txt"] = b"untouched metadata"
+        self.release["assets"].append({"name": "unlisted.txt"})
+        self.release["body"] += f"Source commit: `{'c' * 40}`\n"
+        original = copy.deepcopy(self.release_files)
+        original_notes = self.release["body"]
+        original_refs = copy.deepcopy(self.refs)
+        release.publish(REPO, self.event_run, TAG, incoming, self.root)
+        backups = {backup_name(original["SHA256SUMS"]), backup_name(self.uploaded_files["SHA256SUMS"])}
+        self.assertEqual(set(self.uploaded_files), {"chromix-win-x64.zip", "SHA256SUMS"} | backups)
+        for name, data in original.items():
+            if name != "SHA256SUMS":
+                self.assertEqual(self.release_files[name], data)
+        self.assertEqual(self.release_files[backup_name(original["SHA256SUMS"])], original["SHA256SUMS"])
+        self.assertEqual(self.release_files[backup_name(self.uploaded_files["SHA256SUMS"])],
+                         self.uploaded_files["SHA256SUMS"])
+        self.assertEqual(self.refs, original_refs)
+        self.assertTrue(self.uploaded_files["SHA256SUMS"].startswith(original["SHA256SUMS"]))
+        merged = release.parse_manifest(self.uploaded_files["SHA256SUMS"].decode(), set(original) | release.ASSETS)
+        for name, checksum in release.parse_manifest(original["SHA256SUMS"].decode(), set(original)).items():
+            self.assertEqual(merged[name], checksum)
+        self.assertEqual(set(merged), set(bundles) | set(incoming))
+        notes = self.notes[-1]
+        self.assertTrue(notes.startswith(original_notes))
+        self.assertIn(f"Source commit: `{SHA}`", notes)
+        self.assertIn("may use different source commits", notes)
+        self.assertNotIn("All five platforms", notes)
+        self.assertEqual(set(self.release_downloads), set(bundles) | {"SHA256SUMS"} | backups)
+        self.assertTrue(all("--target" not in args for args in self.mutations))
+        self.assertTrue(all("--clobber" not in args for args in self.mutations if args[1] == "upload"
+                            and Path(args[3]).name != "SHA256SUMS"))
+
+    def test_four_later_platforms_append_to_manual_windows_release_at_distinct_source_shas(self):
+        windows = self.incoming()["chromix-win-x64.zip"]
+        write_bundle(windows, missing="chromix/LICENSE.chromium")
+        initial = {windows.name: windows}
+        for name in ("LICENSE.chromix", "LICENSE.chromium"):
+            path = self.root / name
+            path.write_text(f"sidecar {name}")
+            initial[name] = path
+        self.existing_release(initial, sha=OTHER_SHA)
+        pinned_refs = copy.deepcopy(self.refs)
+        for index, name in enumerate(list(EXPECTED_WORKFLOWS)[:-1]):
+            with self.subTest(platform=name):
+                sha = str(index + 1) * 40
+                self.event_run = self.event_response = {**self.runs[name], "head_sha": sha}
+                self.pages = [{"workflow_runs": [self.event_run]}]
+                before = copy.deepcopy(self.release_files)
+                self.uploaded_files.clear()
+                self.mutations.clear()
+                root = self.root / name
+                root.mkdir()
+                release.publish(REPO, self.event_run, TAG, self.incoming(), root)
+                asset = EXPECTED_WORKFLOWS[name][0] + ".zip"
+                backups = {backup_name(before["SHA256SUMS"]), backup_name(self.uploaded_files["SHA256SUMS"])}
+                new_backups = backups - set(before)
+                self.assertEqual(set(self.uploaded_files), {asset, "SHA256SUMS"} | new_backups)
+                self.assertTrue(self.uploaded_files["SHA256SUMS"].startswith(before["SHA256SUMS"]))
+                for backup in backups:
+                    self.assertIn(backup, self.release_downloads)
+                for key, value in before.items():
+                    if key != "SHA256SUMS":
+                        self.assertEqual(self.release_files[key], value)
+                self.assertEqual(self.refs, pinned_refs)
+                self.assertIn(f"Source commit: `{sha}`", self.release["body"])
+                self.assertIn(f"Workflow: {name} (attempt 1)", self.release["body"])
+                self.assertEqual([args[1] for args in self.mutations],
+                                 ["upload"] * len(new_backups) + ["edit", "upload", "upload", "edit"])
+                edits = [args for args in self.mutations if args[1] == "edit"]
+                self.assertNotIn("--draft=false", edits[0])
+                self.assertIn("--draft=false", edits[-1])
+        backup_assets = {name for name in self.release_files if name.startswith("SHA256SUMS.backup.")}
+        self.assertEqual(len(backup_assets), 5)
+        for name in backup_assets:
+            self.assertEqual(name, backup_name(self.release_files[name]))
+        self.assertEqual(set(self.release_files),
+                         release.ASSETS | {"SHA256SUMS", "LICENSE.chromix", "LICENSE.chromium"} | backup_assets)
+        self.assertIn(f"Source commit: `{OTHER_SHA}`", self.release["body"])
+        self.assertEqual(self.release["body"].count("Verified build:"), 4)
+
+    def test_legacy_windows_zip_without_internal_licenses_is_not_repacked_or_revalidated(self):
+        bundles = self.bundles()
+        windows = bundles["chromix-win-x64.zip"]
+        write_bundle(windows, missing="chromix/LICENSE.chromium")
+        license_path = self.root / "LICENSE.chromium"
+        license_path.write_text("sidecar license")
+        self.existing_release({windows.name: windows, license_path.name: license_path}, sha=OTHER_SHA)
+        self.event_run = self.event_response = self.runs["build-linux-x64"]
+        original = windows.read_bytes()
+        release.publish(REPO, self.event_run, TAG, {"chromix-linux-x64.zip": bundles["chromix-linux-x64.zip"]}, self.root)
+        self.assertNotIn(windows.name, self.uploaded_files)
+        self.assertEqual(self.release_files[windows.name], original)
+        self.assertIn(license_path.name.encode(), self.uploaded_files["SHA256SUMS"])
+
+    def test_identical_retry_preserves_provenance_and_does_not_clobber_manifest(self):
+        incoming = self.incoming()
+        self.existing_release(incoming)
+        release.publish(REPO, self.event_run, TAG, incoming, self.root)
+        notes = self.notes[-1]
+        self.assertEqual(notes.count("Verified build:"), 1)
         self.release["body"] = notes
         second_root = self.root / "retry"
         second_root.mkdir()
-        release.publish(REPO, self.runs, TAG, bundles, second_root)
-        self.assertEqual((second_root / "notes.md").read_text(), notes)
-        self.assertTrue(all(args[1] != "create" for args in self.mutations))
-        self.assertTrue(all(Path(args[3]).name == "SHA256SUMS"
-                            for args in self.mutations if args[1] == "upload"))
+        release.publish(REPO, self.event_run, TAG, incoming, second_root)
+        self.assertEqual(self.notes[-1], notes)
+        self.assertEqual([args[1] for args in self.mutations], ["edit", "edit"])
+        self.assertEqual(self.uploaded_files, {})
 
-    def test_different_published_bytes_are_never_replaced(self):
-        bundles = self.bundles()
-        self.existing_release(bundles)
+    def test_legacy_same_source_claim_is_removed_without_removing_provenance(self):
+        self.existing_release({})
+        self.release["body"] += "All five platforms are verified at one source commit. Old provenance."
+        release.publish(REPO, self.event_run, TAG, self.incoming(), self.root)
+        self.assertNotIn("All five platforms", self.notes[-1])
+        self.assertIn("Old provenance.", self.notes[-1])
+        self.assertIn("may use different source commits", self.notes[-1])
+
+    def test_different_published_bytes_are_never_replaced_even_same_version(self):
+        bundles = self.incoming()
+        self.existing_release(bundles, sha=OTHER_SHA)
         write_bundle(bundles["chromix-win-x64.zip"], extra=("chromix/extra", "different"))
         with self.assertRaisesRegex(ValueError, "Refusing to replace a different published browser"):
-            release.publish(REPO, self.runs, TAG, bundles, self.root)
+            release.publish(REPO, self.event_run, TAG, bundles, self.root)
         self.assertEqual(self.mutations, [])
 
     def test_existing_manifest_mismatch_fails_before_any_mutation(self):
-        bundles = self.bundles()
+        bundles = self.incoming()
         self.existing_release(bundles)
-        self.release_files["SHA256SUMS"] = f"{'0' * 64}  chromix-linux-x64.zip\n".encode("ascii")
+        self.release_files["SHA256SUMS"] = f"{'0' * 64}  chromix-win-x64.zip\n".encode("ascii")
         with self.assertRaisesRegex(ValueError, "Existing release checksum mismatch"):
-            release.publish(REPO, self.runs, TAG, bundles, self.root)
+            release.publish(REPO, self.event_run, TAG, bundles, self.root)
         self.assertEqual(self.mutations, [])
 
-    def test_rerun_during_existing_asset_download_blocks_all_mutations(self):
+    def test_sidecar_checksum_mismatch_is_not_silently_rewritten(self):
+        sidecar = self.root / "LICENSE.chromix"
+        sidecar.write_text("original license")
+        self.existing_release({sidecar.name: sidecar})
+        self.release_files[sidecar.name] = b"changed license"
+        with self.assertRaisesRegex(ValueError, "Existing release checksum mismatch"):
+            release.publish(REPO, self.event_run, TAG, self.incoming(), self.root)
+        self.assertEqual(self.mutations, [])
+
+    def test_unrelated_public_browser_without_existing_checksum_is_not_adopted(self):
         bundles = self.bundles()
-        self.existing_release(bundles)
+        self.existing_release({"chromix-linux-x64.zip": bundles["chromix-linux-x64.zip"]})
+        self.release_files["SHA256SUMS"] = b""
+        with self.assertRaisesRegex(ValueError, "missing existing checksums"):
+            release.publish(REPO, self.event_run, TAG, self.incoming(), self.root)
+        self.assertEqual(self.downloads, [])
+        self.assertEqual(self.mutations, [])
+
+    def test_matching_incoming_public_browser_can_recover_missing_checksum(self):
+        incoming = self.incoming()
+        self.existing_release(incoming)
+        original = self.release_files["chromix-win-x64.zip"]
+        self.release_files["SHA256SUMS"] = b""
+        release.publish(REPO, self.event_run, TAG, incoming, self.root)
+        hashes = release.parse_manifest(self.uploaded_files["SHA256SUMS"].decode())
+        self.assertEqual(hashes["chromix-win-x64.zip"], release.digest(incoming["chromix-win-x64.zip"]))
+        self.assertEqual(self.downloads, [(self.event_run["id"], "chromix-win-x64")])
+        self.assertEqual(self.release_files["chromix-win-x64.zip"], original)
+        self.assertEqual(set(self.uploaded_files), {"SHA256SUMS", backup_name(b""),
+                                                  backup_name(self.uploaded_files["SHA256SUMS"])})
+
+    def test_recovered_slot_must_match_fresh_artifact_not_just_local_bytes(self):
+        incoming = self.incoming()
+        write_bundle(incoming["chromix-win-x64.zip"], extra=("chromix/extra", "untrusted"))
+        self.existing_release(incoming)
+        self.release_files["SHA256SUMS"] = b""
+        with self.assertRaisesRegex(ValueError, "differs from verified incoming artifact"):
+            release.publish(REPO, self.event_run, TAG, incoming, self.root)
+        self.assertEqual(self.downloads, [(self.event_run["id"], "chromix-win-x64")])
+        self.assertEqual(self.mutations, [])
+
+    def test_orphan_recollection_keeps_artifact_validation_fail_closed(self):
+        incoming = self.incoming()
+        self.existing_release(incoming)
+        self.release_files["SHA256SUMS"] = b""
+        for error in ("layout", "checksum", "missing-checksum", "foreign-checksum", "unexpected", "corrupt", "expired"):
+            with self.subTest(error=error):
+                root = self.root / error
+                root.mkdir()
+                self.downloads.clear()
+                self.artifact_errors["chromix-win-x64"] = error
+                with self.assertRaises((ValueError, zipfile.BadZipFile, RuntimeError)):
+                    release.publish(REPO, self.event_run, TAG, incoming, root)
+                self.assertEqual(self.downloads, [(self.event_run["id"], "chromix-win-x64")])
+                self.assertEqual(self.mutations, [])
+
+    def test_rerun_during_existing_asset_download_blocks_all_mutations(self):
+        self.existing_release(self.incoming())
         original_gh = self.fake_gh
 
         def download_then_rerun(*args):
             result = original_gh(*args)
             if args[:2] == ("release", "download"):
-                self.pages = copy.deepcopy(self.pages)
-                self.pages[0]["workflow_runs"][0].update(run_attempt=2, status="in_progress", conclusion=None)
+                self.event_response = {**self.event_run, "run_attempt": 2, "status": "in_progress", "conclusion": None}
             return result
 
         self.gh.side_effect = download_then_rerun
-        release.publish(REPO, self.runs, TAG, bundles, self.root)
+        release.publish(REPO, self.event_run, TAG, self.incoming(), self.root)
         self.assertIn("Pending release", self.stdout.getvalue())
         self.assertEqual(self.mutations, [])
 
     def test_existing_manifest_cannot_reference_missing_assets(self):
-        bundles = self.bundles()
-        self.existing_release(bundles)
-        self.release["assets"] = [asset for asset in self.release["assets"]
-                                  if asset["name"] != "chromix-win-x64.zip"]
+        self.existing_release(self.incoming())
+        self.release["assets"] = [{"name": "SHA256SUMS"}]
         with self.assertRaisesRegex(ValueError, "references missing release assets"):
-            release.publish(REPO, self.runs, TAG, bundles, self.root)
+            release.publish(REPO, self.event_run, TAG, self.incoming(), self.root)
         self.assertEqual(self.mutations, [])
 
-    def test_partial_draft_is_completed_only_after_all_assets_are_verified(self):
+    def test_duplicate_or_unsafe_existing_manifest_entries_fail_closed(self):
+        self.existing_release(self.incoming())
+        self.release_files["SHA256SUMS"] *= 2
+        with self.assertRaisesRegex(ValueError, "Invalid or duplicate"):
+            release.publish(REPO, self.event_run, TAG, self.incoming(), self.root)
+        self.assertEqual(self.mutations, [])
+
+    def test_duplicate_release_asset_names_fail_closed(self):
+        self.existing_release(self.incoming())
+        self.release["assets"].append({"name": "chromix-win-x64.zip"})
+        with self.assertRaisesRegex(ValueError, "Duplicate existing release asset"):
+            release.publish(REPO, self.event_run, TAG, self.incoming(), self.root)
+        self.assertEqual(self.mutations, [])
+
+    def test_existing_manifest_bytes_are_preserved_including_crlf_uppercase_and_no_newline(self):
         bundles = self.bundles()
-        self.existing_release({"chromix-linux-x64.zip": bundles["chromix-linux-x64.zip"]}, draft=True)
-        release.publish(REPO, self.runs, TAG, bundles, self.root)
-        uploads = [Path(args[3]).name for args in self.mutations if args[1] == "upload"]
-        self.assertEqual(set(uploads), (release.ASSETS - {"chromix-linux-x64.zip"}) | {"SHA256SUMS"})
+        self.existing_release({"chromix-linux-x64.zip": bundles["chromix-linux-x64.zip"]})
+        checksum = release.digest(bundles["chromix-linux-x64.zip"]).upper()
+        original = f"\r\n{checksum} *chromix-linux-x64.zip".encode()
+        self.release_files["SHA256SUMS"] = original
+        release.publish(REPO, self.event_run, TAG, self.incoming(), self.root)
+        self.assertTrue(self.uploaded_files["SHA256SUMS"].startswith(original + b"\n"))
+        self.assertEqual(len(release.parse_manifest(self.uploaded_files["SHA256SUMS"].decode())), 2)
+
+    def test_manifest_upload_failure_restores_old_manifest_and_retry_recovers_remote_zip(self):
+        self.existing_release({})
+        original = self.release_files["SHA256SUMS"]
+        incoming = self.incoming()
+        self.fail_upload = "SHA256SUMS"
+        with self.assertRaises(subprocess.CalledProcessError):
+            release.publish(REPO, self.event_run, TAG, incoming, self.root)
+        self.assertEqual(self.uploaded_files["SHA256SUMS"], original)
+        self.assertEqual(self.release_files["SHA256SUMS"], original)
+        self.assertEqual(self.release_files["chromix-win-x64.zip"], incoming["chromix-win-x64.zip"].read_bytes())
+        self.assertEqual([args[1] for args in self.mutations], ["upload", "upload", "edit", "upload", "upload", "upload"])
+        self.assertNotIn("--draft=false", self.mutations[2])
+        self.assertIn(f"Source commit: `{SHA}`", self.release["body"])
+        self.assertIn("existing", self.mutations[-1][3])
+        backups = {name: data for name, data in self.release_files.items() if name.startswith("SHA256SUMS.backup.")}
+        self.assertEqual(len(backups), 2)
+        self.assertEqual(backups[backup_name(original)], original)
+        retry = self.root / "retry"
+        retry.mkdir()
+        release.publish(REPO, self.event_run, TAG, incoming, retry)
+        self.assertEqual(self.downloads, [(self.event_run["id"], "chromix-win-x64")])
+        self.assertEqual(len([args for args in self.mutations if args[1] == "upload"
+                              and Path(args[3]).name == "chromix-win-x64.zip"]), 1)
+        hashes = release.parse_manifest(self.release_files["SHA256SUMS"].decode())
+        self.assertEqual(hashes, {"chromix-win-x64.zip": release.digest(incoming["chromix-win-x64.zip"])})
+        for name, data in backups.items():
+            self.assertEqual(self.release_files[name], data)
         self.assertEqual(self.mutations[-1][1], "edit")
+
+    def test_partial_draft_is_completed_without_waiting_for_other_platforms(self):
+        incoming = self.incoming()
+        self.existing_release(incoming, draft=True, sha=OTHER_SHA)
+        self.refs = []
+        self.release_files.pop("SHA256SUMS")
+        self.release["assets"] = [{"name": "chromix-win-x64.zip"}]
+        release.publish(REPO, self.event_run, TAG, incoming, self.root)
+        self.assertEqual(set(self.uploaded_files), {"SHA256SUMS", backup_name(self.uploaded_files["SHA256SUMS"])})
+        self.assertEqual(self.downloads, [(self.event_run["id"], "chromix-win-x64")])
+        self.assertFalse(self.release["draft"])
+        self.assertEqual(self.mutations[-1][1], "edit")
+        self.assertIn("--draft=false", self.mutations[-1])
+        self.assertNotIn("--target", self.mutations[-1])
 
 
 if __name__ == "__main__":
