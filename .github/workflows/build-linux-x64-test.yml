@@ -1,0 +1,29 @@
+name: build-linux-x64-test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'patches/**'
+      - 'assets/fonts/**'
+      - 'build/**'
+      - 'tools/**'
+      - '.github/workflows/build-linux-x64-test.yml'
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  linux-build-test:
+    uses: ./.github/workflows/build-posix-github.yml
+    with:
+      platform: linux
+      arch: x64
+      runner: ubuntu-22.04
+      artifact: chromix-linux-x64-test
+      max-stages: 1
+      build_profile: fast
+      use_upstream_cache: false
+    secrets: inherit
