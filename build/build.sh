@@ -118,11 +118,9 @@ if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
   GN_INPUTS=("$OUT/args.gn" "${GN_INPUTS[@]}")
 fi
 python3 "$REPO/tools/merge_gn_args.py" "$OUT/args.gn" "${GN_INPUTS[@]}"
-if [ ! -x "$OUT/gn" ]; then
-  # GN's standalone bootstrap still treats this libstdc++ warning as an error.
-  CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }-Wno-deprecated-declarations" \
-    python3 tools/gn/bootstrap/bootstrap.py -o "$OUT/gn" --skip-generate-buildfiles
-fi
+# GN's standalone bootstrap still treats this libstdc++ warning as an error.
+CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }-Wno-deprecated-declarations" \
+  python3 "$REPO/tools/bootstrap_gn.py" --src "$SRC" --out "$OUT"
 "$OUT/gn" gen "$OUT" --fail-on-unused-args
 chromix_report_upstream_plan chrome chrome_crashpad_handler chrome_sandbox
 chromix_build_restored_target linux "${CHROMIX_JOBS:-$(getconf _NPROCESSORS_ONLN)}" chrome chrome_crashpad_handler chrome_sandbox

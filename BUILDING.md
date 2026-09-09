@@ -286,6 +286,17 @@ Linux Actions also install checksum-pinned Ninja 1.12.1 for x64/arm64 alongside
 the distro tool, since the upstream Debian tool can differ from Ubuntu's.
 Selection still follows the actual restored header, not the target platform.
 
+Linux and macOS builders run `gn --version` before reusing the restored GN.
+A missing or unrunnable GN is bootstrapped in a fresh temporary directory under
+`src/out`, with an explicit `--build-path`. The bootstrap must pass its own
+`--version` probe before atomically replacing the output GN. This avoids copying
+an incompatible cached executable from the bootstrap's default
+`out/Release/gn_build`, as observed on the Intel runner in run `34295258278`.
+Only the temporary GN build is removed; if restoring the previous GN itself
+fails, the recovery directory is retained and reported. Chromium objects and
+Ninja state are preserved, subject to the normal toolchain and dependency
+invalidation checks.
+
 The restored source already contains the pinned ungoogled core patches,
 platform overlay, pruning, and domain substitution. Preparation verifies those
 pins and appends Chromix `patches/series` without reapplying upstream layers.

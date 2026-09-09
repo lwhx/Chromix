@@ -60,9 +60,7 @@ if [ -f "$SRC/.chromix-upstream-restored.json" ]; then
   GN_INPUTS=("$OUT/args.gn" "${GN_INPUTS[@]}")
 fi
 python3 "$REPO/tools/merge_gn_args.py" "$OUT/args.gn" "${GN_INPUTS[@]}"
-if [ ! -x "$OUT/gn" ]; then
-  python3 tools/gn/bootstrap/bootstrap.py -o "$OUT/gn" --skip-generate-buildfiles
-fi
+python3 "$REPO/tools/bootstrap_gn.py" --src "$SRC" --out "$OUT"
 "$OUT/gn" gen "$OUT" --fail-on-unused-args
 chromix_report_upstream_plan chrome
 chromix_build_restored_target macos "${CHROMIX_JOBS:-$(sysctl -n hw.ncpu)}" chrome

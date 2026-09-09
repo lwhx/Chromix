@@ -723,6 +723,9 @@ if name == "python3" and Path(args[0]).name == "macos_runtime.py":
                 mock.patch.object(module.subprocess, "run", side_effect=probe):
             raise SystemExit(module.main(args[1:]))
     os.execv(sys.executable, [sys.executable] + args)
+if name == "python3" and Path(args[0]).name == "bootstrap_gn.py":
+    assert not any(key.startswith("DYLD_") for key in os.environ)
+    os.execv(sys.executable, [sys.executable] + args)
 if name == "python3":
     name = Path(args[0]).name
 dyld = {key: value for key, value in os.environ.items() if key.startswith("DYLD_")}
@@ -776,7 +779,8 @@ class MacOSRuntimeShellTest(unittest.TestCase):
         self.bin = self.root / "bin"
         self.bin.mkdir()
         self.log = self.root / "calls.jsonl"
-        for relative in ("build/macos/build.sh", "build/posix/prepare-restored-tools.sh", "tools/macos_runtime.py"):
+        for relative in ("build/macos/build.sh", "build/posix/prepare-restored-tools.sh",
+                         "tools/macos_runtime.py", "tools/bootstrap_gn.py"):
             target = self.repo / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REPO / relative, target)

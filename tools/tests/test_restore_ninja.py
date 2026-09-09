@@ -387,7 +387,7 @@ class RestoreNinjaShellTest(unittest.TestCase):
             path.chmod(0o755)
 
         for relative in ("build/build.sh", "build/macos/build.sh", "build/posix/upstream-cache.sh",
-                         "tools/merge_gn_args.py", "tools/macos_runtime.py"):
+                         "tools/bootstrap_gn.py", "tools/merge_gn_args.py", "tools/macos_runtime.py"):
             destination = self.repo / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REPO / relative, destination)
@@ -401,7 +401,7 @@ class RestoreNinjaShellTest(unittest.TestCase):
             shell(self.bin / name, "exit 0\n")
         shell(self.bin / "ninja", 'printf "WRONG NINJA\\n" >> "$CALLS"\nexit 99\n')
         shell(self.bin / "sysctl", 'printf "2\\n"\n')
-        shell(self.out / "gn", 'printf "gn\\n" >> "$CALLS"\n')
+        shell(self.out / "gn", '[ "$1" != --version ] || exit 0\nprintf "gn\\n" >> "$CALLS"\n')
         shell(self.out / "chrome", "exit 0\n")
         for system, arch in TARGETS[:-1]:
             with self.subTest(system=system, arch=arch):

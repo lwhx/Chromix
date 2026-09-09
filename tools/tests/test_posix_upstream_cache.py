@@ -50,7 +50,8 @@ class PosixUpstreamCacheTest(unittest.TestCase):
                 self.assertIn('--fail-on-unused-args', source)
 
     def run_restored_builder(self, platform, arch, *, fail_tools=False, host_arch=None,
-                             restored=True, system=None, missing_gn=False, incomplete_tools=False):
+                             restored=True, system=None, missing_gn=False, incompatible_gn=False,
+                             incomplete_tools=False):
         with tempfile.TemporaryDirectory(prefix="restored build ") as directory:
             root = Path(directory)
             repo, work, binaries = root / "repo", root / "work", root / "bin"
@@ -65,7 +66,8 @@ class PosixUpstreamCacheTest(unittest.TestCase):
                 path.chmod(0o755)
 
             builder = "build/build.sh" if platform == "linux" else "build/macos/build.sh"
-            for relative in (builder, "build/posix/upstream-cache.sh", "tools/merge_gn_args.py", "tools/macos_runtime.py"):
+            for relative in (builder, "build/posix/upstream-cache.sh", "tools/bootstrap_gn.py",
+                             "tools/merge_gn_args.py", "tools/macos_runtime.py"):
                 target = repo / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(REPO / relative, target)
@@ -113,13 +115,17 @@ with open(os.environ['CALL_LOG'], 'a') as output:
             (out / "args.gn").write_text('symbol_level = 2\nchrome_pgo_phase = 2\nupstream_extra = true\n')
             for name in (".ninja_deps", ".ninja_log", "build.ninja", "retained.o"):
                 (out / name).write_text(name)
-            gn_script = '#!/bin/sh\nprintf "gn\\n" >> "$CALL_LOG"\n'
-            if missing_gn:
+            gn_script = '#!/bin/sh\n[ "$1" != --version ] || exit 0\nprintf "gn\\n" >> "$CALL_LOG"\n'
+            if missing_gn or incompatible_gn:
                 bootstrap = src / "tools/gn/bootstrap/bootstrap.py"
                 bootstrap.parent.mkdir(parents=True)
                 bootstrap.write_text(f'''import os, sys
 from pathlib import Path
-assert os.environ['CXX'] == {str(src / 'third_party/llvm-build/Release+Asserts/bin/clang++')!r}
+if {platform!r} == 'linux':
+    assert os.environ['CXX'] == {str(src / 'third_party/llvm-build/Release+Asserts/bin/clang++')!r}
+build = Path.cwd() / sys.argv[sys.argv.index('--build-path') + 1]
+assert build.parent == Path({str(src)!r}) / 'out'
+assert not list(build.iterdir())
 assert sys.argv[-1] == '--skip-generate-buildfiles'
 with open(os.environ['CALL_LOG'], 'a') as output:
     output.write('bootstrap-gn\\n')
@@ -127,6 +133,8 @@ path = Path(sys.argv[sys.argv.index('-o') + 1])
 path.write_text({gn_script!r})
 path.chmod(0o755)
 ''')
+                if incompatible_gn:
+                    script(out / "gn", 'exit 126\n')
             else:
                 script(out / "gn", gn_script.split('\n', 1)[1])
             script(out / "chrome", 'printf "chrome-version\\n" >> "$CALL_LOG"\n'
@@ -169,7 +177,7 @@ path.chmod(0o755)
                 if platform == "linux" and host_arch == arch:
                     iteration.append("chrome-version")
                 expected_calls = iteration * 2
-                if missing_gn:
+                if missing_gn or incompatible_gn:
                     expected_calls.insert(3, "bootstrap-gn")
                 self.assertEqual(log.read_text().splitlines(), expected_calls)
                 self.assertEqual((out / "gn").read_text(), gn_script)
@@ -206,6 +214,15 @@ path.chmod(0o755)
 
     def test_restored_linux_cross_bootstraps_missing_native_gn_once(self):
         self.run_restored_builder("linux", "arm64", host_arch="x64", missing_gn=True)
+
+    def test_restored_posix_rebuilds_unrunnable_gn_once(self):
+        for platform in ("linux", "macos"):
+            for arch in ("x64", "arm64"):
+                with self.subTest(platform=platform, arch=arch):
+                    self.run_restored_builder(platform, arch, incompatible_gn=True)
+
+    def test_restored_macos_bootstraps_missing_gn_once(self):
+        self.run_restored_builder("macos", "x64", missing_gn=True)
 
     def test_linux_cross_requires_full_restore_before_preparing_source(self):
         self.run_restored_builder("linux", "arm64", host_arch="x64", restored=False)

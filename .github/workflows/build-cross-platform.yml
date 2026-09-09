@@ -19,6 +19,7 @@ on:
       - 'tools/apply_restored_patches.py'
       - 'tools/prepare_restored_build.py'
       - 'tools/restore_ninja.py'
+      - 'tools/bootstrap_gn.py'
       - 'tools/macos_runtime.py'
       - 'tools/restored_reuse_evidence.py'
       - 'tools/verify_linux_bundle.py'
