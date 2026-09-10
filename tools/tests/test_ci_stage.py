@@ -746,7 +746,7 @@ class ResumeWorkflowRegressionTest(unittest.TestCase):
         self.assertEqual(self.source.count("merge-multiple: true"), 22)
         self.assertIn("resume_tree_stage:", self.source)
         self.assertIn(
-            "pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '11' }}-attempt-*-part*",
+            "pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '11' }}-attempt-${{ inputs.resume_attempt }}-part*",
             self.source,
         )
         self.assertNotIn("download-stage-artifacts.ps1", self.source)
@@ -1255,7 +1255,7 @@ class RustToolchainMergeRegressionTest(unittest.TestCase):
                 shutil.copy("/bin/true", base / "rustc/bin/rustc.exe")
 
         result = subprocess.run(
-            ["python3", str(self.MERGE_PY), "--third-party-root", str(root)],
+            [sys.executable, str(self.MERGE_PY), "--third-party-root", str(root)],
             capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -1278,7 +1278,7 @@ class RustToolchainMergeRegressionTest(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         root = Path(temp.name) / "tp"
         result = subprocess.run(
-            ["python3", str(self.MERGE_PY), "--third-party-root", str(root)],
+            [sys.executable, str(self.MERGE_PY), "--third-party-root", str(root)],
             capture_output=True, text=True)
         # No x64 bundle present must fail with the inventory rather than an
         # unhandled traceback or - worse - a silent zero exit like PS 5.1 did.

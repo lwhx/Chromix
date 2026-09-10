@@ -3,6 +3,10 @@ name: build-linux-x64
 on:
   workflow_dispatch:
     inputs:
+      compile_jobs:
+        description: 'Ninja jobs: auto uses CPU/memory limits, or a positive integer'
+        type: string
+        default: auto
       build_profile:
         description: 'ThinLTO optimization profile'
         type: choice
@@ -37,6 +41,7 @@ on:
       - 'sdk/python/chromix/_binary.py'
       - 'tools/gen_posix_workflow.py'
       - 'tools/merge_gn_args.py'
+      - 'tools/build_resources.py'
       - '.github/workflows/build-linux-x64.yml'
       - '.github/workflows/build-posix-github.yml'
       - 'CHROMIUM_VERSION'
@@ -61,5 +66,6 @@ jobs:
       artifact: chromix-linux-x64
       max-stages: ${{ inputs.build_mode == 'single' && 1 || 8 }}
       build_profile: ${{ inputs.build_profile || 'fast' }}
+      compile_jobs: ${{ inputs.compile_jobs || 'auto' }}
       use_upstream_cache: ${{ github.event_name != 'workflow_dispatch' || inputs.use_upstream_cache }}
     secrets: inherit

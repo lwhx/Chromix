@@ -17,6 +17,8 @@ param(
 $ErrorActionPreference = "Stop"
 $Repo = (Resolve-Path "$PSScriptRoot\..\..").Path
 $Revisions = Import-PowerShellDataFile (Join-Path $Repo "build\ungoogled-revisions.psd1")
+$BuildProfile = if ($env:CHROMIX_BUILD_PROFILE) { $env:CHROMIX_BUILD_PROFILE } else { "native" }
+if ($BuildProfile -notin @("native", "fast", "release")) { throw "invalid CHROMIX_BUILD_PROFILE" }
 
 $Root = "C:\c"
 $WorkDir = "$Root\chromix"
@@ -671,6 +673,7 @@ $WindowsTooling = Join-Path $WorkDir "tooling\ungoogled-chromium-windows"
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $gnArgs = Join-Path $OutDir "args.gn"
 $mergeArgs = @((Join-Path $Repo "tools\merge_gn_args.py"), $gnArgs)
+if ($BuildProfile -in @("fast", "release")) { $mergeArgs += @("--build-profile", $BuildProfile) }
 if ($RestoredUpstream) { $mergeArgs += $gnArgs }
 $mergeArgs += @(
   (Join-Path $UngoogledTooling "flags.gn"),
@@ -789,8 +792,16 @@ if ($RestoredUpstream) {
     --workdir $WorkDir --platform windows --arch x64 --ninja $Ninja --target chrome
   if ($LASTEXITCODE -ne 0) { throw "restored reuse evidence collection failed before Ninja (exit $LASTEXITCODE)" }
 }
+$CompileJobs = 4
+if ($env:CHROMIX_JOBS) {
+  if ($env:CHROMIX_JOBS -notmatch '\A[1-9][0-9]{0,3}\z' -or [int]$env:CHROMIX_JOBS -gt 1024) {
+    throw "CHROMIX_JOBS must be an integer from 1 to 1024"
+  }
+  $CompileJobs = [int]$env:CHROMIX_JOBS
+}
+Write-Host "==> Ninja compile jobs: $CompileJobs"
 $rc = Invoke-Tracked -File $Ninja `
-  -ArgList "-C `"$OutDir`" -j 4 chrome" -Cwd $Src -TimeoutSec ($ninjaBudget * 60)
+  -ArgList "-C `"$OutDir`" -j $CompileJobs chrome" -Cwd $Src -TimeoutSec ($ninjaBudget * 60)
 if ($RestoredUpstream) {
   try {
     & python (Join-Path $Repo "tools\restored_reuse_evidence.py") --phase after `

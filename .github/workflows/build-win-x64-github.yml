@@ -23,12 +23,25 @@ on:
       - 'tools/bootstrap_gn.py'
       - 'tools/restored_reuse_evidence.py'
       - 'tools/merge_gn_args.py'
+      - 'tools/build_resources.py'
       - '.github/workflows/build-win-x64-github.yml'
       - 'CHROMIUM_VERSION'
       - 'UNGOOGLED_VERSION'
       - 'UNGOOGLED_WINDOWS_VERSION'
   workflow_call:
     inputs:
+      build_profile:
+        required: false
+        type: string
+        default: native
+      compile_jobs:
+        required: false
+        type: string
+        default: auto
+      resume_attempt:
+        required: false
+        type: string
+        default: '1'
       resume_run_id:
         required: false
         type: string
@@ -54,6 +67,19 @@ on:
         required: false
   workflow_dispatch:
     inputs:
+      build_profile:
+        description: 'native keeps existing flags; fast reduces ThinLTO optimization; release enables it'
+        type: choice
+        options: [native, fast, release]
+        default: native
+      compile_jobs:
+        description: 'Ninja jobs: auto uses CPU/memory limits, or a positive integer'
+        type: string
+        default: auto
+      resume_attempt:
+        description: 'Exact attempt that produced all snapshot volumes'
+        type: string
+        default: '1'
       resume_run_id:
         description: 'Previous run ID whose successful stage artifact should be reused'
         required: false
@@ -101,6 +127,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  CHROMIX_BUILD_PROFILE: ${{ inputs.build_profile || 'native' }}
+  CHROMIX_JOBS: ${{ inputs.compile_jobs || 'auto' }}
   CHROMIX_USE_UPSTREAM_CACHE: ${{ (github.event_name == 'push' || inputs.use_upstream_cache || inputs.upstream_run_id != '') && '1' || '0' }}
   DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
   DEPOT_TOOLS_METRICS: '0'
@@ -114,6 +142,9 @@ jobs:
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
+      - name: Select compile parallelism
+        shell: powershell
+        run: python tools/build_resources.py --github-env
       - name: Run validation
         id: stage
         shell: powershell
@@ -147,6 +178,9 @@ jobs:
       finished: ${{ steps.stage.outputs.finished }}
     steps:
       - uses: actions/checkout@v4
+      - name: Select compile parallelism
+        shell: powershell
+        run: python tools/build_resources.py --github-env
       - name: Run stage 1
         id: stage
         shell: powershell
@@ -256,11 +290,14 @@ jobs:
         if: ${{ inputs.resume_run_id != '' && inputs.resume_stage == '2' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '1' }}-attempt-*-part*
+          pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '1' }}-attempt-${{ inputs.resume_attempt }}-part*
           merge-multiple: true
           path: C:\restore
           github-token: ${{ github.token }}
           run-id: ${{ inputs.resume_run_id }}
+      - name: Select compile parallelism
+        shell: powershell
+        run: python tools/build_resources.py --github-env
       - name: Run stage 2
         id: stage
         shell: powershell
@@ -349,11 +386,14 @@ jobs:
         if: ${{ inputs.resume_run_id != '' && inputs.resume_stage == '3' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '2' }}-attempt-*-part*
+          pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '2' }}-attempt-${{ inputs.resume_attempt }}-part*
           merge-multiple: true
           path: C:\restore
           github-token: ${{ github.token }}
           run-id: ${{ inputs.resume_run_id }}
+      - name: Select compile parallelism
+        shell: powershell
+        run: python tools/build_resources.py --github-env
       - name: Run stage 3
         id: stage
         shell: powershell
@@ -442,11 +482,14 @@ jobs:
         if: ${{ inputs.resume_run_id != '' && inputs.resume_stage == '4' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '3' }}-attempt-*-part*
+          pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '3' }}-attempt-${{ inputs.resume_attempt }}-part*
           merge-multiple: true
           path: C:\restore
           github-token: ${{ github.token }}
           run-id: ${{ inputs.resume_run_id }}
+      - name: Select compile parallelism
+        shell: powershell
+        run: python tools/build_resources.py --github-env
       - name: Run stage 4
         id: stage
         shell: powershell
@@ -535,11 +578,14 @@ jobs:
         if: ${{ inputs.resume_run_id != '' && inputs.resume_stage == '5' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '4' }}-attempt-*-part*
+          pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '4' }}-attempt-${{ inputs.resume_attempt }}-part*
           merge-multiple: true
           path: C:\restore
           github-token: ${{ github.token }}
           run-id: ${{ inputs.resume_run_id }}
+      - name: Select compile parallelism
+        shell: powershell
+        run: python tools/build_resources.py --github-env
       - name: Run stage 5
         id: stage
         shell: powershell
@@ -628,11 +674,14 @@ jobs:
         if: ${{ inputs.resume_run_id != '' && inputs.resume_stage == '6' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '5' }}-attempt-*-part*
+          pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '5' }}-attempt-${{ inputs.resume_attempt }}-part*
           merge-multiple: true
           path: C:\restore
           github-token: ${{ github.token }}
           run-id: ${{ inputs.resume_run_id }}
+      - name: Select compile parallelism
+        shell: powershell
+        run: python tools/build_resources.py --github-env
       - name: Run stage 6
         id: stage
         shell: powershell
@@ -721,11 +770,14 @@ jobs:
         if: ${{ inputs.resume_run_id != '' && inputs.resume_stage == '7' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '6' }}-attempt-*-part*
+          pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '6' }}-attempt-${{ inputs.resume_attempt }}-part*
           merge-multiple: true
           path: C:\restore
           github-token: ${{ github.token }}
           run-id: ${{ inputs.resume_run_id }}
+      - name: Select compile parallelism
+        shell: powershell
+        run: python tools/build_resources.py --github-env
       - name: Run stage 7
         id: stage
         shell: powershell
@@ -814,11 +866,14 @@ jobs:
         if: ${{ inputs.resume_run_id != '' && inputs.resume_stage == '8' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '7' }}-attempt-*-part*
+          pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '7' }}-attempt-${{ inputs.resume_attempt }}-part*
           merge-multiple: true
           path: C:\restore
           github-token: ${{ github.token }}
           run-id: ${{ inputs.resume_run_id }}
+      - name: Select compile parallelism
+        shell: powershell
+        run: python tools/build_resources.py --github-env
       - name: Run stage 8
         id: stage
         shell: powershell
@@ -907,11 +962,14 @@ jobs:
         if: ${{ inputs.resume_run_id != '' && inputs.resume_stage == '9' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '8' }}-attempt-*-part*
+          pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '8' }}-attempt-${{ inputs.resume_attempt }}-part*
           merge-multiple: true
           path: C:\restore
           github-token: ${{ github.token }}
           run-id: ${{ inputs.resume_run_id }}
+      - name: Select compile parallelism
+        shell: powershell
+        run: python tools/build_resources.py --github-env
       - name: Run stage 9
         id: stage
         shell: powershell
@@ -1000,11 +1058,14 @@ jobs:
         if: ${{ inputs.resume_run_id != '' && inputs.resume_stage == '10' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '9' }}-attempt-*-part*
+          pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '9' }}-attempt-${{ inputs.resume_attempt }}-part*
           merge-multiple: true
           path: C:\restore
           github-token: ${{ github.token }}
           run-id: ${{ inputs.resume_run_id }}
+      - name: Select compile parallelism
+        shell: powershell
+        run: python tools/build_resources.py --github-env
       - name: Run stage 10
         id: stage
         shell: powershell
@@ -1093,11 +1154,14 @@ jobs:
         if: ${{ inputs.resume_run_id != '' && inputs.resume_stage == '11' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '10' }}-attempt-*-part*
+          pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '10' }}-attempt-${{ inputs.resume_attempt }}-part*
           merge-multiple: true
           path: C:\restore
           github-token: ${{ github.token }}
           run-id: ${{ inputs.resume_run_id }}
+      - name: Select compile parallelism
+        shell: powershell
+        run: python tools/build_resources.py --github-env
       - name: Run stage 11
         id: stage
         shell: powershell
@@ -1186,11 +1250,14 @@ jobs:
         if: ${{ inputs.resume_run_id != '' && inputs.resume_stage == '12' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '11' }}-attempt-*-part*
+          pattern: tree-s${{ inputs.resume_tree_stage != '' && inputs.resume_tree_stage || '11' }}-attempt-${{ inputs.resume_attempt }}-part*
           merge-multiple: true
           path: C:\restore
           github-token: ${{ github.token }}
           run-id: ${{ inputs.resume_run_id }}
+      - name: Select compile parallelism
+        shell: powershell
+        run: python tools/build_resources.py --github-env
       - name: Run stage 12
         id: stage
         shell: powershell

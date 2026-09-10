@@ -259,7 +259,7 @@ class WindowsUpstreamCacheRegressionTest(unittest.TestCase):
         runs = workflow_runs(self.validate)
         for number in range(1, 13):
             runs.extend(workflow_runs(workflow_job(self.workflow, f"build-{number}")))
-        self.assertEqual(len(runs), 25)
+        self.assertEqual(len(runs), 38)
         for run in runs:
             self.assertNotIn("${{", run)
         self.assertIn("UPSTREAM_RUN_ID: ${{ inputs.upstream_run_id }}", self.build_one)
@@ -574,7 +574,7 @@ Add-Content $env:CALL_LOG ("ninja:" + $OutDir.Replace('\', '/'))
         self.fixture.seed("windows", "x64")
         result = self.run_stage(validate=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        expected = ["prepare", f"ninja:{self.fixture.work}/src/out/Default"]
+        expected = ["prepare", f"ninja:{self.fixture.work.as_posix()}/src/out/Default"]
         self.assertEqual(self.fixture.called(), ["fetch", "restore", "verify"] + expected)
         self.fixture.calls.unlink()
         result = self.run_stage(stage=2, resume=True, minutes=60)
@@ -597,7 +597,7 @@ Add-Content $env:CALL_LOG ("ninja:" + $OutDir.Replace('\', '/'))
     def test_fresh_no_cache_is_normal_but_switch_or_run_id_requires_it(self):
         result = self.run_stage(enabled=False, validate=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.fixture.called(), ["prepare", f"ninja:{self.fixture.work}/src/out/Chromix"])
+        self.assertEqual(self.fixture.called(), ["prepare", f"ninja:{self.fixture.work.as_posix()}/src/out/Chromix"])
         self.fixture.calls.unlink()
         for option in ({"switch": True}, {"run_id": "123"}):
             with self.subTest(option=option):
@@ -682,7 +682,7 @@ function git {
     @staticmethod
     def put(path, content):
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        path.write_text(content, encoding="utf-8", newline="\n")
 
     def prepare_build_fixture(self):
         from tools import prepare_restored_build as helper

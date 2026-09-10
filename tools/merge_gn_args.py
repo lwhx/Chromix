@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 ASSIGNMENT = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=")
+GENERATED_HEADER = "# Generated. Later input files override earlier assignments."
 
 
 def parse(path: Path) -> tuple[list[str], dict[str, str]]:
@@ -16,6 +17,8 @@ def parse(path: Path) -> tuple[list[str], dict[str, str]]:
     pending_comments: list[str] = []
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
+        if line == GENERATED_HEADER:
+            continue
         if not line:
             pending_comments.clear()
             continue
@@ -37,7 +40,7 @@ def parse(path: Path) -> tuple[list[str], dict[str, str]]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--build-profile", choices=("fast", "release"),
-                        help="override ThinLTO optimization for a POSIX build")
+                        help="override ThinLTO optimization for a build")
     parser.add_argument("output", type=Path)
     parser.add_argument("inputs", nargs="+", type=Path)
     args = parser.parse_args()
@@ -59,9 +62,13 @@ def main() -> int:
         merged[key] = f"{key} = {value}"
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    body = ["# Generated. Later input files override earlier assignments."]
+    body = [GENERATED_HEADER]
     body.extend(merged[key] for key in order)
-    args.output.write_text("\n".join(body) + "\n", encoding="utf-8")
+    content = "\n".join(body) + "\n"
+    if args.output.exists() and args.output.read_text(encoding="utf-8") == content:
+        print(f"unchanged {args.output} with {len(order)} GN assignments")
+        return 0
+    args.output.write_text(content, encoding="utf-8")
     print(f"wrote {args.output} with {len(order)} GN assignments")
     return 0
 

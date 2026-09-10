@@ -43,6 +43,10 @@ on:
         required: false
         type: string
         default: fast
+      compile_jobs:
+        required: false
+        type: string
+        default: auto
       use_upstream_cache:
         required: false
         type: boolean
@@ -64,6 +68,7 @@ env:
   DEPOT_TOOLS_METRICS: '0'
   DEPOT_TOOLS_COLLECT_METRICS: '0'
   CHROMIUM_VERSION: '152.0.7977.82'
+  CHROMIX_JOBS: ${{ inputs.compile_jobs }}
 
 jobs:
 """
@@ -360,6 +365,8 @@ def job(stage: int) -> str:
         parts.append(DOWNLOAD_STEP % {"prev": stage - 1})
         parts.append("\n")
     parts.append(CACHE_RESTORE)
+    parts.append("      - name: Select compile parallelism\n"
+                 "        run: python3 tools/build_resources.py --github-env\n\n")
     parts.append(run_step(stage))
     parts.append(SNAPSHOT_ENSURE % {"stage": stage})
     parts.append("\n")

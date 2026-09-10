@@ -176,7 +176,84 @@ GitHub skips push-triggered workflows for `[skip ci]`, but still permits manual
 dispatch. `build-posix-github.yml` is callable only through a platform entrypoint;
 its platform and architecture must be supplied explicitly.
 
-### POSIX build speed and profiles
+### Five-platform parallelism and incremental builds
+
+All five Actions entrypoints accept `compile_jobs=auto|N`. The default `auto`
+uses host CPU count and available RAM, reserving 2 GiB and budgeting 2.5 GiB per
+compile. It is a conservative starting heuristic, not a peak-memory guarantee:
+large translation units and linkers may need more memory. An unavailable memory
+probe falls back to at most four jobs. Explicit values 1 through 1024 override
+the heuristic; use them only after checking runner resources and swap activity.
+Linux ARM64 cross-build parallelism is based on the x64 host, not target CPUs.
+Each stage records its decision in the Actions summary. Windows no longer fixes
+every runner to four compile jobs; POSIX no longer blindly uses every CPU when
+memory is limited. Small hosted runners may still select four or fewer jobs.
+
+The GN merge helper preserves `args.gn` bytes and mtime when its generated
+contents are unchanged, including in-place merges after a snapshot restore.
+This avoids unnecessary timestamp invalidation; GN generation still runs and
+changed flags still invalidate affected build actions. No objects, depfiles or
+Ninja command hashes are forged. A changed public header can still cause a
+large rebuild.
+
+Windows Actions additionally accept `build_profile=native|fast|release`.
+`native` is the default and keeps the previous Windows GN policy. `fast` and
+`release` explicitly disable/enable `thin_lto_enable_optimizations`, as on POSIX.
+They do not disable CFI, the sandbox, codecs or GPU features. Profile changes
+can themselves invalidate cached work; keep the donor's configuration for a
+first resume, then benchmark a separate fast build if link time dominates.
+The four POSIX defaults remain `fast` and `staged`.
+
+### Resume the supplied Windows snapshot
+
+At the 2026-09-10 metadata check, run `34080799322` is successful and its source
+commit `23fd0a7a0c63cd452cfaec6b2aba8469ef5d4123` pins Chromium `152.0.7977.82`.
+Its stage-8 attempt-1 snapshot consists of **both** artifacts:
+
+| ID | Name | Bytes |
+|---|---|---|
+| `10066122665` | `tree-s8-attempt-1-part1` | 9663676664 |
+| `10066143002` | `tree-s8-attempt-1-part2` | 2740944316 |
+
+The linked artifact is only part 1, not a standalone build tree. The snapshot
+expires around `2026-09-11T16:28Z`; recheck availability before dispatch. The
+archive has not been downloaded or fully inspected in this optimization pass.
+Matching version metadata is not proof that its old patch markers can migrate
+to the current patch series; existing restore/preparation checks remain required.
+
+After these workflow changes are pushed to the selected ref, use:
+
+```bash
+gh workflow run build-win-x64-github.yml --ref main \
+  -f resume_run_id=34080799322 -f resume_tree_stage=8 \
+  -f resume_attempt=1 -f resume_stage=2 \
+  -f use_upstream_cache=false -f compile_jobs=auto -f build_profile=native
+```
+
+Stage 2 here means the first active job in the new run; `resume_tree_stage=8`
+selects the donor snapshot, leaving stages 3-12 available for continuation.
+The download pattern now selects one exact attempt instead of merging arbitrary
+attempts with identically named archive volumes. `use_upstream_cache=false`
+allows a Chromix snapshot without an upstream receipt and avoids requesting the
+expired upstream donor. It does not skip receipt validation when one is present,
+7-Zip integrity checks, patch preparation or compiler compatibility checks.
+An incompatible legacy snapshot can still fail or require rebuilding objects;
+do not remove those checks to claim cache reuse.
+
+For a POSIX platform, retain its own architecture-specific donor and use e.g.:
+
+```bash
+gh workflow run build-linux-x64.yml --ref main \
+  -f compile_jobs=auto -f build_profile=fast -f build_mode=staged \
+  -f use_upstream_cache=true
+```
+
+The same inputs apply to `build-linux-arm64.yml`, `build-macos-x64.yml` and
+`build-macos-arm64.yml`. The Windows snapshot is not portable to those targets.
+No new Actions runs are dispatched by the optimization scripts or tests, and no
+wall-clock speedup is claimed until native builds are timed.
+
+### POSIX profile details
 
 The four POSIX entrypoints accept `build_profile=fast|release` and
 `build_mode=staged|single`. Pushes and manual dispatches default to `fast` with

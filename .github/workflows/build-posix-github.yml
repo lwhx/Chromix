@@ -30,6 +30,10 @@ on:
         required: false
         type: string
         default: fast
+      compile_jobs:
+        required: false
+        type: string
+        default: auto
       use_upstream_cache:
         required: false
         type: boolean
@@ -51,6 +55,7 @@ env:
   DEPOT_TOOLS_METRICS: '0'
   DEPOT_TOOLS_COLLECT_METRICS: '0'
   CHROMIUM_VERSION: '152.0.7977.82'
+  CHROMIX_JOBS: ${{ inputs.compile_jobs }}
 
 jobs:
   posix-1:
@@ -184,6 +189,9 @@ jobs:
           key: ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-${{ env.CHROMIUM_VERSION }}-${{ hashFiles('build/ungoogled-revisions.psd1', 'build/prepare-ungoogled.sh') }}
           restore-keys: |
             ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
+      - name: Select compile parallelism
+        run: python3 tools/build_resources.py --github-env
+
       - name: Run stage 1
         id: stage
         env:
@@ -426,6 +434,9 @@ jobs:
           key: ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-${{ env.CHROMIUM_VERSION }}-${{ hashFiles('build/ungoogled-revisions.psd1', 'build/prepare-ungoogled.sh') }}
           restore-keys: |
             ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
+      - name: Select compile parallelism
+        run: python3 tools/build_resources.py --github-env
+
       - name: Run stage 2
         id: stage
         env:
@@ -669,6 +680,9 @@ jobs:
           key: ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-${{ env.CHROMIUM_VERSION }}-${{ hashFiles('build/ungoogled-revisions.psd1', 'build/prepare-ungoogled.sh') }}
           restore-keys: |
             ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
+      - name: Select compile parallelism
+        run: python3 tools/build_resources.py --github-env
+
       - name: Run stage 3
         id: stage
         env:
@@ -912,6 +926,9 @@ jobs:
           key: ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-${{ env.CHROMIUM_VERSION }}-${{ hashFiles('build/ungoogled-revisions.psd1', 'build/prepare-ungoogled.sh') }}
           restore-keys: |
             ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
+      - name: Select compile parallelism
+        run: python3 tools/build_resources.py --github-env
+
       - name: Run stage 4
         id: stage
         env:
@@ -1155,6 +1172,9 @@ jobs:
           key: ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-${{ env.CHROMIUM_VERSION }}-${{ hashFiles('build/ungoogled-revisions.psd1', 'build/prepare-ungoogled.sh') }}
           restore-keys: |
             ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
+      - name: Select compile parallelism
+        run: python3 tools/build_resources.py --github-env
+
       - name: Run stage 5
         id: stage
         env:
@@ -1398,6 +1418,9 @@ jobs:
           key: ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-${{ env.CHROMIUM_VERSION }}-${{ hashFiles('build/ungoogled-revisions.psd1', 'build/prepare-ungoogled.sh') }}
           restore-keys: |
             ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
+      - name: Select compile parallelism
+        run: python3 tools/build_resources.py --github-env
+
       - name: Run stage 6
         id: stage
         env:
@@ -1641,6 +1664,9 @@ jobs:
           key: ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-${{ env.CHROMIUM_VERSION }}-${{ hashFiles('build/ungoogled-revisions.psd1', 'build/prepare-ungoogled.sh') }}
           restore-keys: |
             ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
+      - name: Select compile parallelism
+        run: python3 tools/build_resources.py --github-env
+
       - name: Run stage 7
         id: stage
         env:
@@ -1884,6 +1910,9 @@ jobs:
           key: ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-${{ env.CHROMIUM_VERSION }}-${{ hashFiles('build/ungoogled-revisions.psd1', 'build/prepare-ungoogled.sh') }}
           restore-keys: |
             ${{ runner.os }}-${{ inputs.platform }}-${{ inputs.arch }}-downloads-v2-
+      - name: Select compile parallelism
+        run: python3 tools/build_resources.py --github-env
+
       - name: Run stage 8
         id: stage
         env:

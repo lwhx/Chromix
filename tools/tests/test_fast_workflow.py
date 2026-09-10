@@ -189,8 +189,8 @@ class FastBuildProfileTest(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("CHROMIX_BUILD_PROFILE must be fast or release", result.stderr)
                     self.assertFalse(work.exists())
-        for filename in ("build/windows/build.ps1", "build/windows/ci-stage.ps1"):
-            self.assertNotIn("--build-profile", (REPO / filename).read_text())
+        self.assertNotIn("--build-profile", (REPO / "build/windows/build.ps1").read_text())
+        self.assertIn('@("fast", "release")', (REPO / "build/windows/ci-stage.ps1").read_text())
 
     def test_fast_and_release_differ_only_in_thinlto_optimization(self):
         for platform, filename in (("linux", "args.gn"), ("macos", "args.macos.gn")):
@@ -262,13 +262,14 @@ class SingleStageCompletionTest(unittest.TestCase):
         self.put(binaries / "date", "#!/bin/sh\nprintf '1700000000\\n'\n")
         self.put(binaries / "timeout", '#!/bin/sh\nexit "$BUILD_EXIT_FIXTURE"\n')
         self.env = {**os.environ, "PATH": str(binaries) + os.pathsep + os.environ["PATH"],
+                    "FIXTURE_BIN": binaries.as_posix(),
                     "CHROMIX_USE_UPSTREAM_CACHE": "0", "CHROMIX_BUILD_PROFILE": "fast",
                     "CHROMIX_RESERVE_MINUTES": "15", "BUILD_EXIT_FIXTURE": "124",
                     "GITHUB_OUTPUT": str(self.output)}
 
     def put(self, path, source):
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(source)
+        path.write_text(source, newline="\n")
         path.chmod(0o755)
 
     def run_stage(self, shell, platform, arch, stage, maximum, phase):
@@ -280,7 +281,9 @@ class SingleStageCompletionTest(unittest.TestCase):
             self.put(self.work / "src/.chromix-source-ready", "fixture\n")
         minutes = 30 if phase in ("prepare", "ninja") else 300
         return subprocess.run(
-            [shell, "--norc", str(self.stage), "--platform", platform, "--arch", arch,
+            [shell, "--norc", "-c",
+             'export PATH="$(cd "$FIXTURE_BIN" && pwd):$PATH"; exec "$BASH" "$@"',
+             "fixture", str(self.stage), "--platform", platform, "--arch", arch,
              "--workdir", str(self.work), "--stage-index", str(stage), "--max-stages", str(maximum),
              "--deadline-epoch", str(1700000000 + minutes * 60)],
             env=self.env, capture_output=True, text=True, timeout=10)
