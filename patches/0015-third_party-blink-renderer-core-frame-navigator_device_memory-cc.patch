@@ -2,7 +2,7 @@ diff --git a/third_party/blink/renderer/core/frame/navigator_device_memory.cc b/
 index 05fa33e456..666154ddaa 100644
 --- a/third_party/blink/renderer/core/frame/navigator_device_memory.cc
 +++ b/third_party/blink/renderer/core/frame/navigator_device_memory.cc
-@@ -9,9 +9,36 @@
+@@ -9,9 +9,39 @@
  #include "third_party/blink/renderer/core/dom/document.h"
  #include "third_party/blink/renderer/core/frame/local_dom_window.h"
  
@@ -15,6 +15,9 @@ index 05fa33e456..666154ddaa 100644
  namespace blink {
  
  float NavigatorDeviceMemory::deviceMemory() const {
++  // Getter overrides do not change the allocator or native memory bucket.
++  if (base::UxrConfig::GetInstance().Get("uxr-synthetic-device-tests") != "true")
++    return ApproximatedDeviceMemory::GetApproximatedDeviceMemory();
 +  // UXR Layer 2: persona-driven via renderer cmdline switch.
 +  double v = 0.0;
 +  // UXR P1-A: StringToDouble + snap to the web-exposed buckets {0.25..8}.

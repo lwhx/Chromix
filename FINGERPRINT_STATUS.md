@@ -4,6 +4,14 @@ This record tracks the implementation requested by `/root/fingerprint-p0-p2-back
 
 ## Acceptance rules
 
+Latest Canvas follow-up: legacy readback/export noise and the remote Canvas
+Bridge now require `--uxr-synthetic-device-tests=true`; default execution retains
+native pixels. A standalone five-context, three-launch codec/color/alpha audit
+and offline oracle regressions are added; see [Canvas chain](docs/canvas-chain.md).
+The installed Chrome 153 control fails this audit. It is not the matching
+Chromium 152 build, so this is diagnostic evidence, not patched-build acceptance.
+Historical validation counts below do not apply to these latest edits.
+
 Each backlog category remains open until it has all of the following:
 
 1. An explicit policy for high-entropy host data and necessary capability checks.
@@ -38,12 +46,12 @@ A standalone C++ test with stubs checks the extracted algorithm or getter contra
 | Codecs / MSE / EME | MediaCapabilities filters intersect native results, including WebRTC callbacks and missing-history fallback; EME fallback retains key-system access. Mixed recording configs also check their audio codec. MediaRecorder MIME queries remain native, and synchronous encoder-start failure restores inactive state. A shared codec policy across playback, MSE, EME, WebRTC and actual decoding remains open. Queries and standalone callback tests do not verify a real encoder/decoder. |
 | Storage | Removed seed-derived and explicit renderer-only quota replacement. StorageManager and buckets retain browser accounting, individual limits and error paths. Backend quota enforcement, persistence and IndexedDB/Cache partitioning still require real browser tests. |
 | Network Information | Removed RTT/downlink-only overrides so getters, cached state, effectiveType, saveData and native change events share the notifier again. Real network transitions and any future notifier-level test policy remain unverified. |
-| Font provenance | Family-name filtering does not prove the selected font is bundled. Check generic, local, last-resort, emoji/CJK/math fallback and Font Loading API. |
+| Font provenance | Default native selection; legacy whitelist/substitution/fallback require synthetic-test opt-in. Probe v2 checks CSS/Canvas/loading samples; CDP audit records platform font names and glyph counts. File-to-glyph binding and rasterization remain open. |
 | Plugins / MIME / PDF | A reported PDF plugin cannot create a missing/disabled viewer. Verify actual PDF display and extension exposure. |
 | Input / device capabilities | Keyboard map overrides do not change actual key/code input. Touch/pointer CSS, gamepad, orientation, motion, and sensors remain open. |
 | CSS media features | Existing overrides cover selected preferences, not full gamut/HDR rendering, print media, scrollbars, and layout. |
 | WebGL | Native readback bytes/errors/pack layout are retained across CPU/PBO/float paths; removed CPU-only postprocessing and unsafe bridge replacement. Extension enumeration and requests share one native support filter; shader precision stays native and limit clamps preserve zero capability. A common backend-level readback privacy mechanism is not implemented; real GPU acceptance remains open. |
-| Wasm / SIMD / threads / SharedArrayBuffer | No unified capability policy established; hardwareConcurrency/deviceMemory getters do not control these execution capabilities. |
+| Wasm / SIMD / threads / SharedArrayBuffer | Legacy CPU/RAM getter overrides require synthetic-test opt-in; heap remains native. Probe v2 executes Wasm/SIMD and bounded memory growth. Isolated-origin audit tests SAB/Atomics worker transfer. Real maximum heap allocation and matching native-build acceptance remain open. |
 
 ## P2 coverage
 
@@ -61,18 +69,52 @@ A standalone C++ test with stubs checks the extracted algorithm or getter contra
 
 ## Real-device pool gaps and next priorities
 
+An evidence collector and conservative whole-record preflight selector now live
+in `tools/collect_device.py` and `tools/device_pool.py`; see
+[`docs/device-pool.md`](docs/device-pool.md). They collect five browser contexts,
+host inventory and restart/profile observations, reject inconsistent evidence,
+and select only exact backend-observation matches. `tools/device_wire_evidence.py`
+parses existing packet captures without treating protocol presence as verification.
+Measured selection now gates the Python sync/async and Node context/persistent
+launch APIs, rejects field overrides, binds persistent record/seed manifests and
+verifies all five contexts before returning them. Default SDK geometry is native;
+independent C++ CPU/RAM/display/GPU pools now require the explicit
+`--uxr-synthetic-device-tests=true` flag. Heap limits retain V8's native value.
+Legacy explicit CPU/RAM/GPU identity overrides and font substitution/whitelisting
+also require that test flag. These are native-default changes, not backend emulation.
+No reviewed real-hardware pool or cross-device backend emulation is bundled.
+Stock Chrome launch workflow tests pass; matching native Chromix build acceptance
+and real wire capture validation remain open.
+
 The current three Windows GPU records are synthetic templates. No measured full-device corpus, sample provenance, or measured population distribution is implemented. Seed stability is implemented, but it does not turn independently configured values into real device samples.
 
 | Priority | Gap confirmed in the current patches | Required implementation or evidence |
 |---|---|---|
 | 1 | Screen/window/DPR overrides remain separate from actual layout. `screen.avail*` is not bounded by the declared screen, window coordinates reject valid negatives, and detailed-screen flags do not remove extra screens. | Configure display geometry at the browser/emulation layer; validate inner/outer/visualViewport, CSS resolution queries, zoom, orientation changes and multiple monitors together. |
-| 1 | CPU count, deviceMemory and JS heap limit remain independent settings; a 64-bit UA can force a roughly 4 GiB reported heap without changing V8. | Use measured device-class records and preserve actual V8 allocation limits and execution capabilities. Test worker contexts, Wasm/SIMD/threads and memory observations. |
-| 1 | Font filtering allows generic, unique-name and last-resort paths without proving which file provided the glyphs. | Record bundled font file provenance; validate fallback, emoji/CJK/math shaping, CSS Font Loading and text rasterization on each supported OS. |
+| 1 | Legacy CPU/deviceMemory overrides now require synthetic-test opt-in. UA bitness and explicit heap getters no longer replace V8's native limit. | Wasm/SIMD/memory-growth and COOP/COEP/SAB harness passed on stock Chrome. Maximum JS heap allocation and matching patched-browser integration remain unverified. |
+| 1 | Native font selection avoids unsupported family substitution by default; CDP platform-font names do not prove the source file. | Bind glyphs to font hashes and validate fallback/rasterization on each supported OS. CSS/Canvas/loading matrix is implemented, not full shaping acceptance. |
 | 2 | GPU identity templates do not prove the native backend implements a corresponding physical device. Linux/macOS/Windows ARM retain native identity. | Collect internally consistent identity/capability records with browser/driver/build versions, then validate requestable features and rendered/readback results on the matching hardware. |
 | 2 | Media devices, audio, codec queries, permissions and capture are not a single device model. | Use actual or explicit virtual device backends; test permission transitions, capture, latency, decoding and playback without inventing support. |
 | 2 | Network/proxy/DNS/WebRTC/TLS/HTTP behavior has no unified measured policy. | Verify actual routes and packet-level behavior separately from JavaScript estimates; network and storage state must be allowed to change normally. |
 
-A future measured record should retain its collection provenance, Chromium/build/OS/architecture/driver versions, complete correlated values, and the native capabilities needed to use it. Selection must be constrained to compatible backends and stable for a persistent profile. Unsupported combinations should fall back to native behavior or be rejected, rather than partially copying another device. This is remaining work, not an implemented pool.
+Measured records retain collection provenance, executable hash, OS/driver inventory
+and correlated observations. Selection only admits exact native matches and binds
+whole records to persistent profiles. Unsupported candidates use verified native
+fallback; partial device copying is not implemented. Expanding beyond exact-native
+records still requires real backend support and hardware acceptance evidence.
+
+### P0-3 Through P0-6 Implementation Update
+
+| Item | Implemented | Still open |
+|---|---|---|
+| P0-3 CPU/memory/execution | Explicit getter override gates; native heap; five-context Wasm/SIMD execution, bounded memory growth and isolated SAB/Atomics roundtrip. | Maximum JS heap allocation, worker scheduling behavior and matching native build. |
+| P0-4 GPU backend | Native default identity/GL limits; WebGL shader/texture readback and extension requests; WebGPU requestDevice/compute/map/texture readback. | Full features/limits/shader/format boundary matrix, device-loss tests and physical driver/backend attribution. |
+| P0-5 Font source | Native selection gates; 20 CSS/Canvas/Font Loading samples including CJK/emoji/missing characters; CDP platform-font evidence. | Font-file-to-glyph binding, rasterization and cross-platform shaping. |
+| P0-6 Network identity/routes | Five-context local UA/CH/header comparison; offline decoded protocol fields and captured-egress endpoint policy checks. | Real proxy/DNS/QUIC/WebRTC capture, complete route/process attribution and TLS/HTTP2 profile comparison. |
+
+`tools/device_p0_audit.py` passed on stock Chrome 153.0.8010.37 in both isolation
+modes. That is harness verification only. No matching Chromix build or real wire
+capture was accepted, so these P0 items are not marked complete.
 
 ## Compatibility changes
 

@@ -18,7 +18,7 @@ from test_restored_patch_contexts import SOURCE_SECTIONS as RESTORED_SECTIONS
 
 ROOT = Path(__file__).resolve().parents[2]
 PATCH_BIN = shutil.which("gpatch") or shutil.which("patch")
-CXX = shutil.which("clang++") or shutil.which("g++")
+CXX = os.environ.get("CXX") or shutil.which("clang++") or shutil.which("g++")
 BASELINE = ROOT / ".chromix-build-verify/sparse-real110-81cwzua4/context-repair/linux/upstream"
 
 
@@ -64,7 +64,7 @@ def patched_sources(tmp_path_factory):
         path = directory / target_path(number)
         path.parent.mkdir(parents=True, exist_ok=True)
         original = source_fixture(number)
-        path.write_text(original)
+        path.write_bytes(original.encode("utf-8"))
         apply_patch(directory, number)
         sources[number] = path.read_text()
         apply_patch(directory, number, reverse=True)
@@ -178,7 +178,7 @@ def runtime_binary(tmp_path_factory, patched_sources):
 
 @pytest.mark.parametrize("case", ["transparent-oob", "coordinates", "channels", "native", "padding",
                                   "constructors", "lifetime", "failures", "repeat", "uint64-seeds",
-                                  "uint64-high-bits", "legacy-seeds"])
+                                  "uint64-high-bits", "legacy-seeds", "default-native"])
 def test_extracted_noise_and_copy(runtime_binary, case):
     result = subprocess.run([str(runtime_binary), case], text=True, capture_output=True, timeout=15)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -258,9 +258,13 @@ namespace base {
 struct UxrConfig {
   std::string seed = "12345";
   bool disabled = false;
+  bool synthetic = true;
   static UxrConfig& GetInstance() { static UxrConfig config; return config; }
   bool Has(const char* key) const { assert(std::string(key) == "uxr-disable-fingerprint-noise"); return disabled; }
-  std::string Get(const char* key) const { assert(std::string(key) == "uxr-canvas-seed"); return seed; }
+  std::string Get(const char* key) const {
+    if (std::string(key) == "uxr-synthetic-device-tests") return synthetic ? "true" : "";
+    assert(std::string(key) == "uxr-canvas-seed"); return seed;
+  }
 };
 bool StringToUint64(const std::string& text, uint64_t* value) {
   const char* start = text.data();
@@ -575,6 +579,16 @@ int main(int argc, char** argv) {
       auto encoded = ImageDataBuffer::Create(original.pm()); assert(encoded);
       CheckPixels(original, encoded->pixmap_, 0, 0, seed);
       assert(Bytes(read.pm()) == Bytes(encoded->pixmap_));
+    }
+  } else if (test == "default-native") {
+    auto& config = base::UxrConfig::GetInstance();
+    config.synthetic = false;
+    for (const std::string seed : {"1", "12345", "4294967296", "18446744073709551615"}) {
+      config.seed = seed;
+      Fixture f; auto before = f.bytes; ImageData data{f.pm()};
+      ReadNoise(&data, 0, 0);
+      auto encoded = ImageDataBuffer::Create(f.pm()); assert(encoded);
+      assert(f.bytes == before && Bytes(encoded->pixmap_) == Bytes(f.pm()));
     }
   } else if (test == "native") {
     auto& config = base::UxrConfig::GetInstance();

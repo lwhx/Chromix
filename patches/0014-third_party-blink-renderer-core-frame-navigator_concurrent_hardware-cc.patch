@@ -2,7 +2,7 @@ diff --git a/third_party/blink/renderer/core/frame/navigator_concurrent_hardware
 index f5c0db2d1b..782fd4d61a 100644
 --- a/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
 +++ b/third_party/blink/renderer/core/frame/navigator_concurrent_hardware.cc
-@@ -6,9 +6,29 @@
+@@ -6,9 +6,32 @@
  
  #include "base/system/sys_info.h"
  
@@ -14,6 +14,9 @@ index f5c0db2d1b..782fd4d61a 100644
  namespace blink {
  
  unsigned NavigatorConcurrentHardware::hardwareConcurrency() const {
++  // Getter overrides do not configure worker scheduling or CPU resources.
++  if (base::UxrConfig::GetInstance().Get("uxr-synthetic-device-tests") != "true")
++    return static_cast<unsigned>(base::SysInfo::NumberOfProcessors());
 +  // UXR Layer 2: persona-driven via renderer cmdline switch.
 +  if (base::UxrConfig::GetInstance().Has("uxr-hw-concurrency")) {
 +    int v = 0;  // UXR P1-A: StringToInt + clamp [1,128]

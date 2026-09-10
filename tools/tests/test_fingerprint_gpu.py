@@ -25,7 +25,7 @@ PERSONA_PATCHES = ("0091", "0092")
 PATCHES = {number: next((ROOT / "patches").glob(f"{number}-*.patch"))
            for number in ("0030",) + SOURCE_PATCHES + PERSONA_PATCHES}
 PATCH_BIN = shutil.which("gpatch") or shutil.which("patch")
-CXX = shutil.which("clang++") or shutil.which("g++")
+CXX = os.environ.get("CXX") or shutil.which("clang++") or shutil.which("g++")
 
 
 def target_path(number):
@@ -390,7 +390,9 @@ def assert_native_adapter(result, prefix="hardware"):
     assert {key: result[f"{prefix}.{key}"] for key in expected} == expected
 
 
-def run_identity(identity_binary, config):
+def run_identity(identity_binary, config, synthetic=True):
+    if synthetic:
+        config = {"uxr-synthetic-device-tests":"true", **config}
     binary, _ = identity_binary
     result = subprocess.run([str(binary), *(f"{key}={value}" for key, value in config.items())],
                             text=True, capture_output=True, timeout=10)
@@ -409,6 +411,21 @@ def run_identity(identity_binary, config):
 
 def has_windows_pool(identity_binary):
     return identity_binary[1] in ("windows-x86_64", "windows-x86")
+
+
+def test_seed_alone_does_not_select_synthetic_gpu(identity_binary):
+    result = run_identity(identity_binary, {"uxr-fingerprint-seed":"42"}, synthetic=False)
+    assert_native_adapter(result, "hardware")
+
+
+def test_explicit_gpu_identity_needs_synthetic_opt_in(identity_binary):
+    result = run_identity(identity_binary, {
+        'uxr-webgl-vendor':'fake', 'uxr-webgl-renderer':'fake renderer',
+        'uxr-webgpu-vendor':'fake', 'uxr-webgpu-architecture':'fake arch',
+        'uxr-webgl-max-texture-size':'1', 'uxr-webgl-fingerprint':'true',
+    }, synthetic=False)
+    assert_real_native(result)
+    assert result['persona.webgl_identity_explicit'] == '0'
 
 
 GPU_TUPLES = {

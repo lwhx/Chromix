@@ -497,8 +497,8 @@ def test_seeded_geometry_cross_sdk_vectors(seed, width, height, taskbar):
 
 def test_persistent_geometry_follows_saved_seed(tmp_path, offline_launch):
     (tmp_path / SEED_FILE).write_bytes(b"42\n")
-    first = persistent(tmp_path)
-    second = persistent(tmp_path, True)
+    first = persistent(tmp_path, args=["--uxr-synthetic-device-tests=true"])
+    second = persistent(tmp_path, True, args=["--uxr-synthetic-device-tests=true"])
     assert [a for a in first if a.startswith("--uxr-")] == [a for a in second if a.startswith("--uxr-")]
     for launch in offline_launch.launches:
         assert launch["viewport"] == {"width": 1680, "height": 925}
@@ -514,7 +514,7 @@ def test_launch_paths_share_geometry_and_fonts(tmp_path, offline_launch, monkeyp
         kwargs["env"] = {"GENERATED": "yes", **kwargs.get("env", {})}
     monkeypatch.setattr(api, "apply_font_env", font_env)
     monkeypatch.setattr(api, "font_dir_whitelist_arg", lambda path: "--uxr-font-whitelist=Fixture")
-    options = {"args": ["--fingerprint=42", "--uxr-device-pixel-ratio=1.25"],
+    options = {"args": ["--uxr-synthetic-device-tests=true", "--fingerprint=42", "--uxr-device-pixel-ratio=1.25"],
                "fonts_dir": tmp_path, "env": {"USER": "yes"}}
     def check_context(context):
         assert context.options["viewport"] == {"width": 1680, "height": 925}
@@ -571,8 +571,49 @@ def test_disabled_stealth_does_not_inject_geometry(offline_launch, options):
     assert not any(a.startswith("--uxr-") for a in offline_launch.launches[-1]["args"])
 
 
+def test_default_launch_keeps_native_geometry(offline_launch):
+    context = api.launch_context(args=["--fingerprint=42"])
+    assert context.options['viewport'] is None
+    assert not any(a.startswith(('--uxr-screen-', '--uxr-outer-', '--window-size='))
+                   for a in offline_launch.launches[-1]['args'])
+    context.close()
+
+
+@pytest.mark.parametrize('asynchronous', [False, True])
+@pytest.mark.parametrize('persistent_mode', [False, True])
+def test_measured_entry_routes_without_legacy_options(monkeypatch, tmp_path, asynchronous, persistent_mode):
+    from chromix import _device_launch as measured
+    calls = []
+    marker = object()
+    def launch(options, **kwargs):
+        calls.append((options, kwargs))
+        if asynchronous:
+            async def result():
+                return marker
+            return result()
+        return marker
+    monkeypatch.setattr(measured, 'launch_measured', launch)
+    name = 'launch_persistent_context' if persistent_mode else 'launch_context'
+    name += '_async' if asynchronous else ''
+    args = (tmp_path,) if persistent_mode and not asynchronous else ()
+    kwargs = {'user_data_dir':tmp_path} if persistent_mode and asynchronous else {}
+    result = getattr(api, name)(*args, device_pool={'seed':42}, headless=False, **kwargs)
+    if asynchronous:
+        result = asyncio.run(result)
+    assert result is marker
+    expected = {'asynchronous':asynchronous, 'headless':False}
+    if persistent_mode:
+        expected['user_data_dir'] = tmp_path
+    assert calls == [({'seed':42}, expected)]
+
+
+def test_measured_async_persistent_requires_directory():
+    with pytest.raises(ValueError, match='requires user_data_dir'):
+        asyncio.run(api.launch_persistent_context_async(device_pool={}))
+
+
 def test_screen_aliases_and_explicit_outer_size(offline_launch):
-    options = {"headless": False, "args": ["--fingerprint=42", "--fingerprint-screen-width=1366",
+    options = {"headless": False, "args": ["--uxr-synthetic-device-tests=true", "--fingerprint=42", "--fingerprint-screen-width=1366",
                "--fingerprint-screen-height=768", "--uxr-taskbar-height=0",
                "--uxr-outer-width=1000", "--uxr-outer-height=700"]}
     ctx = api.launch_context(**options)
@@ -584,7 +625,7 @@ def test_screen_aliases_and_explicit_outer_size(offline_launch):
     ctx = api.launch_context(**options)
     assert ctx.options["viewport"] == {"width": 1000, "height": 615}
     ctx.close()
-    api.launch_context(headless=False, args=["--fingerprint=42", "--window-size=800,600"]).close()
+    api.launch_context(headless=False, args=["--uxr-synthetic-device-tests=true", "--fingerprint=42", "--window-size=800,600"]).close()
     args = offline_launch.launches[-1]["args"]
     assert "--uxr-outer-width=800" in args and "--uxr-outer-height=600" in args
     assert "--start-maximized" not in args
@@ -764,7 +805,8 @@ def test_native_webrtc_policy_overrides_default(offline_launch, policy):
     (200, json.dumps({**GEO_DATA, "timezone": "UTC\n--flag"}).encode(), {}),
     (200, json.dumps({**GEO_DATA, "countryCode": "ZZ"}).encode(), {}),
     (200, json.dumps({**GEO_DATA, "status": "fail"}).encode(), {}),
-])
+], ids=['redirect', 'auth', 'json', 'array', 'oversize', 'length', 'ip',
+        'scoped-ip', 'timezone', 'injection', 'country', 'status'])
 def test_geoip_invalid_response_fails_without_fallback(local_network, status, body, headers):
     proxy, calls = local_network.server(body=body, status=status, headers=headers)
     with pytest.raises(ValueError, match="GeoIP"):

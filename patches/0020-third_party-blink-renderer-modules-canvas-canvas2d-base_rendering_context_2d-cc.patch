@@ -19,7 +19,7 @@ diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_c
  
  // Including "base/time/time.h" triggers a bug in IWYU.
  // https://github.com/include-what-you-use/include-what-you-use/issues/1122
-@@ -519,6 +523,67 @@
+@@ -519,6 +523,69 @@
      }
 -    if (read_pixels_successful && RuntimeEnabledFeatures::FingerprintingCanvasImageDataNoiseEnabled()) {
 +    const auto& noise_config = base::UxrConfig::GetInstance();
@@ -30,6 +30,7 @@ diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_c
 +        noise_seed_text.find_first_not_of("0123456789") == std::string::npos &&
 +        base::StringToUint64(noise_seed_text, &noise_seed) && noise_seed != 0u;
 +    if (read_pixels_successful &&
++        noise_config.Get("uxr-synthetic-device-tests") == "true" &&
 +        !noise_config.Has("uxr-disable-fingerprint-noise") && !persona_noise &&
 +        RuntimeEnabledFeatures::FingerprintingCanvasImageDataNoiseEnabled()) {
        StaticBitmapImage::ShuffleSubchannelColorData(image_data_pixmap.addr(), image_data_pixmap.info(), sx, sy);
@@ -40,6 +41,7 @@ diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_c
 +  const auto ph_seed_text = ph_config.Get("uxr-canvas-seed");
 +  uint64_t ph_seed64 = 0u;
 +  if (!ph_config.Has("uxr-disable-fingerprint-noise") && !ph_seed_text.empty() &&
++      ph_config.Get("uxr-synthetic-device-tests") == "true" &&
 +      ph_seed_text.find_first_not_of("0123456789") == std::string::npos &&
 +      base::StringToUint64(ph_seed_text, &ph_seed64) && ph_seed64 != 0u) {
 +    // SplitMix64's finalizer folds high bits without changing legacy 32-bit seeds.

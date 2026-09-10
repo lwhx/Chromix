@@ -32,3 +32,6 @@ chromix = "chromix.__main__:main"
 
 [tool.setuptools]
 packages = ["chromix"]
+
+[tool.setuptools.package-data]
+chromix = ["device_probe.js"]

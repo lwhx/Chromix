@@ -323,7 +323,8 @@ def _prepare(headless, proxy, args, stealth_args, timezone, locale, geoip,
                              extension_paths=extension_paths,
                              start_maximized=start_maximized)
     geometry = None
-    if stealth_args and "--fingerprint=off" not in chrome_args:
+    if (stealth_args and "--fingerprint=off" not in chrome_args
+            and "--uxr-synthetic-device-tests=true" in chrome_args):
         chrome_args, geometry = ensure_persona_geometry(chrome_args)
         if not headless and not any(a.split("=", 1)[0] == "--window-size" for a in chrome_args):
             chrome_args = [a for a in chrome_args if a != "--start-maximized"]
@@ -376,8 +377,6 @@ def _wrap_new_page(browser, humanize: bool, cfg_factory):
 
 def _wrap_geometry(browser, geometry, headless, asynchronous=False):
     browser._chromix_geometry = geometry
-    if geometry is None:
-        return
 
     def wrap(original):
         if asynchronous:
@@ -419,6 +418,8 @@ def launch(headless: bool = True,
     """
     from playwright.sync_api import sync_playwright
 
+    if "device_pool" in kwargs:
+        raise ValueError("device_pool requires launch_context or launch_persistent_context")
     fonts_dir = kwargs.pop("fonts_dir", None)
     binary, chrome_args, proxy_kwargs, geometry = _prepare(
         headless, proxy, args, stealth_args, timezone, locale, geoip,
@@ -459,6 +460,8 @@ async def launch_async(headless: bool = True,
     """Async variant of launch(); returns an async Playwright Browser."""
     from playwright.async_api import async_playwright
 
+    if "device_pool" in kwargs:
+        raise ValueError("device_pool requires launch_context_async or launch_persistent_context_async")
     fonts_dir = kwargs.pop("fonts_dir", None)
     binary, chrome_args, proxy_kwargs, geometry = _prepare(
         headless, proxy, args, stealth_args, timezone, locale, geoip,
@@ -508,7 +511,7 @@ def _split_context_kwargs(viewport, locale, color_scheme, user_agent, kwargs,
     elif ("viewport" not in ctx_kwargs and "no_viewport" not in ctx_kwargs):
         ctx_kwargs["viewport"] = (
             {"width": geometry.get("outer_width", geometry["width"]),
-             "height": geometry["inner_height"]} if geometry else DEFAULT_VIEWPORT
+             "height": geometry["inner_height"]} if geometry else None
         ) if headless else None
     if "viewport" in ctx_kwargs and ctx_kwargs["viewport"] is None:
         ctx_kwargs.setdefault("no_viewport", True)
@@ -737,3 +740,40 @@ async def launch_persistent_context_async(**kw: Any) -> Any:
             patch_page(page, resolve_human_config(kw.get("human_preset", "default"),
                                                   kw.get("human_config")))
     return ctx
+
+
+def _measured_context_entry(original, asynchronous=False):
+    from functools import wraps
+    import inspect
+    signature = inspect.signature(original)
+
+    def dispatch(args, kwargs):
+        options = kwargs.pop("device_pool")
+        bound = signature.bind(*args, **kwargs)
+        supplied = dict(bound.arguments)
+        supplied.update(supplied.pop("kwargs", {}))
+        supplied.update(supplied.pop("kw", {}))
+        if "persistent" in original.__name__ and not supplied.get("user_data_dir"):
+            raise ValueError("measured persistent launch requires user_data_dir")
+        from ._device_launch import launch_measured
+        return launch_measured(options, asynchronous=asynchronous, **supplied)
+
+    if asynchronous:
+        @wraps(original)
+        async def wrapped(*args, **kwargs):
+            if "device_pool" in kwargs:
+                return await dispatch(args, kwargs)
+            return await original(*args, **kwargs)
+    else:
+        @wraps(original)
+        def wrapped(*args, **kwargs):
+            if "device_pool" in kwargs:
+                return dispatch(args, kwargs)
+            return original(*args, **kwargs)
+    return wrapped
+
+
+launch_context = _measured_context_entry(launch_context)
+launch_persistent_context = _measured_context_entry(launch_persistent_context)
+launch_context_async = _measured_context_entry(launch_context_async, asynchronous=True)
+launch_persistent_context_async = _measured_context_entry(launch_persistent_context_async, asynchronous=True)

@@ -12,7 +12,7 @@ index 9d155705c1..b8f0e0b8f0 100644
  #include "third_party/blink/renderer/modules/webgpu/gpu_memory_heap_info.h"
  #include "third_party/blink/renderer/modules/webgpu/gpu_subgroup_matrix_config.h"
  
-@@ -34,7 +37,41 @@ GPUAdapterInfo::GPUAdapterInfo(const String& vendor,
+@@ -34,7 +37,43 @@ GPUAdapterInfo::GPUAdapterInfo(const String& vendor,
        type_(type),
        d3d_shader_model_(d3d_shader_model),
        vk_driver_version_(vk_driver_version),
@@ -22,6 +22,8 @@ index 9d155705c1..b8f0e0b8f0 100644
 +  if (is_fallback_adapter_)
 +    return;
 +  const auto& config = base::UxrConfig::GetInstance();
++  if (config.Get("uxr-synthetic-device-tests") != "true")
++    return;
 +  const auto& persona = ungoogled::CurrentPersona();
 +  const bool explicit_vendor = config.Has("uxr-webgpu-vendor") &&
 +      !config.Get("uxr-webgpu-vendor").empty();

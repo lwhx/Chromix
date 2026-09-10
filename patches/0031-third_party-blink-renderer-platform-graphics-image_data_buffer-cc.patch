@@ -10,7 +10,7 @@ diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc b
  #include "third_party/blink/renderer/platform/image-encoders/image_encoder_utils.h"
  #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
  #include "third_party/blink/renderer/platform/wtf/text/base64.h"
-@@ -43,6 +45,79 @@
+@@ -43,6 +45,80 @@
  #include "ui/gfx/skia_span_util.h"
  
  namespace blink {
@@ -27,6 +27,7 @@ diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc b
 +  uint64_t seed64 = 0u;
 +  const SkColorType ct = pm.colorType();
 +  const bool apply_noise =
++      config.Get("uxr-synthetic-device-tests") == "true" &&
 +      !config.Has("uxr-disable-fingerprint-noise") && !seed_text.empty() &&
 +      seed_text.find_first_not_of("0123456789") == std::string::npos &&
 +      base::StringToUint64(seed_text, &seed64) && seed64 != 0u &&
@@ -90,7 +91,7 @@ diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc b
  
  ImageDataBuffer::ImageDataBuffer(scoped_refptr<StaticBitmapImage> image) {
    if (!image)
-@@ -83,6 +158,8 @@
+@@ -83,6 +159,8 @@
        return;
  
      sk_sp<SkData> data = SkData::MakeUninitialized(size);
@@ -99,7 +100,7 @@ diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc b
      pixmap_ = {info, data->writable_data(), info.minRowBytes()};
      if (!paint_image.readPixels(info, pixmap_.writable_addr(), rowBytes, 0,
                                  0)) {
-@@ -97,13 +174,23 @@
+@@ -97,13 +175,23 @@
        return;
      MSAN_CHECK_MEM_IS_INITIALIZED(pixmap_.addr(), pixmap_.computeByteSize());
    }

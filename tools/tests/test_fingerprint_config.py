@@ -1,5 +1,6 @@
 """Standalone regressions for the merged renderer configuration templates."""
 from pathlib import Path
+import os
 import shutil
 import subprocess
 
@@ -17,7 +18,7 @@ def added_source(name):
 
 @pytest.fixture(scope="module")
 def config_binary(tmp_path_factory):
-    compiler = shutil.which("c++") or shutil.which("g++")
+    compiler = os.environ.get("CXX") or shutil.which("c++") or shutil.which("g++")
     if not compiler:
         pytest.skip("C++ compiler unavailable")
     root = tmp_path_factory.mktemp("merged-config")
@@ -74,7 +75,7 @@ inline bool StringToDouble(const std::string& text, double* out) {
 #include <iostream>
 int main(int argc, char** argv) {
   auto& config = base::UxrConfig::GetInstance();
-  if (argc > 2) {
+  if (argc > 2 && std::string(argv[1]) != "synthetic") {
     config.SetAll({{"typed", argv[2]}});
     if (std::string(argv[1]) == "uint64") {
       uint64_t value = 0;
@@ -87,7 +88,9 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
-  if (argc > 1) config.SetAll({{"uxr-canvas-seed", argv[1]}});
+  if (argc > 2 && std::string(argv[1]) == "synthetic")
+    config.SetAll({{"uxr-canvas-seed", argv[2]}, {"uxr-synthetic-device-tests", "true"}});
+  else if (argc > 1) config.SetAll({{"uxr-canvas-seed", argv[1]}});
   int width = 0, height = 0;
   float dpr = 0;
   const bool screen = config.GetSeededScreen(&width, &height, &dpr);
@@ -116,6 +119,67 @@ def read_config(binary, seed=None):
     return subprocess.check_output(args, text=True).strip().split()
 
 
+def test_heap_limit_keeps_native_v8_value(tmp_path):
+    compiler = os.environ.get('CXX') or shutil.which('c++') or shutil.which('g++')
+    if not compiler:
+        pytest.skip('C++ compiler unavailable')
+    source = added_source('0054-third_party-blink-renderer-core-timing-memory_info-h.patch')
+    assert 'uxr-js-heap-size-limit' not in source
+    assert 'uxr-ua-bitness' not in source
+    main = tmp_path / 'heap.cc'
+    main.write_text('#include <cstdint>\n#include <iostream>\nstruct Memory {\n'
+                    'struct Info {uint64_t js_heap_size_limit;} info_;\n' + source +
+                    '};\nint main(){for(uint64_t value : {0ull, 123ull, 8589934592ull})'
+                    '{Memory m{{value}};if(m.jsHeapSizeLimit()!=value)return 1;}}\n')
+    binary = tmp_path / 'heap-test'
+    subprocess.run([compiler, '-std=c++20', str(main), '-o', str(binary)],
+                   check=True, capture_output=True, text=True)
+    subprocess.run([str(binary)], check=True, timeout=10)
+
+
+@pytest.mark.parametrize('number,klass,method,native', [
+    ('0014','NavigatorConcurrentHardware','hardwareConcurrency',32),
+    ('0015','NavigatorDeviceMemory','deviceMemory',16),
+])
+def test_explicit_cpu_memory_overrides_need_test_opt_in(tmp_path, number, klass, method, native):
+    compiler = os.environ.get('CXX') or shutil.which('c++') or shutil.which('g++')
+    if not compiler:
+        pytest.skip('C++ compiler unavailable')
+    name = next((REPO / 'patches').glob(number + '-*.patch')).name
+    body = '\n'.join(line for line in added_source(name).splitlines() if not line.startswith('#include'))
+    returns = 'unsigned' if number == '0014' else 'float'
+    fallback = ('static_cast<unsigned>(base::SysInfo::NumberOfProcessors())' if number == '0014'
+                else 'ApproximatedDeviceMemory::GetApproximatedDeviceMemory()')
+    source = '''#include <string>
+#include <cmath>
+#include <cassert>
+namespace base {
+struct UxrConfig {
+  bool synthetic=false;
+  static UxrConfig& GetInstance(){static UxrConfig c;return c;}
+  std::string Get(const std::string& key) const {
+    return key=="uxr-synthetic-device-tests" ? (synthetic?"true":"false") : "4";
+  }
+  bool Has(const char*) const {return true;}
+  int GetSeededHwConcurrency() const {return 2;}
+  float GetSeededDeviceMemory() const {return 2;}
+};
+struct SysInfo {static int NumberOfProcessors(){return 32;}};
+bool StringToInt(const std::string& s,int* out){*out=std::stoi(s);return true;}
+bool StringToDouble(const std::string& s,double* out){*out=std::stod(s);return true;}
+}
+struct ApproximatedDeviceMemory {static float GetApproximatedDeviceMemory(){return 16;}};
+'''
+    source += f'struct {klass} {{{returns} {method}() const {{\n{body}\nreturn {fallback};\n}}}};\n'
+    source += f'int main(){{{klass} n;assert(n.{method}()=={native});base::UxrConfig::GetInstance().synthetic=true;assert(n.{method}()==4);}}'
+    cpp = tmp_path / 'native.cc'
+    cpp.write_text(source)
+    binary = tmp_path / 'native-test'
+    subprocess.run([compiler, '-std=c++20', str(cpp), '-o', str(binary)],
+                   capture_output=True, text=True, check=True)
+    subprocess.run([str(binary)], check=True, timeout=10)
+
+
 @pytest.mark.parametrize("seed", [None, "", "0", "-1", "abc", "12x", "18446744073709551616"])
 def test_invalid_or_missing_seed_keeps_native_fallback(config_binary, seed):
     assert read_config(config_binary, seed) == ["0"] * 7
@@ -123,8 +187,10 @@ def test_invalid_or_missing_seed_keeps_native_fallback(config_binary, seed):
 
 @pytest.mark.parametrize("seed", ["1", "4294967295", "4294967296", "1099511627776", "18446744073709551615"])
 def test_full_64bit_canvas_seed_selects_stable_templates(config_binary, seed):
-    result = read_config(config_binary, seed)
-    assert result == read_config(config_binary, seed)
+    assert read_config(config_binary, seed) == ["0"] * 7
+    command = [str(config_binary), "synthetic", seed]
+    result = subprocess.check_output(command, text=True).strip().split()
+    assert result == subprocess.check_output(command, text=True).strip().split()
     cores, memory, screen, width, height, dpr, taskbar = result
     assert int(cores) in {2, 4, 6, 8, 12, 14, 16, 20, 24}
     assert float(memory) in {4.0, 8.0}

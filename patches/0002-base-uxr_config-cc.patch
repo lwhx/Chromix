@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000000..cac1a6896b
 --- /dev/null
 +++ b/base/uxr_config.cc
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,159 @@
 +// Copyright 2026.
 +#include "base/uxr_config.h"
 +
@@ -65,6 +65,9 @@ index 0000000000..cac1a6896b
 +namespace {
 +
 +uint64_t SeedFromCanvasKey(const UxrConfig& cfg) {
++  // Independent hardware templates are only for explicit synthetic tests.
++  if (cfg.Get("uxr-synthetic-device-tests") != "true")
++    return 0u;
 +  uint64_t seed = 0;
 +  const std::string raw = cfg.Get("uxr-canvas-seed");
 +  if (raw.empty() || !base::StringToUint64(raw, &seed))
@@ -106,7 +109,7 @@ index 0000000000..cac1a6896b
 +  const uint64_t seed = SeedFromCanvasKey(*this);
 +  if (seed == 0u)
 +    return 0.0f;
-+  // deviceMemory buckets cap at 8: every 16GB/32GB machine reports 8.
++  // Legacy synthetic test buckets only; native Chromium may expose 16/32.
 +  struct E { float gb; unsigned w; };
 +  static constexpr std::array<E, 2> kPool = {{{8.0f, 75}, {4.0f, 25}}};
 +  return PickSeeded(kPool, seed ^ 0x6465766d656dULL, &E::w).gb;

@@ -27,6 +27,7 @@ import {
 import { fontLaunchEnv, fontDirWhitelistArg } from "./_fonts.js";
 import { ensurePersonaGeometry } from "./_persona.js";
 import { extractProxyUrl, geoipHttp, networkArgs, splitProxy } from "./_network.js";
+import { launchMeasured, measuredOptions } from "./_device_pool.js";
 
 // One geometry pick per options object, shared by buildLaunchOptions and
 // buildContextOptions (launchPersistentContext calls them separately).
@@ -37,7 +38,8 @@ function personaGeometryFor(options) {
   let entry = _personaGeoCache.get(options);
   if (!entry || entry.key !== key) {
     const fingerprint = args.filter((a) => a.split("=", 1)[0] === "--fingerprint").at(-1);
-    if (options.stealthArgs === false || fingerprint === "--fingerprint=off") {
+    if (options.stealthArgs === false || fingerprint === "--fingerprint=off" ||
+        !args.includes("--uxr-synthetic-device-tests=true")) {
       entry = { args, geometry: null };
     } else {
       entry = ensurePersonaGeometry(buildArgs({ extraArgs: args }));
@@ -264,6 +266,8 @@ function effectiveHeadless(options) {
 }
 
 export function buildContextOptions(options = {}) {
+  if (Object.hasOwn(options, "devicePool"))
+    throw new Error("devicePool requires launchContext or launchPersistentContext for runtime verification");
   const headless = effectiveHeadless(options);
   // Context-level locale/timezoneId would route through CDP emulation — strip
   // them and route through the binary flags instead (same policy as CloakBrowser).
@@ -275,7 +279,7 @@ export function buildContextOptions(options = {}) {
   // with the spoofed devicePixelRatio.
   const persona = personaGeometryFor(options).geometry;
   const personaViewport = persona
-    ? { width: persona.outerWidth, height: persona.innerHeight } : DEFAULT_VIEWPORT;
+    ? { width: persona.outerWidth, height: persona.innerHeight } : null;
   const viewport = options.viewport !== undefined
     ? options.viewport
     : ctx.viewport !== undefined ? ctx.viewport : headless ? personaViewport : null;
@@ -291,6 +295,8 @@ export function buildContextOptions(options = {}) {
 }
 
 export async function buildLaunchOptions(options = {}) {
+  if (Object.hasOwn(options, "devicePool"))
+    throw new Error("devicePool requires launchContext or launchPersistentContext for runtime verification");
   const headless = effectiveHeadless(options);
   const proxy = splitProxy(launchProxy(options));
   const lookupProxy = splitProxy(geoipProxy(options));
@@ -500,13 +506,10 @@ export async function launch(options = {}) {
   const launchOpts = await buildLaunchOptions(options);
   const browser = await chromium.launch(launchOpts);
   for (const method of ["newPage", "newContext"]) {
-    const geometry = personaGeometryFor(options).geometry;
-    if (!browser[method] || (!geometry && !options.contextOptions)) continue;
+    if (!browser[method]) continue;
     const original = browser[method].bind(browser);
     browser[method] = (contextOptions = {}) => {
       const defaults = buildContextOptions(options);
-      if (!geometry && options.viewport === undefined && options.contextOptions?.viewport === undefined)
-        delete defaults.viewport;
       if (contextOptions.viewport === null) delete defaults.deviceScaleFactor;
       return original({ ...defaults, ...contextOptions });
     };
@@ -517,6 +520,10 @@ export async function launch(options = {}) {
 }
 
 export async function launchContext(options = {}) {
+  if (Object.hasOwn(options, "devicePool")) {
+    measuredOptions(options);
+    return launchMeasured(await loadChromium(), await ensureBinary(options), options);
+  }
   options = { ...options };
   const chromium = await loadChromium();
   const browser = await chromium.launch(await buildLaunchOptions(options));
@@ -532,6 +539,11 @@ export async function launchContext(options = {}) {
 }
 
 export async function launchPersistentContext(options = {}) {
+  if (Object.hasOwn(options, "devicePool")) {
+    if (!options.userDataDir) throw new Error("launchPersistentContext requires options.userDataDir");
+    measuredOptions(options);
+    return launchMeasured(await loadChromium(), await ensureBinary(options), options);
+  }
   const chromium = await loadChromium();
   if (!options.userDataDir) throw new Error("launchPersistentContext requires options.userDataDir");
   let args = options.contextOptions?.args ?? options.launchOptions?.args ?? options.args ?? [];

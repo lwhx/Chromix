@@ -2,7 +2,7 @@ diff --git a/components/ungoogled/persona_profile.cc b/components/ungoogled/pers
 new file mode 100644
 --- /dev/null
 +++ b/components/ungoogled/persona_profile.cc
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,234 @@
 +// Copyright 2026.
 +#include "components/ungoogled/persona_profile.h"
 +
@@ -46,6 +46,8 @@ new file mode 100644
 +}};
 +
 +bool SupportsSeededWebGLPool(const base::UxrConfig& config) {
++  if (config.Get("uxr-synthetic-device-tests") != "true")
++    return false;
 +#if BUILDFLAG(IS_WIN) && (defined(ARCH_CPU_X86_64) || defined(ARCH_CPU_X86))
 +  const std::string platform = base::ToLowerASCII(config.Get("uxr-platform"));
 +  const std::string architecture = config.Get("uxr-ua-arch");
@@ -136,6 +138,11 @@ new file mode 100644
 +PersonaProfile BuildPersona() {
 +  PersonaProfile p;
 +  const base::UxrConfig& config = base::UxrConfig::GetInstance();
++  // No identity/limit template may replace the physical backend by default.
++  if (config.Get("uxr-synthetic-device-tests") != "true") {
++    p.webgl_real = true;
++    return p;
++  }
 +  const std::string vendor = config.Get("uxr-webgl-vendor");
 +  const std::string renderer = config.Get("uxr-webgl-renderer");
 +  if (!vendor.empty() && !renderer.empty()) {

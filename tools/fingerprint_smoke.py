@@ -397,7 +397,8 @@ def browser_args(scenario: dict, origin: str, no_sandbox: bool) -> list[str]:
         args.append("--fingerprint=off")
     else:
         seed = scenario["seed"] if scenario["mode"] == "on" else "off"
-        args += [f"--fingerprint={seed}", f"--fingerprint-platform={PLATFORMS[scenario['platform']]['platform']}",
+        args += ["--uxr-synthetic-device-tests=true",
+                 f"--fingerprint={seed}", f"--fingerprint-platform={PLATFORMS[scenario['platform']]['platform']}",
                  f"--fingerprint-locale={scenario['locale']}"]
     if no_sandbox:
         args.append("--no-sandbox")

@@ -43,7 +43,7 @@ the download.
 |---|---|
 | `launch(**opts)` | Returns a Playwright `Browser` |
 | `launch_async(**opts)` | Async variant |
-| `launch_context(**opts)` | Returns a `BrowserContext` (viewport/locale/color_scheme pre-set) |
+| `launch_context(**opts)` | Returns a `BrowserContext` (native viewport by default) |
 | `launch_context_async(**opts)` | Async variant |
 | `launch_persistent_context(user_data_dir, **opts)` | Persistent profile |
 | `launch_persistent_context_async(user_data_dir, **opts)` | Async variant |
@@ -65,18 +65,32 @@ one decimal 32-bit seed followed by a newline, uses the same format as the
 Node SDK, and is published atomically for concurrent first launches. An
 explicit `--fingerprint=...` in `args` wins without creating or rewriting the
 file; `stealth_args=False` also skips seed I/O. Defaults claim the native
-persona: `linux`, `windows`, or `macos`. Numeric seeds also determine the
-same screen geometry in both SDKs, so a persistent profile keeps its screen,
-outer window and default viewport/DPR across launches. Explicit geometry and
-viewport options still win; headed contexts use the native viewport by default.
+persona: `linux`, `windows`, or `macos`. Default viewport geometry is native.
+Seeded synthetic geometry now requires `args=["--uxr-synthetic-device-tests=true"]`;
+that test-only mode retains deterministic cross-SDK templates. Explicit viewport
+options still win outside measured mode.
+
+### Measured device launch
+
+`launch_context(device_pool={"host": "record.json", "records": ["record.json"],
+"seed": "42"})` validates whole evidence bundles and native host capabilities,
+then checks five live contexts before returning. Async and persistent context
+variants support the same option; the async persistent directory is keyword-only.
+Point `CLOAKBROWSER_BINARY_PATH` at the collected executable. Evidence defaults to
+a 24-hour maximum age, and extra launch/context overrides are rejected. Persistent
+profiles bind record and seed rather than rotating identities. Browser-returning
+`launch` does not support this option. See [device pool documentation](../../docs/device-pool.md)
+for collection, configuration, native fallback and remaining acceptance limits.
 
 ### Custom font directory
 
-`fonts_dir="path/to/fonts"` makes the browser use exactly the fonts inside
-that directory: the SDK parses every `.ttf` / `.otf` / `.ttc` name table and
-passes the discovered families as `--uxr-font-whitelist`, and on Linux the
-directory replaces the bundled Fontconfig set so those fonts truly render.
-An explicit `--uxr-font-whitelist` in `args` still wins.
+`fonts_dir="path/to/fonts"` parses `.ttf` / `.otf` / `.ttc` family names and,
+on Linux, configures the actual Fontconfig directory. It does not install fonts
+into the Windows/macOS font backend or prove the file used for each glyph.
+Family whitelisting, substitution and persona fallback now require
+`--uxr-synthetic-device-tests=true`; normal launches keep native font selection.
+An explicit whitelist overrides SDK-generated names only in that test mode.
+Measured device mode rejects `fonts_dir` and other per-field overrides.
 
 ```python
 browser = launch(fonts_dir="C:/fontsets/win11-segoe-only")

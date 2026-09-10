@@ -7,7 +7,7 @@ import fsPromises from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import http from "node:http";
 import https from "node:https";
@@ -47,6 +47,7 @@ test("default stealth args carry one seed and preserve the sandbox", () => {
 
 test("context options: default viewport, explicit null, CDP emulation stripped", () => {
   const ctx = buildContextOptions({ headless: true, args: [
+    "--uxr-synthetic-device-tests=true",
     "--uxr-screen-width=1920", "--uxr-screen-height=1080", "--uxr-taskbar-height=48",
   ] });
   assert.equal(ctx.viewport?.width, 1920);
@@ -85,7 +86,8 @@ for (const [platform, persona] of [["linux", "linux"], ["win32", "windows"], ["d
 
 const SEED_FILE = ".chromix-fingerprint-seed";
 const fixture = mkdtempSync(join(tmpdir(), "chromix-api-"));
-const playwright = join(new URL("../node_modules", import.meta.url).pathname, "playwright-core");
+const playwright = join(fileURLToPath(new URL("../node_modules", import.meta.url)), "playwright-core");
+if (existsSync(playwright)) throw new Error("Test fixture refuses to overwrite installed playwright-core");
 mkdirSync(playwright, { recursive: true });
 writeFileSync(join(playwright, "package.json"), JSON.stringify({ type: "module", exports: "./index.js" }));
 writeFileSync(join(playwright, "index.js"), `
@@ -115,7 +117,7 @@ after(() => rmSync(fixture, { recursive: true, force: true }));
 function offline(t) {
   const root = mkdtempSync(join(fixture, "profile-test-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
-  for (const [key, value] of [["CLOAKBROWSER_BINARY_PATH", new URL("../index.js", import.meta.url).pathname], ["CLOAKBROWSER_WIDEVINE", "0"]]) {
+  for (const [key, value] of [["CLOAKBROWSER_BINARY_PATH", fileURLToPath(new URL("../index.js", import.meta.url))], ["CLOAKBROWSER_WIDEVINE", "0"]]) {
     const original = process.env[key];
     process.env[key] = value;
     t.after(() => {
@@ -402,7 +404,7 @@ test("persona geometry respects explicit values and dpr viewport", async () => {
 });
 
 test("context viewport comes from the same persona pick per options object", () => {
-  const opts = { args: [] };
+  const opts = { args: ["--uxr-synthetic-device-tests=true"] };
   const c1 = buildContextOptions(opts);
   const c2 = buildContextOptions(opts);
   assert.deepEqual(c1.viewport, c2.viewport, "one pick per options object");
@@ -431,9 +433,9 @@ for (const [seed, width, height, taskbar] of [[1, 1920, 1200, 48], [42, 1680, 10
 test("persistent geometry follows the saved seed before context construction", async (t) => {
   const profile = offline(t);
   writeFileSync(join(profile, SEED_FILE), "42\n");
-  const first = await persistent(profile);
+  const first = await persistent(profile, { args: ["--uxr-synthetic-device-tests=true"] });
   const firstOptions = calls.at(-1).options;
-  const second = await persistent(profile);
+  const second = await persistent(profile, { args: ["--uxr-synthetic-device-tests=true"] });
   assert.deepEqual(geometryArgs(first), geometryArgs(second));
   assert.deepEqual(firstOptions.viewport, { width: 1680, height: 925 });
   assert.deepEqual(calls.at(-1).options.viewport, firstOptions.viewport);
@@ -442,14 +444,14 @@ test("persistent geometry follows the saved seed before context construction", a
 
 test("launch and context options share geometry with DPR at context level", async (t) => {
   offline(t);
-  const options = { args: ["--fingerprint=42", "--uxr-device-pixel-ratio=1.25"] };
+  const options = { args: ["--uxr-synthetic-device-tests=true", "--fingerprint=42", "--uxr-device-pixel-ratio=1.25"] };
   const context = buildContextOptions(options);
   const launch = await fixtureApi.buildLaunchOptions(options);
   assert.deepEqual(context.viewport, { width: 1680, height: 925 });
   assert.equal(context.deviceScaleFactor, 1.25);
   assert.equal(context.viewport.deviceScaleFactor, undefined);
   assert.ok(launch.args.includes("--uxr-screen-width=1680"));
-  options.args = ["--fingerprint=1"];
+  options.args = ["--uxr-synthetic-device-tests=true", "--fingerprint=1"];
   assert.deepEqual(buildContextOptions(options).viewport, { width: 1920, height: 1067 });
   const nested = buildContextOptions({ ...options, contextOptions: { viewport: { width: 800, height: 600 } } });
   assert.deepEqual(nested.viewport, { width: 800, height: 600 });
@@ -457,7 +459,7 @@ test("launch and context options share geometry with DPR at context level", asyn
 
 test("browser newPage and newContext inherit geometry but allow explicit overrides", async (t) => {
   offline(t);
-  const options = { args: ["--fingerprint=42", "--uxr-device-pixel-ratio=1.25"] };
+  const options = { args: ["--uxr-synthetic-device-tests=true", "--fingerprint=42", "--uxr-device-pixel-ratio=1.25"] };
   const browser = await fixtureApi.launch(options);
   for (const method of ["newPage", "newContext"]) {
     const context = await browser[method]();
@@ -483,14 +485,14 @@ test("disabled stealth and fingerprint off do not inject geometry", async (t) =>
 
 test("screen aliases, explicit outer size and headed window remain coherent", async (t) => {
   offline(t);
-  const options = { headless: false, args: ["--fingerprint=42", "--fingerprint-screen-width=1366",
+  const options = { headless: false, args: ["--uxr-synthetic-device-tests=true", "--fingerprint=42", "--fingerprint-screen-width=1366",
     "--fingerprint-screen-height=768", "--uxr-taskbar-height=0", "--uxr-outer-width=1000", "--uxr-outer-height=700"] };
   const launch = await fixtureApi.buildLaunchOptions(options);
   assert.ok(!launch.args.some((a) => a.startsWith("--uxr-screen-width=")));
   assert.ok(launch.args.includes("--window-size=1000,700"));
   assert.equal(buildContextOptions(options).viewport, null);
   assert.deepEqual(buildContextOptions({ ...options, headless: true }).viewport, { width: 1000, height: 615 });
-  const sized = { headless: false, args: ["--fingerprint=42", "--window-size=800,600"] };
+  const sized = { headless: false, args: ["--uxr-synthetic-device-tests=true", "--fingerprint=42", "--window-size=800,600"] };
   const sizedLaunch = await fixtureApi.buildLaunchOptions(sized);
   assert.ok(sizedLaunch.args.includes("--uxr-outer-width=800"));
   assert.ok(sizedLaunch.args.includes("--uxr-outer-height=600"));
@@ -500,7 +502,7 @@ test("screen aliases, explicit outer size and headed window remain coherent", as
 test("font directory reaches launch args and isolated Fontconfig paths", async (t) => {
   const root = offline(t);
   const { linuxFontEnv } = await import("../_fonts.js");
-  const fontsDir = new URL("../../../assets/fonts", import.meta.url).pathname;
+  const fontsDir = fileURLToPath(new URL("../../../assets/fonts", import.meta.url));
   const launch = await fixtureApi.buildLaunchOptions({ fontsDir, launchOptions: { env: { FIXTURE: "yes" } } });
   assert.ok(launch.args.some((a) => a.startsWith("--uxr-font-whitelist=") && a.includes("Arial")));
   assert.equal(launch.env.FIXTURE, "yes");
@@ -637,7 +639,7 @@ for (const mode of [{ stealthArgs: false }, { args: ["--fingerprint=off"] }]) {
     for (const method of ["newPage", "newContext"]) {
       const context = await browser[method]();
       assert.deepEqual(context.contextOptions.proxy, { server, username: "u", password: "p" });
-      assert.equal(context.contextOptions.viewport, undefined);
+      assert.equal(context.contextOptions.viewport, null);
       const explicit = await browser[method]({ proxy: { server: "http://other.invalid:80" } });
       assert.equal(explicit.contextOptions.proxy.server, "http://other.invalid:80");
     }

@@ -1,14 +1,15 @@
 diff --git a/third_party/blink/renderer/platform/fonts/font_cache.cc b/third_party/blink/renderer/platform/fonts/font_cache.cc
 --- a/third_party/blink/renderer/platform/fonts/font_cache.cc
 +++ b/third_party/blink/renderer/platform/fonts/font_cache.cc
-@@ -372,8 +372,23 @@
+@@ -376,8 +376,24 @@
    if (Character::IsPrivateUse(lookup_char) ||
        Character::IsNonCharacter(lookup_char))
      return nullptr;
    base::ElapsedTimer timer;
 +  const std::string persona = base::UxrConfig::GetInstance().Get("uxr-platform");
 +  const std::string whitelist = base::UxrConfig::GetInstance().Get("uxr-font-whitelist");
-+  if ((base::EqualsCaseInsensitiveASCII(persona, "windows") ||
++  if (base::UxrConfig::GetInstance().Get("uxr-synthetic-device-tests") == "true" &&
++      (base::EqualsCaseInsensitiveASCII(persona, "windows") ||
 +       base::EqualsCaseInsensitiveASCII(persona, "win32")) && whitelist.empty()) {
 +    static constexpr const char* kPersonaFallbackFamilies[] = {
 +        "Segoe UI Emoji", "Segoe UI Symbol", "Segoe UI", "Arial",

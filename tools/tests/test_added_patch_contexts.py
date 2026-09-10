@@ -19,7 +19,7 @@ import test_restored_patch_contexts as restored
 
 ROOT = Path(__file__).resolve().parents[2]
 NUMBERS = tuple(f"{number:04d}" for number in range(111, 121))
-CXX = shutil.which("clang++") or shutil.which("g++")
+CXX = os.environ.get("CXX") or shutil.which("clang++") or shutil.which("g++")
 
 SOURCE_SECTIONS = {
     "0111": [(3, '''// found in the LICENSE file.
@@ -210,7 +210,7 @@ def patched_sources(tmp_path_factory):
         path = directory / restored.target_path(patch.read_bytes())
         path.parent.mkdir(parents=True, exist_ok=True)
         original = source_fixture(number)
-        path.write_text(original)
+        path.write_bytes(original.encode("utf-8"))
         chain = {"0118": ("0047", "0118"), "0120": ("0022", "0120")}.get(number, (number,))
         for step in chain:
             result = restored.apply_patch(directory, media.patch_path(step))
@@ -550,6 +550,11 @@ int main(int argc, char** argv) {
     FontCache cache;
     config.values["uxr-platform"] = "windows";
     available_fonts["Arial"] = &persona_font;
+    assert(cache.FallbackFontForCharacter(7, 65, &native_font, 3) == &native_font);
+    assert(queried_families.empty());
+    assert(native_fallback_calls == 1 && fallback_metrics == 1);
+    native_fallback_calls = fallback_metrics = 0;
+    config.values["uxr-synthetic-device-tests"] = "true";
     assert(cache.FallbackFontForCharacter(7, 65, &native_font, 3) == &persona_font);
     assert(native_fallback_calls == 0);
     persona_font.contains_glyph = false;

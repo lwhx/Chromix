@@ -505,6 +505,10 @@ int main(int argc, char** argv) {
       Equal(encoded->GetPixmap(), read.pixmap()); assert(read.storage != before && p.storage == before);
     }
     config.seed = ""; legacy_noise = false; assert(!LegacyNoiseAllowed(true));
+    legacy_noise = true; config.synthetic = false;
+    assert(!LegacyNoiseAllowed(true));
+    config.seed = "12345";
+    assert(!LegacyNoiseAllowed(true));
   } else return 2;
 }
 '''

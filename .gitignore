@@ -3,6 +3,7 @@ out/
 src/
 depot_tools/
 .chromix-build*/
+.chromix-local-build/device-pool-*/
 .fortress-build*/
 *.tar.gz
 *.deb

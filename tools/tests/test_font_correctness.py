@@ -1,4 +1,5 @@
 import re
+import os
 import shutil
 import subprocess
 import tempfile
@@ -212,6 +213,8 @@ struct UxrConfig {
     return instance;
   }
   std::string Get(const char* key) const {
+    if (std::string(key) == "uxr-synthetic-device-tests")
+      return persona == "native-test" ? "false" : "true";
     if (std::string(key) == "uxr-platform")
       return persona;
     assert(std::string(key) == "uxr-font-whitelist");
@@ -342,6 +345,7 @@ int main(int argc, char** argv) {
     for (const auto& attempt : cache.font_platform_data_cache_.attempts)
       std::cout << attempt << '\n';
   }
+  return 0;
 }
 '''
 
@@ -350,7 +354,7 @@ class FontCacheFunctionTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         patch_bin = shutil.which("gpatch") or shutil.which("patch")
-        compiler = shutil.which("clang++") or shutil.which("g++")
+        compiler = os.environ.get("CXX") or shutil.which("clang++") or shutil.which("g++")
         if not patch_bin or not compiler:
             raise unittest.SkipTest("GNU patch and a local C++ compiler are required")
         temporary = tempfile.TemporaryDirectory(prefix=".font-correctness-", dir=REPO)
@@ -365,7 +369,7 @@ class FontCacheFunctionTest(unittest.TestCase):
         original = "".join(lines)
         target = directory / "third_party/blink/renderer/platform/fonts/font_cache.cc"
         target.parent.mkdir(parents=True)
-        target.write_text(original, encoding="utf-8")
+        target.write_bytes(original.encode("utf-8"))
         command = [patch_bin, "-p1", "--fuzz=0", "--batch", "--forward",
                    "--binary", "--get=0", "--no-backup-if-mismatch", "--reject-file=-",
                    "--input", str(FONT_CACHE)]
@@ -384,6 +388,21 @@ class FontCacheFunctionTest(unittest.TestCase):
         source = FONT_RUNTIME_STUBS + helpers
         source += "const FontPlatformData* FontCache::GetFontPlatformData(" + lookup
         source += FONT_RUNTIME_MAIN
+        if os.name == 'nt':
+            source = '#define NOMINMAX\n#include <windows.h>\n' + source.replace('int main(int argc, char** argv)', 'int test_main(int argc, char** argv)')
+            source += r'''
+int wmain(int argc, wchar_t** wide) {
+  std::vector<std::string> strings;
+  for (int i = 0; i < argc; ++i) {
+    int size = WideCharToMultiByte(CP_UTF8, 0, wide[i], -1, nullptr, 0, nullptr, nullptr);
+    strings.emplace_back(size, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide[i], -1, strings.back().data(), size, nullptr, nullptr);
+  }
+  std::vector<char*> args;
+  for (auto& s : strings) args.push_back(s.data());
+  return test_main(argc, args.data());
+}
+'''
         cpp = directory / "font_functions.cc"
         cpp.write_text(source, encoding="utf-8")
         cls.binaries = []
@@ -405,7 +424,7 @@ class FontCacheFunctionTest(unittest.TestCase):
                 result = subprocess.run(
                     [str(binary), action, persona, whitelist, family, str(mode),
                      missing, "denied" if denied else "allowed"],
-                    capture_output=True, text=True, timeout=5)
+                    capture_output=True, text=True, encoding='utf-8', timeout=5)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.splitlines(), expected)
 
@@ -419,6 +438,10 @@ class FontCacheFunctionTest(unittest.TestCase):
         self.check_runtime(["0"], "allowed", "Host Font", persona="WiN32")
         for generic in ("", "SERIF", "sans-serif", "system-ui", "emoji", "fangsong"):
             self.check_runtime(["1"], "allowed", generic)
+
+    def test_native_mode_ignores_synthetic_whitelist_and_mapping(self):
+        self.check_runtime(["1"], "allowed", "Host Font", persona="native-test", whitelist="Other")
+        self.check_runtime(["<null>"], "substitute", "system-ui", persona="native-test")
 
     def test_custom_whitelist_overrides_default_without_splitting_spaces(self):
         for persona in ("windows", "linux"):

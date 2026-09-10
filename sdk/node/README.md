@@ -75,6 +75,22 @@ published atomically for concurrent first launches. An explicit
 wins without creating or rewriting the file; `stealthArgs: false` also skips
 seed I/O. Defaults claim the native persona: `linux`, `windows`, or `macos`.
 
+Default viewport geometry is native. Seeded synthetic geometry requires explicit
+`args: ['--uxr-synthetic-device-tests=true']` and is only a test template.
+
+## Measured device launch
+
+`launchContext({devicePool: {python: 'python', host: 'record.json',
+records: ['record.json'], seed: '42'}})` validates entire evidence bundles and
+the native host, then verifies five live contexts before returning. The persistent
+variant uses `launchPersistentContext` with `userDataDir` and binds record/seed.
+Install the matching Python SDK into the selected interpreter first:
+`python -m pip install ./sdk/python` from this checkout. Set
+`CLOAKBROWSER_BINARY_PATH` to the exact collected executable. Evidence defaults to
+a 24-hour age limit. Other field/launch/context overrides are rejected;
+browser-returning `launch` does not support measured mode. See
+[device pool documentation](../../docs/device-pool.md) for the full contract.
+
 Environment variables: `CLOAKBROWSER_BINARY_PATH`, `CLOAKBROWSER_VERSION`,
 `CLOAKBROWSER_RELEASE_CHANNEL`, `CLOAKBROWSER_GEOIP_TIMEOUT_SECONDS`,
 `CLOAKBROWSER_WIDEVINE_CDM` / `CLOAKBROWSER_WIDEVINE=0` (DRM), and
