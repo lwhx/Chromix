@@ -23,6 +23,7 @@ import os
 import secrets
 import shutil
 import sys
+import tempfile
 import urllib.request
 from pathlib import Path
 from typing import Any, TypedDict
@@ -147,16 +148,58 @@ def check_for_update() -> dict:
 # ---------------------------------------------------------------------------
 
 def get_default_stealth_args() -> list[str]:
-    """Stealth defaults with a random per-launch fingerprint seed.
-
-    macOS runs native (no Windows spoofing); Linux/Windows claim the Windows
-    persona — normalized to --uxr-* by the engine's chrome_main patch.
-    """
+    """Stealth defaults with a random 32-bit seed and the native OS persona."""
     seed = secrets.randbits(32) or 1
     base = [f"--fingerprint={seed}"]
-    if sys.platform == "darwin":
-        return base + ["--fingerprint-platform=macos"]
-    return base + ["--fingerprint-platform=windows"]
+    platform = {"linux": "linux", "win32": "windows", "darwin": "macos"}.get(sys.platform)
+    return base + ([f"--fingerprint-platform={platform}"] if platform else [])
+
+
+_PROFILE_SEED_FILE = ".chromix-fingerprint-seed"
+
+
+def _read_profile_seed(path: Path) -> int:
+    data = path.read_bytes()
+    try:
+        seed = int(data)
+        if not 1 <= seed <= 0xFFFFFFFF or data != f"{seed}\n".encode("ascii"):
+            raise ValueError
+    except ValueError:
+        raise ValueError(f"Invalid Chromix profile seed file: {path}") from None
+    return seed
+
+
+def _profile_seed(user_data_dir: str | os.PathLike) -> int:
+    profile = Path(user_data_dir)
+    path = profile / _PROFILE_SEED_FILE
+    try:
+        return _read_profile_seed(path)
+    except FileNotFoundError:
+        pass
+    profile.mkdir(parents=True, exist_ok=True)
+    seed = secrets.randbits(32) or 1
+    fd, temporary = tempfile.mkstemp(prefix=f"{_PROFILE_SEED_FILE}.", dir=profile)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(f"{seed}\n".encode("ascii"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        # Publish a complete file without replacing a concurrent winner.
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            pass
+        return _read_profile_seed(path)
+    finally:
+        os.unlink(temporary)
+
+
+def _persistent_args(user_data_dir, stealth_args, args):
+    if not user_data_dir or not os.fspath(user_data_dir):
+        raise ValueError("launch_persistent_context requires user_data_dir")
+    if not stealth_args or any(a.split("=", 1)[0] == "--fingerprint" for a in args or []):
+        return args
+    return list(args or []) + [f"--fingerprint={_profile_seed(user_data_dir)}"]
 
 
 def build_args(stealth_args: bool,
@@ -565,9 +608,10 @@ def launch_persistent_context(user_data_dir: str | os.PathLike,
                               browser_version: str | None = None,
                               release_channel: str | None = None,
                               **kwargs: Any) -> Any:
-    """Launch with a persistent profile; returns a BrowserContext."""
+    """Launch with a persistent profile and seed; returns a BrowserContext."""
     from playwright.sync_api import sync_playwright
 
+    args = _persistent_args(user_data_dir, stealth_args, args)
     ctx_kwargs = _split_context_kwargs(viewport, locale, color_scheme, user_agent, kwargs)
     binary, chrome_args, proxy_kwargs = _prepare(
         headless, proxy, args, stealth_args, timezone, locale, geoip,
@@ -660,6 +704,7 @@ async def launch_persistent_context_async(**kw: Any) -> Any:
     from playwright.async_api import async_playwright
 
     user_data_dir = kw.get("user_data_dir")
+    args = _persistent_args(user_data_dir, kw.get("stealth_args", True), kw.get("args"))
     ctx_kwargs = _split_context_kwargs(kw.get("viewport", _VIEWPORT_UNSET),
                                        kw.get("locale"), kw.get("color_scheme"),
                                        kw.get("user_agent"),
@@ -672,7 +717,7 @@ async def launch_persistent_context_async(**kw: Any) -> Any:
                                            "browser_version", "release_channel")})
     headless = kw.get("headless", True)
     binary, chrome_args, proxy_kwargs = _prepare(
-        headless, kw.get("proxy"), kw.get("args"), kw.get("stealth_args", True),
+        headless, kw.get("proxy"), args, kw.get("stealth_args", True),
         kw.get("timezone"), kw.get("locale"), kw.get("geoip", False),
         kw.get("extension_paths"), start_maximized=False,
         browser_version=kw.get("browser_version"), release_channel=kw.get("release_channel"))

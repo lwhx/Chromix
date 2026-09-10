@@ -1,74 +1,107 @@
 diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
-index 0159341..36c1533 100644
 --- a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
 +++ b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
-@@ -33,6 +33,9 @@
- #include "third_party/blink/renderer/platform/graphics/image_data_buffer.h"
+@@ -34,6 +34,8 @@
  
  #include "base/compiler_specific.h"
-+#include "base/command_line.h"  // UXR
-+#include "base/strings/string_number_conversions.h"  // UXR
-+#include "base/uxr_config.h"  // UXR
  #include "base/memory/ptr_util.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/uxr_config.h"
  #include "third_party/blink/renderer/platform/image-encoders/image_encoder_utils.h"
  #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
-@@ -44,6 +47,51 @@
+ #include "third_party/blink/renderer/platform/wtf/text/base64.h"
+@@ -43,6 +45,60 @@
+ #include "ui/gfx/skia_span_util.h"
  
  namespace blink {
- 
++
 +namespace {
-+// UXR: identical seeded canvas noise as getImageData (absolute coords, same
-+// fmix32) so toDataURL/toBlob and getImageData return pixel-identical results
-+// (closes the cross-path canvas tell). Operates on the encode COPY (pixmap_), not
-+// the source canvas. Skips alpha; same +-1 across RGB (byte-order-independent).
-+void UxrNoiseEncodeBuffer(const SkPixmap& pm) {
++bool UxrCopyAndNoiseEncodeBuffer(SkPixmap& pm, sk_sp<SkImage>& retained_image) {
++  const auto& config = base::UxrConfig::GetInstance();
 +  uint32_t seed = 0u;
-+  // Must MATCH base_rendering_context_2d getImageData EXACTLY (audit P0-G):
-+  // StringToUint, fail-closed on invalid/zero, value-dependent + per-channel.
-+  if (!base::StringToUint(
-+          base::UxrConfig::GetInstance().Get("uxr-canvas-seed"), &seed) ||
-+      seed == 0u) {
-+    return;
-+  }
 +  const SkColorType ct = pm.colorType();
-+  if (ct != kRGBA_8888_SkColorType && ct != kBGRA_8888_SkColorType) {
-+    return;
++  if (config.Has("uxr-disable-fingerprint-noise") ||
++      !base::StringToUint(config.Get("uxr-canvas-seed"), &seed) || seed == 0u ||
++      (ct != kRGBA_8888_SkColorType && ct != kBGRA_8888_SkColorType)) {
++    return true;
 +  }
-+  uint8_t* px = static_cast<uint8_t*>(pm.writable_addr());
-+  if (!px) {
-+    return;
++  if (!pm.addr() || pm.info().isEmpty() ||
++      SkImageInfo::ByteSizeOverflowed(pm.computeByteSize())) {
++    return false;
 +  }
-+  const int w = pm.width();
-+  const int h = pm.height();
-+  const size_t rb = pm.rowBytes();
-+  for (int y = 0; y < h; ++y) {
-+    uint8_t* row = UNSAFE_BUFFERS(px + static_cast<size_t>(y) * rb);
-+    for (int x = 0; x < w; ++x) {
-+      for (int ch = 0; ch < 3; ++ch) {
-+        uint8_t* p = UNSAFE_BUFFERS(row + static_cast<size_t>(x) * 4 + ch);
-+        const uint32_t v = *p;
++  auto data = gfx::MakeSkDataFromSpanWithCopy(gfx::SkPixmapToSpan(pm));
++  if (!data)
++    return false;
++  SkPixmap copy(pm.info(), data->writable_data(), pm.rowBytes());
++  auto pixels = gfx::SkPixmapToWritableSpan(copy);
++  for (int y = 0; y < copy.height(); ++y) {
++    auto row = pixels.subspan(static_cast<size_t>(y) * copy.rowBytes(),
++                              copy.info().minRowBytes());
++    for (int x = 0; x < copy.width(); ++x) {
++      auto pixel = row.subspan(static_cast<size_t>(x) * 4, size_t{4});
++      if (pixel[3] == 0)
++        continue;
++      for (uint32_t ch = 0; ch < 3; ++ch) {
++        const size_t index = ct == kBGRA_8888_SkColorType ? 2 - ch : ch;
++        const uint32_t v = pixel[index];
 +        uint32_t z = seed ^ (static_cast<uint32_t>(x) * 374761393u) ^
 +                     (static_cast<uint32_t>(y) * 668265263u) ^
-+                     (static_cast<uint32_t>(ch) * 0x9e3779b9u) ^
-+                     (v * 2654435761u);
-+        z ^= z >> 16; z *= 0x85ebca6bu; z ^= z >> 13; z *= 0xc2b2ae35u;
++                     (ch * 0x9e3779b9u) ^ (v * 2654435761u);
++        z ^= z >> 16;
++        z *= 0x85ebca6bu;
++        z ^= z >> 13;
++        z *= 0xc2b2ae35u;
 +        z ^= z >> 16;
 +        const int nv = static_cast<int>(v) + ((z & 1u) ? 1 : -1);
-+        *p = static_cast<uint8_t>(nv < 0 ? 0 : (nv > 255 ? 255 : nv));
++        pixel[index] =
++            static_cast<uint8_t>(nv < 0 ? 0 : (nv > 255 ? 255 : nv));
 +      }
 +    }
 +  }
++  auto image = SkImages::RasterFromData(copy.info(), std::move(data),
++                                       copy.rowBytes());
++  if (!image)
++    return false;
++  // RasterFromData retains the private pixel storage backing the pixmap.
++  retained_image = std::move(image);
++  pm = copy;
++  return true;
 +}
 +}  // namespace
-+
+ 
  ImageDataBuffer::ImageDataBuffer(scoped_refptr<StaticBitmapImage> image) {
    if (!image)
-     return;
-@@ -90,6 +138,7 @@ ImageDataBuffer::ImageDataBuffer(scoped_refptr<StaticBitmapImage> image) {
+@@ -83,6 +139,8 @@
        return;
-     }
+ 
+     sk_sp<SkData> data = SkData::MakeUninitialized(size);
++    if (!data)
++      return;
+     pixmap_ = {info, data->writable_data(), info.minRowBytes()};
+     if (!paint_image.readPixels(info, pixmap_.writable_addr(), rowBytes, 0,
+                                 0)) {
+@@ -97,13 +155,23 @@
+       return;
      MSAN_CHECK_MEM_IS_INITIALIZED(pixmap_.addr(), pixmap_.computeByteSize());
-+    UxrNoiseEncodeBuffer(pixmap_);  // UXR: coherent with getImageData
-     retained_image_ = SkImages::RasterFromData(info, std::move(data), rowBytes);
-   } else {
-     retained_image_ = paint_image.GetSwSkImage();
+   }
++  if (!retained_image_ ||
++      !UxrCopyAndNoiseEncodeBuffer(pixmap_, retained_image_)) {
++    pixmap_.reset();
++    return;
++  }
+   is_valid_ = true;
+ }
+ 
+ ImageDataBuffer::ImageDataBuffer(const SkPixmap& pixmap)
+     : pixmap_(pixmap),
+       is_valid_(pixmap_.addr() &&
+-                !gfx::Size(pixmap.width(), pixmap.height()).IsEmpty()) {}
++                !gfx::Size(pixmap.width(), pixmap.height()).IsEmpty()) {
++  if (is_valid_ && !UxrCopyAndNoiseEncodeBuffer(pixmap_, retained_image_)) {
++    pixmap_.reset();
++    is_valid_ = false;
++  }
++}
+ 
+ std::unique_ptr<ImageDataBuffer> ImageDataBuffer::Create(
+     scoped_refptr<StaticBitmapImage> image) {

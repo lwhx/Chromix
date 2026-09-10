@@ -2,7 +2,7 @@ diff --git a/components/ungoogled/persona_profile.cc b/components/ungoogled/pers
 new file mode 100644
 --- /dev/null
 +++ b/components/ungoogled/persona_profile.cc
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,227 @@
 +// Copyright 2026.
 +#include "components/ungoogled/persona_profile.h"
 +
@@ -13,7 +13,9 @@ new file mode 100644
 +#include <random>
 +
 +#include "base/strings/string_number_conversions.h"
++#include "base/strings/string_util.h"
 +#include "base/uxr_config.h"
++#include "build/build_config.h"
 +
 +namespace ungoogled {
 +namespace {
@@ -21,29 +23,45 @@ new file mode 100644
 +struct WebGLGPU {
 +  const char* vendor;
 +  const char* renderer;
-+  double weight;
++  const char* webgpu_vendor;
++  const char* webgpu_architecture;
++  unsigned weight;
 +};
 +
-+// Clearcote's desktop GPU pool, selected once from the launch fingerprint.
-+// The selected identity is shared by WebGL 1, WebGL 2, and WebGPU.
++// Synthetic Windows templates, not measured devices or market-share weights.
++// Architecture tokens follow Dawn's gpu_info.json for these model families.
 +constexpr std::array<WebGLGPU, 3> kWebGLGPUs = {{
 +    {"Google Inc. (Intel)",
 +     "ANGLE (Intel, Intel(R) UHD Graphics 770 (0x0000A780) Direct3D11 "
 +     "vs_5_0 ps_5_0, D3D11)",
-+     0.50},
++     "intel", "gen-12-lp", 50},
 +    {"Google Inc. (NVIDIA)",
 +     "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, "
 +     "D3D11)",
-+     0.35},
++     "nvidia", "ampere", 35},
 +    {"Google Inc. (AMD)",
 +     "ANGLE (AMD, AMD Radeon(TM) Graphics (0x000015D8) Direct3D11 vs_5_0 "
 +     "ps_5_0, D3D11)",
-+     0.15},
++     "amd", "gcn-5", 15},
 +}};
++
++bool SupportsSeededWebGLPool(const base::UxrConfig& config) {
++#if BUILDFLAG(IS_WIN) && (defined(ARCH_CPU_X86_64) || defined(ARCH_CPU_X86))
++  const std::string platform = base::ToLowerASCII(config.Get("uxr-platform"));
++  const std::string architecture = config.Get("uxr-ua-arch");
++  return (platform.empty() || platform == "windows" || platform == "win32") &&
++         (architecture.empty() || architecture == "x86");
++#else
++  (void)config;
++  return false;
++#endif
++}
 +
 +uint64_t SeedFromConfig(const base::UxrConfig& config) {
 +  uint64_t seed = 0;
-+  const std::string raw = config.Get("uxr-canvas-seed");
++  std::string raw = config.Get("uxr-fingerprint-seed");
++  if (raw.empty())
++    raw = config.Get("uxr-canvas-seed");
 +  if (raw.empty() || !base::StringToUint64(raw, &seed))
 +    return 0;
 +  return seed;
@@ -55,10 +73,17 @@ new file mode 100644
 +    return kWebGLGPUs[0];
 +
 +  std::mt19937_64 rng(seed);
-+  const std::array<double, 3> weights = {0.50, 0.35, 0.15};
-+  std::discrete_distribution<size_t> distribution(weights.begin(),
-+                                                   weights.end());
-+  return kWebGLGPUs[distribution(rng)];
++  unsigned total_weight = 0;
++  for (const auto& gpu : kWebGLGPUs)
++    total_weight += gpu.weight;
++  // Engine output and integer mapping are stable across standard libraries.
++  unsigned bucket = static_cast<unsigned>(rng() % total_weight);
++  for (const auto& gpu : kWebGLGPUs) {
++    if (bucket < gpu.weight)
++      return gpu;
++    bucket -= gpu.weight;
++  }
++  return kWebGLGPUs.back();
 +}
 +
 +void OverrideWebGLGPU(PersonaProfile* profile,
@@ -68,6 +93,8 @@ new file mode 100644
 +  const WebGLGPU& gpu = SelectSeededWebGLGPU(config);
 +  profile->webgl_vendor = gpu.vendor;
 +  profile->webgl_renderer = gpu.renderer;
++  profile->webgpu_vendor = gpu.webgpu_vendor;
++  profile->webgpu_architecture = gpu.webgpu_architecture;
 +}
 +
 +void OverrideInt(const base::UxrConfig& config, const char* key, int* value) {
@@ -119,6 +146,15 @@ new file mode 100644
 +  p.webgl_fingerprint = ConfigSwitchEnabled(config, "uxr-webgl-fingerprint");
 +  p.webgl_real = ConfigSwitchEnabled(config, "uxr-webgl-real") ||
 +                 ConfigSwitchEnabled(config, "uxr-disable-gpu-fingerprint");
++  // A partial identity is unusable; do not silently substitute another GPU.
++  const bool partial_identity =
++      (config.Has("uxr-webgl-vendor") || config.Has("uxr-webgl-renderer")) &&
++      !p.webgl_identity_explicit;
++  if (partial_identity ||
++      (!p.webgl_identity_explicit &&
++       (!SupportsSeededWebGLPool(config) || SeedFromConfig(config) == 0))) {
++    p.webgl_real = true;
++  }
 +  OverrideWebGLGPU(&p, config);
 +  const std::string platform = config.Get("uxr-platform");
 +  p.mobile = platform == "android" || platform == "Android";

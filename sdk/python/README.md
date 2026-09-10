@@ -47,7 +47,7 @@ the download.
 | `launch_context_async(**opts)` | Async variant |
 | `launch_persistent_context(user_data_dir, **opts)` | Persistent profile |
 | `launch_persistent_context_async(user_data_dir, **opts)` | Async variant |
-| `build_args` / `get_default_stealth_args` | Arg assembly (32-bit random seed + platform claim) |
+| `build_args` / `get_default_stealth_args` | Arg assembly (32-bit random seed + native platform claim) |
 | `maybe_resolve_geoip(geoip, proxy, tz, locale, args)` | Egress IP → (tz, locale, exit_ip) |
 | `ensure_binary` / `clear_cache` / `binary_info` / `check_for_update` | Binary management |
 | `HumanConfig` / `resolve_human_config` | Behavioral-layer config (`default` / `careful` presets) |
@@ -58,6 +58,14 @@ human_preset, human_config, extension_paths, license_key, browser_version,
 release_channel, user_agent, viewport, color_scheme`) match CloakBrowser
 name-for-name; `**kwargs` passes through to `playwright.chromium.launch()` /
 `browser.new_context()`.
+
+Persistent contexts create `.chromix-fingerprint-seed` inside
+`user_data_dir` on first stealth launch and reuse it thereafter. The file is
+one decimal 32-bit seed followed by a newline, uses the same format as the
+Node SDK, and is published atomically for concurrent first launches. An
+explicit `--fingerprint=...` in `args` wins without creating or rewriting the
+file; `stealth_args=False` also skips seed I/O. Defaults claim the native
+persona: `linux`, `windows`, or `macos`.
 
 ## Env vars
 

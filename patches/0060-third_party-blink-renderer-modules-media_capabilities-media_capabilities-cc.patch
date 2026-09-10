@@ -12,7 +12,7 @@ index 8d900f2270..3872155493 100644
  #include "media/base/media_switches.h"
  #include "media/base/media_util.h"
  #include "media/base/mime_util.h"
-@@ -108,6 +110,75 @@ bool WebrtcEncodeForceSmoothIfPowerEfficient() {
+@@ -108,6 +110,76 @@ bool WebrtcEncodeForceSmoothIfPowerEfficient() {
        kWebrtcEncodeSmoothIfPowerEfficientDefault);
  }
  
@@ -78,17 +78,18 @@ index 8d900f2270..3872155493 100644
 +    return;
 +  }
 +
-+  // Never promote a configuration that Chromium found unsupported.
++  // Never promote capabilities beyond Chromium's native result.
 +  const bool supported = info->supported() && capabilities.supported;
 +  info->setSupported(supported);
-+  info->setSmooth(supported && capabilities.smooth);
-+  info->setPowerEfficient(supported && capabilities.power_efficient);
++  info->setSmooth(supported && info->smooth() && capabilities.smooth);
++  info->setPowerEfficient(supported && info->powerEfficient() &&
++                          capabilities.power_efficient);
 +}
 +
  // static
  bool UseGpuFactoriesForPowerEfficient(
      ExecutionContext* execution_context,
-@@ -1366,6 +1437,7 @@ void MediaCapabilities::GetPerfInfo(
+@@ -1366,6 +1438,7 @@ void MediaCapabilities::GetPerfInfo(
  
    if (!EnsurePerfHistoryService(execution_context)) {
      MediaCapabilitiesDecodingInfo* info = CreateDecodingInfoWith(true);
@@ -96,7 +97,7 @@ index 8d900f2270..3872155493 100644
      resolver->Resolve(WrapPersistent(info));
      return;
    }
-@@ -1375,6 +1447,7 @@ void MediaCapabilities::GetPerfInfo(
+@@ -1375,6 +1448,7 @@ void MediaCapabilities::GetPerfInfo(
        callback_id,
        MakeGarbageCollected<MediaCapabilities::PendingCallbackState>(
            resolver, access, request_time));
@@ -104,7 +105,7 @@ index 8d900f2270..3872155493 100644
  
    media::mojom::blink::PredictionFeaturesPtr features =
        media::mojom::blink::PredictionFeatures::New(
-@@ -1509,6 +1582,7 @@ void MediaCapabilities::ResolveCallbackIfReady(int callback_id) {
+@@ -1509,6 +1583,7 @@ void MediaCapabilities::ResolveCallbackIfReady(int callback_id) {
    }
  
    info->setSmooth(*pending_cb->db_is_smooth);
@@ -112,7 +113,7 @@ index 8d900f2270..3872155493 100644
  
    const base::TimeDelta process_time =
        base::TimeTicks::Now() - pending_cb->request_time;
-@@ -1566,6 +1640,8 @@ void MediaCapabilities::OnWebrtcSupportInfo(
+@@ -1566,6 +1641,8 @@ void MediaCapabilities::OnWebrtcSupportInfo(
      bool is_power_efficient) {
    DCHECK(pending_cb_map_.Contains(callback_id));
    PendingCallbackState* pending_cb = pending_cb_map_.at(callback_id);
@@ -121,7 +122,7 @@ index 8d900f2270..3872155493 100644
  
    // Special treatment if the config is not supported, or if only audio was
    // specified which is indicated by the fact that `video_pixels` equals 0,
-@@ -1584,6 +1660,7 @@ void MediaCapabilities::OnWebrtcSupportInfo(
+@@ -1584,6 +1661,7 @@ void MediaCapabilities::OnWebrtcSupportInfo(
      info->setSupported(is_supported);
      info->setSmooth(is_supported);
      info->setPowerEfficient(is_power_efficient);
@@ -129,7 +130,7 @@ index 8d900f2270..3872155493 100644
      if (type == OperationType::kEncoding) {
        pending_cb->resolver->DowncastTo<MediaCapabilitiesInfo>()->Resolve(info);
      } else {
-@@ -1627,6 +1704,7 @@ void MediaCapabilities::OnWebrtcPerfHistoryInfo(int callback_id,
+@@ -1627,6 +1705,7 @@ void MediaCapabilities::OnWebrtcPerfHistoryInfo(int callback_id,
    info->setSupported(*pending_cb->is_supported);
    info->setPowerEfficient(*pending_cb->is_gpu_factories_supported);
    info->setSmooth(is_smooth);

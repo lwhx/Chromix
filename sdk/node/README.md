@@ -67,6 +67,14 @@ timezone, locale, geoip, humanize, humanPreset, humanConfig, userAgent,
 viewport, colorScheme, extensionPaths, browserVersion, releaseChannel,
 licenseKey, contextOptions, launchOptions, userDataDir` (+ `startMaximized`).
 
+Persistent contexts create `.chromix-fingerprint-seed` inside `userDataDir` on
+first stealth launch and reuse it thereafter. The file is one decimal 32-bit
+seed followed by a newline, uses the same format as the Python SDK, and is
+published atomically for concurrent first launches. An explicit
+`--fingerprint=...` in `args`, `launchOptions.args`, or `contextOptions.args`
+wins without creating or rewriting the file; `stealthArgs: false` also skips
+seed I/O. Defaults claim the native persona: `linux`, `windows`, or `macos`.
+
 Environment variables: `CLOAKBROWSER_BINARY_PATH`, `CLOAKBROWSER_VERSION`,
 `CLOAKBROWSER_RELEASE_CHANNEL`, `CLOAKBROWSER_GEOIP_TIMEOUT_SECONDS`,
 `CLOAKBROWSER_WIDEVINE_CDM` / `CLOAKBROWSER_WIDEVINE=0` (DRM), and

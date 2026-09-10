@@ -3,10 +3,17 @@
 Surface-coherence patches applied after the pinned `ungoogled-chromium` core,
 matching Windows/Linux/macOS platform layer, and binary pruning (see
 `CHROMIUM_VERSION` and `build/ungoogled-revisions.psd1`): in-tree Chromium/Blink modifications that read a
-per-launch persona and present it consistently across the JS-observable
-fingerprint surfaces (user-agent, platform, WebGL, timezone, languages, screen,
-keyboard, media, geolocation, detailed-screen, codec capability, and so on),
-including inside worker and iframe realms where the upstream API permits it.
+per-launch persona for selected JS-observable fingerprint surfaces (user-agent,
+platform, WebGL, timezone, languages, screen, keyboard, media, geolocation,
+detailed-screen, codec capability, and so on). Coverage and known cross-interface
+gaps, including worker/iframe behavior, are tracked in
+[`FINGERPRINT_STATUS.md`](../FINGERPRINT_STATUS.md). A configured getter does not
+by itself change the underlying device, permission, rendering or network behavior.
+
+The network and storage patches now preserve native notifier/accounting behavior;
+their former getter-only overrides are retired. MediaCapabilities filters can
+only restrict native support, smoothness and power efficiency. GPU templates
+remain synthetic test records rather than a measured full-device pool.
 
 - One patch per file, numbered contiguously from `0001`; `series` lists them in
   apply order (`build/apply-patches.sh` / `build/windows/build.ps1` consume it).

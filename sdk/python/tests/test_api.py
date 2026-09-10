@@ -1,7 +1,15 @@
 """API tests for the CloakBrowser-compatible chromix surface (no browser launch needed)."""
+import asyncio
+import errno
+import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -174,3 +182,248 @@ def test_humanizer_zero_sleep_fast_path():
     t0 = time.monotonic()
     h.type("abc").click(10, 10)
     assert time.monotonic() - t0 < 1.0
+
+
+@pytest.mark.parametrize("platform,persona", [
+    ("linux", "linux"), ("win32", "windows"), ("darwin", "macos"), ("freebsd", None),
+])
+def test_native_platform_defaults_and_override(monkeypatch, platform, persona):
+    monkeypatch.setattr(api.sys, "platform", platform)
+    defaults = api.get_default_stealth_args()
+    platforms = [arg for arg in defaults if arg.startswith("--fingerprint-platform=")]
+    assert platforms == ([f"--fingerprint-platform={persona}"] if persona else [])
+    args = api.build_args(True, ["--fingerprint-platform=macos"])
+    assert [a for a in args if a.startswith("--fingerprint-platform=")] == ["--fingerprint-platform=macos"]
+    assert not any(a.startswith("--fingerprint") for a in api.build_args(False, None))
+
+
+SEED_FILE = ".chromix-fingerprint-seed"
+
+
+def fingerprint(args):
+    seeds = [a.split("=", 1)[1] for a in args if a.startswith("--fingerprint=")]
+    assert len(seeds) == 1
+    return seeds[0]
+
+
+@pytest.fixture
+def offline_launch(monkeypatch, tmp_path):
+    calls = SimpleNamespace(launches=[], starts=0, stops=0, fail=False)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Network or browser download attempted")
+
+    monkeypatch.setattr(api, "ensure_binary", lambda **kw: tmp_path / "unused-binary")
+    monkeypatch.setattr(api.urllib.request, "urlopen", forbidden)
+    monkeypatch.setattr(api.urllib.request, "urlretrieve", forbidden)
+    monkeypatch.setenv("CLOAKBROWSER_WIDEVINE", "0")
+
+    def capture(**kwargs):
+        calls.launches.append(kwargs)
+        if calls.fail:
+            raise RuntimeError("fixture launch failure")
+        return SimpleNamespace(options=kwargs, pages=[], close=lambda: None,
+                               new_context=lambda **kw: SimpleNamespace(close=lambda: None))
+
+    def stop():
+        calls.stops += 1
+
+    def start():
+        calls.starts += 1
+        return SimpleNamespace(chromium=SimpleNamespace(launch_persistent_context=capture, launch=capture), stop=stop)
+
+    async def capture_async(**kwargs):
+        context = capture(**kwargs)
+        async def close():
+            pass
+        async def new_context(**kw):
+            return SimpleNamespace(close=close)
+        context.close, context.new_context = close, new_context
+        return context
+
+    async def stop_async():
+        stop()
+
+    async def start_async():
+        calls.starts += 1
+        return SimpleNamespace(chromium=SimpleNamespace(launch_persistent_context=capture_async, launch=capture_async),
+                               stop=stop_async)
+
+    monkeypatch.setitem(sys.modules, "playwright", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", SimpleNamespace(
+        sync_playwright=lambda: SimpleNamespace(start=start)))
+    monkeypatch.setitem(sys.modules, "playwright.async_api", SimpleNamespace(
+        async_playwright=lambda: SimpleNamespace(start=start_async)))
+    return calls
+
+
+def persistent(profile, asynchronous=False, **kwargs):
+    if asynchronous:
+        async def run():
+            context = await api.launch_persistent_context_async(user_data_dir=profile, **kwargs)
+            await context.close()
+            return context.options["args"]
+        return asyncio.run(run())
+    context = api.launch_persistent_context(profile, **kwargs)
+    context.close()
+    return context.options["args"]
+
+
+def test_persistent_sync_async_share_seed_and_preserve_args(tmp_path, monkeypatch, offline_launch):
+    values = iter([101, 202, 303, 404, 505, 606])
+    monkeypatch.setattr(api.secrets, "randbits", lambda bits: next(values))
+    profile = tmp_path / "nested" / "profile"
+    args = ["--fingerprint-platform=macos", "--window-size=800,600"]
+    first = persistent(profile, args=args, timezone="UTC", locale="en-US")
+    path = profile / SEED_FILE
+    before = path.stat()
+    second = persistent(str(profile), True)
+    assert fingerprint(first) == fingerprint(second) == "101"
+    assert path.read_bytes() == b"101\n"
+    assert (before.st_ino, before.st_mtime_ns) == (path.stat().st_ino, path.stat().st_mtime_ns)
+    assert "--fingerprint-platform=macos" in first
+    assert "--fingerprint-timezone=UTC" in first and "--lang=en-US" in first
+    assert len(first) == len({a.split("=", 1)[0] for a in first})
+    assert args == ["--fingerprint-platform=macos", "--window-size=800,600"]
+    other = persistent(tmp_path / "other")
+    assert fingerprint(other) != fingerprint(first)
+    assert list(profile.iterdir()) == [path]
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o777 == 0o600
+    assert offline_launch.starts == offline_launch.stops == 3
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("value", ["42", "off", "0", ""])
+def test_explicit_fingerprint_bypasses_profile_io(tmp_path, offline_launch, asynchronous, value):
+    profile = tmp_path / "profile"
+    args = ["--fingerprint=13", f"--fingerprint={value}"]
+    assert fingerprint(persistent(profile, asynchronous, args=args)) == value
+    assert not profile.exists()
+    profile.mkdir()
+    path = profile / SEED_FILE
+    path.write_bytes(b"corrupt")
+    assert fingerprint(persistent(profile, asynchronous, args=args)) == value
+    assert path.read_bytes() == b"corrupt"
+    assert args == ["--fingerprint=13", f"--fingerprint={value}"]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_stealth_false_bypasses_profile_io(tmp_path, offline_launch, asynchronous):
+    profile = tmp_path / "profile"
+    args = persistent(profile, asynchronous, stealth_args=False)
+    assert not any(a.startswith("--fingerprint") for a in args)
+    assert not profile.exists()
+    profile.mkdir()
+    path = profile / SEED_FILE
+    path.write_bytes(b"corrupt")
+    persistent(profile, asynchronous, stealth_args=False)
+    assert fingerprint(persistent(profile, asynchronous, stealth_args=False, args=["--fingerprint=42"])) == "42"
+    assert path.read_bytes() == b"corrupt"
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_override_does_not_replace_saved_seed(tmp_path, offline_launch, asynchronous):
+    profile = tmp_path / "profile"
+    original = fingerprint(persistent(profile, asynchronous))
+    assert fingerprint(persistent(profile, asynchronous, args=["--fingerprint=42"])) == "42"
+    assert fingerprint(persistent(profile, asynchronous, args=["--fingerprint=off"])) == "off"
+    assert fingerprint(persistent(profile, asynchronous)) == original
+    assert (profile / SEED_FILE).read_bytes() == f"{original}\n".encode()
+
+
+@pytest.mark.parametrize("data", [b"", b"garbage", b"0\n", b"-1\n", b"4294967296\n", b"1.0\n",
+                                 b"01\n", b" 1\n", b"1", b"1\r\n", b"1\n2\n", b"\xff\n"])
+def test_invalid_seed_fails_without_identity_rotation(tmp_path, offline_launch, data):
+    path = tmp_path / SEED_FILE
+    path.write_bytes(data)
+    for asynchronous in (False, True):
+        with pytest.raises(ValueError, match="Invalid Chromix profile seed file"):
+            persistent(tmp_path, asynchronous)
+    assert path.read_bytes() == data
+    assert list(tmp_path.iterdir()) == [path]
+    assert offline_launch.starts == 0
+
+
+@pytest.mark.parametrize("seed", [1, 4294967295])
+def test_existing_seed_boundaries(tmp_path, offline_launch, seed):
+    (tmp_path / SEED_FILE).write_bytes(f"{seed}\n".encode())
+    assert fingerprint(persistent(tmp_path)) == fingerprint(persistent(tmp_path, True)) == str(seed)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("profile", [None, ""])
+def test_persistent_requires_profile(offline_launch, asynchronous, profile):
+    with pytest.raises(ValueError, match="requires user_data_dir"):
+        persistent(profile, asynchronous)
+    assert offline_launch.starts == 0
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_failed_launch_retains_seed(tmp_path, offline_launch, asynchronous):
+    offline_launch.fail = True
+    with pytest.raises(RuntimeError, match="fixture launch failure"):
+        persistent(tmp_path, asynchronous)
+    seed = (tmp_path / SEED_FILE).read_text().strip()
+    offline_launch.fail = False
+    assert fingerprint(persistent(tmp_path, asynchronous)) == seed
+    assert offline_launch.starts == offline_launch.stops == 2
+
+
+@pytest.mark.parametrize("stage", ["read", "write", "link"])
+def test_seed_io_errors_do_not_fall_back_to_random(tmp_path, monkeypatch, offline_launch, stage):
+    def denied(*args, **kwargs):
+        raise PermissionError(errno.EACCES, "fixture denied")
+    if stage == "read":
+        monkeypatch.setattr(Path, "read_bytes", denied)
+    elif stage == "write":
+        monkeypatch.setattr(api.os, "fsync", denied)
+    else:
+        monkeypatch.setattr(api.os, "link", denied)
+    for asynchronous in (False, True):
+        with pytest.raises(PermissionError):
+            persistent(tmp_path, asynchronous)
+    assert list(tmp_path.iterdir()) == []
+    assert offline_launch.starts == 0
+
+
+def test_concurrent_seed_publication_is_complete(tmp_path, monkeypatch):
+    barrier = threading.Barrier(12)
+    original_link = api.os.link
+
+    def publish(source, target):
+        data = Path(source).read_bytes()
+        assert data == f"{int(data)}\n".encode()
+        barrier.wait(timeout=15)
+        original_link(source, target)
+
+    monkeypatch.setattr(api.os, "link", publish)
+    with ThreadPoolExecutor(max_workers=12) as workers:
+        seeds = list(workers.map(api._profile_seed, [tmp_path] * 12))
+    assert len(set(seeds)) == 1
+    assert (tmp_path / SEED_FILE).read_bytes() == f"{seeds[0]}\n".encode()
+    assert list(tmp_path.iterdir()) == [tmp_path / SEED_FILE]
+
+
+def test_orphan_temporary_file_does_not_block_initialization(tmp_path, offline_launch):
+    orphan = tmp_path / f"{SEED_FILE}.interrupted"
+    orphan.write_bytes(b"12")
+    seed = fingerprint(persistent(tmp_path))
+    assert (tmp_path / SEED_FILE).read_bytes() == f"{seed}\n".encode()
+    assert orphan.read_bytes() == b"12"
+
+
+def test_nonpersistent_launches_keep_per_launch_randomness(tmp_path, monkeypatch, offline_launch):
+    values = iter(range(1, 9))
+    monkeypatch.setattr(api.secrets, "randbits", lambda bits: next(values))
+    for launch in (api.launch, api.launch_context):
+        launch().close()
+        launch().close()
+    async def run():
+        for launch in (api.launch_async, api.launch_context_async):
+            for _ in range(2):
+                obj = await launch()
+                await obj.close()
+    asyncio.run(run())
+    assert [fingerprint(call["args"]) for call in offline_launch.launches] == [str(i) for i in range(1, 9)]
+    assert list(tmp_path.iterdir()) == []

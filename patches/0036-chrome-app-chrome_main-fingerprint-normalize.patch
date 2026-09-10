@@ -1,8 +1,8 @@
 diff --git a/chrome/app/chrome_main.cc b/chrome/app/chrome_main.cc
-index b5cc00e4c8..3cc7963afa 100644
+index f3c06b9e10..b5bc89bcf7 100644
 --- a/chrome/app/chrome_main.cc
 +++ b/chrome/app/chrome_main.cc
-@@ -7,6 +7,7 @@
+@@ -7,12 +7,16 @@
  #include <stdint.h>
  
  #include <iostream>
@@ -10,7 +10,16 @@ index b5cc00e4c8..3cc7963afa 100644
  #include <memory>
  #include <optional>
  
-@@ -161,6 +162,121 @@ int ChromeMain(int argc, const char** argv) {
+ #include "base/command_line.h"
+ #include "base/environment.h"
+ #include "base/functional/bind.h"
++#include "base/i18n/tag_converters.h"
++#include "base/strings/string_split.h"
++#include "base/strings/string_util.h"
+ #include "base/functional/callback_helpers.h"
+ #include "base/no_destructor.h"
+ #include "base/sampling_heap_profiler/poisson_allocation_sampler.h"
+@@ -196,6 +200,194 @@
  
    base::CommandLine* command_line(base::CommandLine::ForCurrentProcess());
  
@@ -49,34 +58,75 @@ index b5cc00e4c8..3cc7963afa 100644
 +                                             "uxr-webrtc-fake-srflx-allow-udp"},
 +    };
 +    for (const auto& a : kAliases) {
-+      if (command_line->HasSwitch(a.fp)) {
++      if (command_line->HasSwitch(a.fp) &&
++          !command_line->HasSwitch(a.uxr)) {
 +        command_line->AppendSwitchASCII(
 +            a.uxr, command_line->GetSwitchValueASCII(a.fp));
 +      }
 +    }
 +
-+    if (command_line->HasSwitch("fingerprint-locale")) {
-+      const std::string loc =
-+          command_line->GetSwitchValueASCII("fingerprint-locale");
-+      command_line->AppendSwitchASCII("uxr-languages", loc);
-+      command_line->AppendSwitchASCII("accept-lang", loc);
++    if (command_line->HasSwitch("fingerprint-locale") &&
++        !command_line->HasSwitch("uxr-languages")) {
++      command_line->AppendSwitchASCII("uxr-languages",
++          command_line->GetSwitchValueASCII("fingerprint-locale"));
 +    }
 +
 +    if (command_line->HasSwitch("fingerprint-platform")) {
-+      const std::string p =
-+          command_line->GetSwitchValueASCII("fingerprint-platform");
-+      command_line->AppendSwitchASCII("uxr-platform", p);
-+      if (p == "Win32") {
-+        command_line->AppendSwitchASCII("uxr-ua-platform", "Windows");
-+        command_line->AppendSwitchASCII("uxr-ua-os",
-+            "Windows NT 10.0; Win64; x64");
-+      } else if (p == "MacIntel") {
-+        command_line->AppendSwitchASCII("uxr-ua-platform", "macOS");
-+        command_line->AppendSwitchASCII("uxr-ua-os",
-+            "Macintosh; Intel Mac OS X 10_15_7");
-+      } else if (p == "Linux x86_64") {
-+        command_line->AppendSwitchASCII("uxr-ua-platform", "Linux");
-+        command_line->AppendSwitchASCII("uxr-ua-os", "Linux x86_64");
++      const std::string alias = base::ToLowerASCII(
++          command_line->GetSwitchValueASCII("fingerprint-platform"));
++      std::string platform;
++      std::string ua_platform;
++      std::string ua_os;
++      std::string platform_version;
++      bool native_platform = false;
++      if (alias == "windows" || alias == "win32") {
++        platform = "Win32";
++        ua_platform = "Windows";
++        ua_os = "Windows NT 10.0; Win64; x64";
++        platform_version = "10.0.0";
++#if BUILDFLAG(IS_WIN)
++        native_platform = true;
++#endif
++      } else if (alias == "macos" || alias == "macintel") {
++        platform = "MacIntel";
++        ua_platform = "macOS";
++        ua_os = "Macintosh; Intel Mac OS X 10_15_7";
++        platform_version = "10.15.7";
++#if BUILDFLAG(IS_MAC)
++        native_platform = true;
++#endif
++      } else if (alias == "linux" || alias == "linux x86_64") {
++        platform = "Linux x86_64";
++        ua_platform = "Linux";
++        ua_os = "X11; Linux x86_64";
++#if BUILDFLAG(IS_LINUX)
++        native_platform = true;
++#endif
++      }
++      if (!platform.empty()) {
++        const auto append_default = [&](const char* name,
++                                        const std::string& value) {
++          if (!command_line->HasSwitch(name))
++            command_line->AppendSwitchASCII(name, value);
++        };
++        if (!native_platform) {
++          // Cross-OS templates prevent host fallback; they are not device data.
++          append_default("uxr-platform", platform);
++          append_default("uxr-ua-os", ua_os);
++          append_default("uxr-ua-platform", ua_platform);
++          append_default("uxr-ua-arch", "x86");
++          append_default("uxr-ua-bitness", "64");
++          append_default("uxr-ua-model", "");
++          append_default("uxr-ua-wow64", "false");
++          append_default("uxr-ua-platform-version", platform_version);
++        } else if (alias == "linux x86_64") {
++          // This alias explicitly declares an x86_64 Linux persona.
++          append_default("uxr-platform", platform);
++          append_default("uxr-ua-os", ua_os);
++          append_default("uxr-ua-platform", ua_platform);
++          append_default("uxr-ua-arch", "x86");
++          append_default("uxr-ua-bitness", "64");
++        }
 +      }
 +    }
 +
@@ -98,6 +148,7 @@ index b5cc00e4c8..3cc7963afa 100644
 +        command_line->GetSwitchValueASCII("fingerprint-noise") == "false") {
 +      command_line->RemoveSwitch("uxr-canvas-seed");
 +      command_line->RemoveSwitch("uxr-audio-seed");
++      command_line->AppendSwitch("uxr-disable-fingerprint-noise");
 +    }
 +
 +    if (command_line->HasSwitch("fingerprint-sapi-voices") &&
@@ -116,6 +167,37 @@ index b5cc00e4c8..3cc7963afa 100644
 +      }
 +      for (const auto& k : uxr_keys)
 +        command_line->RemoveSwitch(k);
++      // GPU identity and readback noise otherwise have enabled defaults.
++      command_line->AppendSwitch("uxr-webgl-real");
++      command_line->AppendSwitch("uxr-disable-fingerprint-noise");
++    }
++
++    if (command_line->HasSwitch("uxr-languages")) {
++      std::vector<std::string> languages;
++      bool valid = true;
++      for (const auto& value : base::SplitString(
++               command_line->GetSwitchValueASCII("uxr-languages"), ",",
++               base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY)) {
++        const auto tag =
++            base::i18n::LanguageTagConverter::GetInstance().FromString(value);
++        if (!tag || tag->language_subtag() == "und") {
++          valid = false;
++          break;
++        }
++        const std::string canonical(tag->tag_string());
++        bool duplicate = false;
++        for (const auto& language : languages)
++          duplicate |= language == canonical;
++        if (!duplicate)
++          languages.push_back(canonical);
++      }
++      if (valid && !languages.empty()) {
++        const std::string normalized = base::JoinString(languages, ",");
++        command_line->AppendSwitchASCII("uxr-languages", normalized);
++        command_line->AppendSwitchASCII(switches::kAcceptLang, normalized);
++      } else {
++        command_line->RemoveSwitch("uxr-languages");
++      }
 +    }
 +
 +    if (command_line->HasSwitch("fingerprint-allow-3p-cookies")) {

@@ -1,5 +1,5 @@
 diff --git a/components/embedder_support/user_agent_utils.cc b/components/embedder_support/user_agent_utils.cc
-index 70a0260..2e54f7b 100644
+index c6320fcb6d..b1458349fd 100644
 --- a/components/embedder_support/user_agent_utils.cc
 +++ b/components/embedder_support/user_agent_utils.cc
 @@ -8,6 +8,7 @@
@@ -10,7 +10,7 @@ index 70a0260..2e54f7b 100644
  #include <optional>
  #include <string>
  #include <vector>
-@@ -154,6 +155,46 @@ const std::string& GetWindowsPlatformVersion() {
+@@ -154,6 +155,56 @@
  }
  #endif  // BUILDFLAG(IS_WIN)
  
@@ -27,8 +27,12 @@ index 70a0260..2e54f7b 100644
 +      }
 +    }
 +    base::Version parsed_version(override_version);
-+    if (parsed_version.IsValid())
++    int major_version = 0;
++    if (parsed_version.IsValid() &&
++        base::StringToInt(base::NumberToString(parsed_version.components()[0]),
++                          &major_version)) {
 +      return override_version;
++    }
 +    return std::string(version_info::GetVersionNumber());
 +  }());
 +  return *version;
@@ -51,13 +55,37 @@ index 70a0260..2e54f7b 100644
 +  if (separator == std::string::npos)
 +    return product;
 +  separator = product.find('/', separator);
-+  return base::StrCat({product.substr(0, separator + 1), version});
++  const size_t version_end = product.find(' ', separator + 1);
++  std::string result = product;
++  result.replace(separator + 1, version_end == std::string::npos
++                                    ? std::string::npos
++                                    : version_end - separator - 1,
++                 version);
++  return result;
 +}
 +
  const blink::UserAgentBrandList GetUserAgentBrandList(
      const std::string& major_version,
      const std::string& full_version,
-@@ -183,10 +224,10 @@ const blink::UserAgentBrandList GetUserAgentBrandList(
+@@ -167,6 +218,17 @@
+   brand = version_info::GetProductName();
+ #endif
+ 
++  const base::CommandLine* command_line =
++      base::CommandLine::ForCurrentProcess();
++  if (command_line->HasSwitch("uxr-ua-brand")) {
++    brand = command_line->GetSwitchValueASCII("uxr-ua-brand");
++    if (brand->empty() || *brand == "Chromium")
++      brand.reset();
++  } else if (!brand &&
++             command_line->GetSwitchValueASCII("fingerprint") != "off") {
++    brand = "Google Chrome";
++  }
++
+   std::string brand_version =
+       output_version_type == blink::UserAgentBrandVersionType::kFullVersion
+           ? full_version
+@@ -183,10 +245,10 @@
  // GetVersionNumber()
  const blink::UserAgentBrandList GetUserAgentBrandMajorVersionListInternal(
      std::optional<blink::UserAgentBrandVersion> additional_brand_version) {
@@ -72,7 +100,7 @@ index 70a0260..2e54f7b 100644
  }
  
  // For desktop and android:
-@@ -205,19 +246,26 @@ bool ShouldSendUserAgentUnifiedPlatform() {
+@@ -207,19 +269,29 @@
  // GetVersionNumber()
  const blink::UserAgentBrandList GetUserAgentBrandFullVersionListInternal(
      std::optional<blink::UserAgentBrandVersion> additional_brand_version) {
@@ -100,13 +128,16 @@ index 70a0260..2e54f7b 100644
 +          ? base::StrCat({major_version, ".0.0.0"})
 +          : full_version;
 +  product = ReplaceProductVersion(product, user_agent_version);
-+  // UXR patch #2: never prepend "Headless" to the product. Under --headless the
-+  // stock code makes the UA "HeadlessChrome/...", a blatant automation tell. We keep
-+  // it as real "Chrome/...".
++  const base::CommandLine* command_line =
++      base::CommandLine::ForCurrentProcess();
++  if (command_line->GetSwitchValueASCII("fingerprint") == "off" &&
++      command_line->HasSwitch(kHeadless)) {
++    product.insert(0, "Headless");
++  }
  
  #if BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_IOS)
    if (base::CommandLine::ForCurrentProcess()->HasSwitch(kUseMobileUserAgent)) {
-@@ -299,6 +347,18 @@ std::string GetUserAgentPlatform() {
+@@ -301,6 +373,18 @@
  }
  
  std::string GetUnifiedPlatform() {
@@ -125,29 +156,7 @@ index 70a0260..2e54f7b 100644
  #if BUILDFLAG(IS_ANDROID) || BUILDFLAG(IS_CHROMEOS)
    // This constant is only used on Android (desktop) and Linux.
    constexpr char kUnifiedPlatformChromeOSX64[] = "X11; CrOS x86_64 14541.0.0";
-@@ -505,6 +565,21 @@ blink::UserAgentBrandList GenerateBrandVersionList(
-   if (brand) {
-     brand_version_list.emplace_back(brand.value(), version);
-   }
-+  // UXR Layer 2: add a "Google Chrome" brand for a Chrome persona (we build
-+  // Chromium, so the official brand is absent). Closes the brand-list incoherence
-+  // (UA says Chrome, brands said Chromium). Browser-process read, no whitelist.
-+  {
-+    const base::CommandLine* p_cmd = base::CommandLine::ForCurrentProcess();
-+    // UXR: default to the "Google Chrome" brand (overridable). A stealth fork
-+    // must never advertise "Chromium"-only brands = a repackaged-Chromium signal.
-+    std::string p_brand = p_cmd->HasSwitch("uxr-ua-brand")
-+                              ? p_cmd->GetSwitchValueASCII("uxr-ua-brand")
-+                              : std::string("Google Chrome");
-+    if (!p_brand.empty()) {
-+      brand_version_list.emplace_back(
-+          blink::UserAgentBrandVersion{p_brand, version});
-+    }
-+  }
-   if (additional_brand_version) {
-     brand_version_list.emplace_back(additional_brand_version.value());
-   }
-@@ -603,6 +678,12 @@ std::string GetPlatformVersion() {
+@@ -616,6 +700,12 @@
  }
  
  std::string GetPlatformForUAMetadata() {
@@ -160,34 +169,48 @@ index 70a0260..2e54f7b 100644
  #if BUILDFLAG(IS_ANDROID)
    if (base::android::device_info::is_desktop() ||
        base::android::device_info::is_xr()) {
-@@ -663,13 +744,29 @@ blink::UserAgentMetadata GetUserAgentMetadata(bool only_low_entropy_ch) {
+@@ -678,13 +768,26 @@
    // High entropy client hints.
    metadata.brand_full_version_list =
        GetUserAgentBrandFullVersionListInternal(std::nullopt);
 -  metadata.full_version = std::string(version_info::GetVersionNumber());
+-  metadata.architecture = GetCpuArchitecture();
+-  metadata.model = BuildModelInfo();
 +  metadata.full_version = GetEffectiveUserAgentFullVersion();
-   metadata.architecture = GetCpuArchitecture();
-   metadata.model = BuildModelInfo();
++  const base::CommandLine* command_line =
++      base::CommandLine::ForCurrentProcess();
++  metadata.architecture = command_line->HasSwitch("uxr-ua-arch")
++                              ? command_line->GetSwitchValueASCII("uxr-ua-arch")
++                              : GetCpuArchitecture();
++  metadata.model = command_line->HasSwitch("uxr-ua-model")
++                       ? command_line->GetSwitchValueASCII("uxr-ua-model")
++                       : BuildModelInfo();
    metadata.form_factors = GetFormFactorsClientHint(metadata, metadata.mobile);
-   metadata.bitness = GetCpuBitness();
-   metadata.wow64 = IsWoW64();
-   metadata.platform_version = GetPlatformVersion();
-+  // UXR Layer 2: high-entropy Client Hints persona via cmdline (browser-process,
-+  // no renderer whitelist needed). Keeps userAgentData high-entropy values coherent
-+  // with the UA string + Sec-CH-UA (coherence rule C15).
-+  {
-+    const base::CommandLine* p_cmd = base::CommandLine::ForCurrentProcess();
-+    if (p_cmd->HasSwitch("uxr-ua-arch"))
-+      metadata.architecture = p_cmd->GetSwitchValueASCII("uxr-ua-arch");
-+    if (p_cmd->HasSwitch("uxr-ua-bitness"))
-+      metadata.bitness = p_cmd->GetSwitchValueASCII("uxr-ua-bitness");
-+    if (p_cmd->HasSwitch("uxr-ua-model"))
-+      metadata.model = p_cmd->GetSwitchValueASCII("uxr-ua-model");
-+    if (p_cmd->HasSwitch("uxr-ua-platform-version"))
-+      metadata.platform_version = p_cmd->GetSwitchValueASCII("uxr-ua-platform-version");
-+    if (p_cmd->HasSwitch("uxr-ua-wow64"))
-+      metadata.wow64 = (p_cmd->GetSwitchValueASCII("uxr-ua-wow64") == "true");
-+  }
+-  metadata.bitness = GetCpuBitness();
+-  metadata.wow64 = IsWoW64();
+-  metadata.platform_version = GetPlatformVersion();
++  metadata.bitness = command_line->HasSwitch("uxr-ua-bitness")
++                         ? command_line->GetSwitchValueASCII("uxr-ua-bitness")
++                         : GetCpuBitness();
++  metadata.wow64 = command_line->HasSwitch("uxr-ua-wow64")
++                       ? command_line->GetSwitchValueASCII("uxr-ua-wow64") == "true"
++                       : IsWoW64();
++  metadata.platform_version =
++      command_line->HasSwitch("uxr-ua-platform-version")
++          ? command_line->GetSwitchValueASCII("uxr-ua-platform-version")
++          : GetPlatformVersion();
    return metadata;
  }
  
+@@ -846,6 +949,11 @@
+ }
+ 
+ std::string BuildUserAgentFromProduct(const std::string& product) {
++  const std::string persona_os =
++      base::CommandLine::ForCurrentProcess()->GetSwitchValueASCII("uxr-ua-os");
++  if (!persona_os.empty())
++    return BuildUserAgentFromOSAndProduct(persona_os, product);
++
+   std::string os_info;
+   base::StringAppendF(&os_info, "%s%s", GetUserAgentPlatform().c_str(),
+                       BuildOSCpuInfo(IncludeAndroidBuildNumber::Exclude,

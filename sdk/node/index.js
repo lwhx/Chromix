@@ -18,6 +18,7 @@
 // puppeteer subpath (use the playwright surface).
 import { randomBytes } from "node:crypto";
 import { existsSync, rmSync, readdirSync } from "node:fs";
+import { link, mkdir, open, readFile, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import {
   VERSION as BROWSER_VERSION, CHANNELS, CACHE, hostFor, resolvePlatform, ensureNative,
@@ -97,9 +98,38 @@ export async function checkForUpdate() {
 export function getDefaultStealthArgs() {
   const seed = randomBytes(4).readUInt32LE(0) || 1;
   const base = [`--fingerprint=${seed}`];
-  return process.platform === "darwin"
-    ? [...base, "--fingerprint-platform=macos"]
-    : [...base, "--fingerprint-platform=windows"];
+  const platform = { linux: "linux", win32: "windows", darwin: "macos" }[process.platform];
+  return platform ? [...base, `--fingerprint-platform=${platform}`] : base;
+}
+
+const PROFILE_SEED_FILE = ".chromix-fingerprint-seed";
+
+async function readProfileSeed(path) {
+  const data = await readFile(path, "utf8");
+  const seed = Number(data);
+  if (!Number.isInteger(seed) || seed < 1 || seed > 0xFFFFFFFF || data !== `${seed}\n`)
+    throw new Error(`Invalid Chromix profile seed file: ${path}`);
+  return seed;
+}
+
+async function profileSeed(userDataDir) {
+  const path = join(userDataDir, PROFILE_SEED_FILE);
+  try { return await readProfileSeed(path); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
+  await mkdir(userDataDir, { recursive: true });
+  const seed = randomBytes(4).readUInt32LE(0) || 1;
+  const temporary = join(userDataDir, `${PROFILE_SEED_FILE}.${randomBytes(16).toString("hex")}`);
+  const stream = await open(temporary, "wx", 0o600);
+  try {
+    try {
+      await stream.writeFile(`${seed}\n`, "ascii");
+      await stream.sync();
+    } finally { await stream.close(); }
+    // Publish a complete file without replacing a concurrent winner.
+    try { await link(temporary, path); }
+    catch (error) { if (error.code !== "EEXIST") throw error; }
+    return await readProfileSeed(path);
+  } finally { await unlink(temporary); }
 }
 
 export function buildArgs({ stealthArgs = true, extraArgs = [], timezone, locale,
@@ -492,8 +522,14 @@ export async function launchPersistentContext(options = {}) {
   const chromium = await loadChromium();
   if (!options.userDataDir) throw new Error("launchPersistentContext requires options.userDataDir");
   const ctxOpts = buildContextOptions(options);
-  const ctx = await chromium.launchPersistentContext(
-    options.userDataDir, { ...(await buildLaunchOptions(options)), ...ctxOpts });
+  const launchOpts = { ...(await buildLaunchOptions(options)), ...ctxOpts };
+  const explicitArgs = ctxOpts.args ?? options.launchOptions?.args ?? options.args ?? [];
+  if ((options.stealthArgs ?? true) && !explicitArgs.some((a) => a.split("=", 1)[0] === "--fingerprint")) {
+    const seed = await profileSeed(options.userDataDir);
+    launchOpts.args = [...(launchOpts.args || []).filter((a) => a.split("=", 1)[0] !== "--fingerprint"),
+                       `--fingerprint=${seed}`];
+  }
+  const ctx = await chromium.launchPersistentContext(options.userDataDir, launchOpts);
   if (options.humanize) {
     const cfg = resolveHumanConfig(options.humanPreset, options.humanConfig);
     for (const p of ctx.pages()) humanizePage(p, cfg);

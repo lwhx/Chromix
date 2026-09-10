@@ -1,17 +1,12 @@
 diff --git a/third_party/blink/renderer/modules/webaudio/audio_buffer.h b/third_party/blink/renderer/modules/webaudio/audio_buffer.h
-index 4bbf70b439..b933737093 100644
+index 4bbf70b439..7709604590 100644
 --- a/third_party/blink/renderer/modules/webaudio/audio_buffer.h
 +++ b/third_party/blink/renderer/modules/webaudio/audio_buffer.h
-@@ -123,6 +123,12 @@ class MODULES_EXPORT AudioBuffer final : public ScriptWrappable {
+@@ -122,6 +122,7 @@
+   float sample_rate_;
    uint32_t length_;
  
++  // JS views, channel copies and SharedAudioBuffer use the same mutable PCM.
    HeapVector<Member<DOMFloat32Array>> channels_;
-+
-+  // UXR Layer 2: one-time seeded sub-perceptual farble of the channel data,
-+  // applied on the JS read path (after render) so the audio fingerprint is stable
-+  // per session-seed and unique across seeds. Inaudible (~2e-7).
-+  void MaybeFarbleForUxr();
-+  bool uxr_audio_farbled_ = false;
  };
  
- // Shared data that audio threads can hold onto.

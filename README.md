@@ -24,11 +24,13 @@ a source commit or wait for other platforms.
 
 ## Highlights
 
-- **Coherent browser personas:** coordinated user agent, platform, locale,
-  timezone, screen, hardware, media, canvas, WebGL, WebGPU, audio, font, and
-  related observable values.
-- **Per-launch identity:** SDK defaults generate a random 32-bit fingerprint
-  seed, while command-line switches allow reproducible test personas.
+- **Configurable browser personas:** user agent, platform, locale, timezone,
+  screen, hardware, media, canvas, WebGL, WebGPU, audio, font, and related
+  surfaces, with cross-interface gaps and verification status tracked in
+  [`FINGERPRINT_STATUS.md`](FINGERPRINT_STATUS.md).
+- **Stable profile identity:** persistent SDK profiles reuse one fingerprint
+  seed; nonpersistent launches generate a random 32-bit seed. Command-line
+  switches allow reproducible test personas.
 - **CloakBrowser-compatible SDK surface:** existing Playwright-based Python and
   Node scripts can usually migrate by changing the import.
 - **Proxy-aware setup:** optional GeoIP resolution can align locale, timezone,
@@ -40,6 +42,22 @@ a source commit or wait for other platforms.
   and Windows/Linux/macOS platform revisions are pinned in the repository.
 - **Integrity checks:** releases include `SHA256SUMS`; the SDK verifies a bundle
   before extracting it when the manifest is available.
+
+## Fingerprint verification
+
+[`FINGERPRINT_STATUS.md`](FINGERPRINT_STATUS.md) records the P0/P1/P2 coverage,
+retired inconsistent overrides, and build/runtime verification boundaries.
+For a locally built or independently verified existing executable, run
+`python3 tools/fingerprint_smoke.py --browser /path/to/chrome --platform linux --locale de-DE --output /tmp/fingerprint-smoke.json`.
+The runner requires Python Playwright, serves its own loopback test pages, and
+never downloads a browser. A passing tooling test is not a passing browser smoke.
+
+The GPU pool currently contains synthetic Windows test templates, not a measured
+full-device dataset. Screen/layout, font provenance, CPU/memory capabilities,
+media backends and wire-level networking still have open consistency work.
+Storage quotas and Network Information now retain native backend/notifier values
+instead of isolated getter-only substitutions. See the status document for
+retired switches and remaining priorities.
 
 ## Downloads
 

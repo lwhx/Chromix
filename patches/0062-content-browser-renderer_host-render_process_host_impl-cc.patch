@@ -1,11 +1,15 @@
 diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
-index 2a8abef097d85d97616a60d603e98784dddfa5ed..57e0501cac2dec732fd11900a145392d723ccff1 100644
+index 79c9568633..c10556d642 100644
 --- a/content/browser/renderer_host/render_process_host_impl.cc
 +++ b/content/browser/renderer_host/render_process_host_impl.cc
-@@ -3759,6 +3759,14 @@ void RenderProcessHostImpl::AppendRendererCommandLine(
+@@ -3787,6 +3787,18 @@
        *base::CommandLine::ForCurrentProcess();
    PropagateBrowserCommandLineToRenderer(browser_command_line, command_line);
  
++  // Locale initialization precedes the renderer's persona IPC.
++  static const char* const kUxrStartupSwitches[] = {"uxr-languages"};
++  command_line->CopySwitchesFrom(browser_command_line, kUxrStartupSwitches);
++
 +  // V8 cannot read the renderer's base::UxrConfig during flag initialization.
 +  if (browser_command_line.HasSwitch(
 +          "uxr-devtools-runtime-suppression")) {

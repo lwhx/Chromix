@@ -2,72 +2,55 @@ diff --git a/third_party/blink/renderer/modules/webgpu/gpu_adapter_info.cc b/thi
 index 9d155705c1..b8f0e0b8f0 100644
 --- a/third_party/blink/renderer/modules/webgpu/gpu_adapter_info.cc
 +++ b/third_party/blink/renderer/modules/webgpu/gpu_adapter_info.cc
-@@ -4,6 +4,10 @@
+@@ -4,6 +4,9 @@
  
  #include "third_party/blink/renderer/modules/webgpu/gpu_adapter_info.h"
  
-+#include "base/strings/string_util.h"
 +#include "base/uxr_config.h"
 +#include "components/ungoogled/persona_profile.h"
 +
  #include "third_party/blink/renderer/modules/webgpu/gpu_memory_heap_info.h"
  #include "third_party/blink/renderer/modules/webgpu/gpu_subgroup_matrix_config.h"
  
-@@ -34,7 +37,57 @@ GPUAdapterInfo::GPUAdapterInfo(const String& vendor,
+@@ -34,7 +37,41 @@ GPUAdapterInfo::GPUAdapterInfo(const String& vendor,
        type_(type),
        d3d_shader_model_(d3d_shader_model),
        vk_driver_version_(vk_driver_version),
 -      power_preference_(power_preference) {}
 +      power_preference_(power_preference) {
-+  // UXR Layer 2: WebGPU adapter persona via cmdline, so navigator.gpu agrees with
-+  // the WebGL GPU spoof (no SwiftShader/fallback adapter beside a claimed NVIDIA).
-+  // When WebGPU is disabled the page sees requestAdapter()==null (coherent); when
-+  // enabled it now reports the persona instead of the real software adapter.
-+  if (base::UxrConfig::GetInstance().Has("uxr-webgpu-vendor")) {
-+    vendor_ = String(base::UxrConfig::GetInstance().Get("uxr-webgpu-vendor").c_str());
-+    is_fallback_adapter_ = false;
-+  }
-+  if (base::UxrConfig::GetInstance().Has("uxr-webgpu-architecture")) {
-+    architecture_ =
-+        String(base::UxrConfig::GetInstance().Get("uxr-webgpu-architecture").c_str());
-+  }
-+  if (base::UxrConfig::GetInstance().Has("uxr-webgpu-description")) {
-+    description_ =
-+        String(base::UxrConfig::GetInstance().Get("uxr-webgpu-description").c_str());
-+  }
++  // Identity overrides cannot turn a software adapter into hardware.
++  if (is_fallback_adapter_)
++    return;
++  const auto& config = base::UxrConfig::GetInstance();
 +  const auto& persona = ungoogled::CurrentPersona();
-+  if (!base::UxrConfig::GetInstance().Has("uxr-webgpu-vendor") &&
-+      !persona.webgl_real) {
-+    const std::string webgl_vendor =
-+        String(persona.webgl_vendor.c_str()).ToAsciiLower().Utf8();
-+    if (webgl_vendor.find("nvidia") != std::string::npos) {
-+      vendor_ = "nvidia";
-+      is_fallback_adapter_ = false;
-+    } else if (webgl_vendor.find("intel") != std::string::npos) {
-+      vendor_ = "intel";
-+      is_fallback_adapter_ = false;
-+    } else if (webgl_vendor.find("amd") != std::string::npos ||
-+               webgl_vendor.find("ati") != std::string::npos ||
-+               webgl_vendor.find("radeon") != std::string::npos) {
-+      vendor_ = "amd";
-+      is_fallback_adapter_ = false;
-+    } else if (webgl_vendor.find("apple") != std::string::npos) {
-+      vendor_ = "apple";
-+      is_fallback_adapter_ = false;
-+    }
-+  }
-+  if (!base::UxrConfig::GetInstance().Has("uxr-webgpu-architecture") &&
-+      !persona.webgl_real) {
-+    const std::string webgpu_vendor = vendor_.ToAsciiLower().Utf8();
-+    if (webgpu_vendor == "nvidia")
-+      architecture_ = "ampere";
-+    else if (webgpu_vendor == "intel")
-+      architecture_ = "gen-12-lp";
-+    else if (webgpu_vendor == "amd")
-+      architecture_ = "rdna2";
-+    else if (webgpu_vendor == "apple")
-+      architecture_ = "apple";
-+  }
++  const bool explicit_vendor = config.Has("uxr-webgpu-vendor") &&
++      !config.Get("uxr-webgpu-vendor").empty();
++  const bool explicit_architecture =
++      config.Has("uxr-webgpu-architecture") &&
++      !config.Get("uxr-webgpu-architecture").empty();
++  const bool explicit_identity = explicit_vendor && explicit_architecture;
++  const bool use_template = !persona.webgl_real &&
++      !persona.webgl_identity_explicit && !persona.webgpu_vendor.empty() &&
++      !persona.webgpu_architecture.empty();
++  if (!explicit_identity && !use_template)
++    return;
++
++  // A complete tuple is required; never mix a synthetic vendor with native
++  // architecture/device/driver values. Description is optional metadata.
++  vendor_ = explicit_identity
++      ? String(config.Get("uxr-webgpu-vendor").c_str())
++      : String(persona.webgpu_vendor.c_str());
++  architecture_ = explicit_identity
++      ? String(config.Get("uxr-webgpu-architecture").c_str())
++      : String(persona.webgpu_architecture.c_str());
++  const std::string webgpu_description =
++      config.Get("uxr-webgpu-description");
++  if (explicit_identity && !webgpu_description.empty())
++    description_ = String(webgpu_description.c_str());
++  else
++    description_ = String();
++  device_ = String();
++  driver_ = String();
 +}
  
  void GPUAdapterInfo::AppendMemoryHeapInfo(GPUMemoryHeapInfo* info) {

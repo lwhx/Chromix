@@ -1,8 +1,9 @@
 diff --git a/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc b/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc
-index 44527d0a7b..45affa329c 100644
+index 44527d0a7b26..feceb3004db2 100644
 --- a/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc
 +++ b/third_party/blink/renderer/modules/webgpu/gpu_adapter.cc
-@@ -5,6 +5,13 @@
+@@ -4,7 +4,13 @@
+ 
  #include "third_party/blink/renderer/modules/webgpu/gpu_adapter.h"
  
 +#include <set>
@@ -12,35 +13,33 @@ index 44527d0a7b..45affa329c 100644
 +#include "base/strings/string_util.h"
  #include "services/metrics/public/cpp/ukm_builders.h"
 +#include "base/uxr_config.h"  // UXR
-+#include "components/ungoogled/persona_profile.h"
  #include "third_party/blink/renderer/bindings/core/v8/script_promise_resolver.h"
  #include "third_party/blink/renderer/bindings/core/v8/v8_object_builder.h"
  #include "third_party/blink/renderer/bindings/modules/v8/v8_gpu_device_descriptor.h"
-@@ -34,6 +35,23 @@ GPUSupportedFeatures* MakeFeatureNameSet(wgpu::Adapter adapter) {
+@@ -34,6 +40,22 @@
    GPUSupportedFeatures* features = MakeGarbageCollected<GPUSupportedFeatures>();
    DCHECK(features->FeatureNameSet().empty());
  
-+  // UXR: persona WebGPU feature allowlist. Dawn's feature set reflects
-+  // the host adapter/backend; when uxr-webgpu-features is set (comma-separated
-+  // feature names, e.g. "depth-clip-control,texture-compression-bc"), only
-+  // listed features are exposed so the adapter stops contradicting the
-+  // claimed GPU. Unset -> native set untouched.
++  // An explicit empty allowlist exposes no features; unset preserves Dawn's set.
++  const base::UxrConfig& config = base::UxrConfig::GetInstance();
++  const bool ph_filter = config.Has("uxr-webgpu-features");
 +  std::set<std::string> ph_allowed;
-+  {
-+    const std::string ph_allow_raw =
-+        base::UxrConfig::GetInstance().Get("uxr-webgpu-features");
++  if (ph_filter) {
++    const std::string ph_allow_raw = config.Get("uxr-webgpu-features");
 +    for (const auto& ph_token : base::SplitString(
 +             ph_allow_raw, ",", base::TRIM_WHITESPACE,
 +             base::SPLIT_WANT_NONEMPTY)) {
 +      ph_allowed.insert(String(ph_token.c_str()).ToAsciiLower().Utf8());
 +    }
++    if (ph_allowed.empty()) {
++      return features;
++    }
 +  }
-+  const bool ph_filter = !ph_allowed.empty();
 +
    wgpu::SupportedFeatures supported_features;
    adapter.GetFeatures(&supported_features);
    // SAFETY: Required from caller
-@@ -43,9 +56,16 @@ GPUSupportedFeatures* MakeFeatureNameSet(wgpu::Adapter adapter) {
+@@ -43,9 +65,16 @@
      auto feature_name_enum_optional =
          GPUSupportedFeatures::ToV8FeatureNameEnum(f);
      if (feature_name_enum_optional) {
@@ -58,48 +57,3 @@ index 44527d0a7b..45affa329c 100644
    }
    return features;
  }
-@@ -96,5 +96,44 @@ GPUAdapter::GPUAdapter(
-   vendor_ = String::FromUtf8(info.vendor);
-   architecture_ = String::FromUtf8(info.architecture);
-+
-+  // UXR: derive WebGPU identity from the final WebGL persona before either
-+  // GPUAdapterInfo constructor is selected. Explicit WebGPU values win.
-+  const base::UxrConfig& uxr_config = base::UxrConfig::GetInstance();
-+  const bool use_real_gpu =
-+      uxr_config.Has("uxr-webgl-real") ||
-+      uxr_config.Has("uxr-disable-gpu-fingerprint");
-+  if (uxr_config.Has("uxr-webgpu-vendor")) {
-+    vendor_ = String(uxr_config.Get("uxr-webgpu-vendor").c_str());
-+  } else if (!use_real_gpu) {
-+    const std::string webgl_vendor =
-+        String(ungoogled::CurrentPersona().webgl_vendor.c_str())
-+            .ToAsciiLower()
-+            .Utf8();
-+    if (webgl_vendor.find("nvidia") != std::string::npos)
-+      vendor_ = "nvidia";
-+    else if (webgl_vendor.find("intel") != std::string::npos)
-+      vendor_ = "intel";
-+    else if (webgl_vendor.find("amd") != std::string::npos ||
-+             webgl_vendor.find("ati") != std::string::npos ||
-+             webgl_vendor.find("radeon") != std::string::npos)
-+      vendor_ = "amd";
-+    else if (webgl_vendor.find("apple") != std::string::npos)
-+      vendor_ = "apple";
-+  }
-+  if (uxr_config.Has("uxr-webgpu-architecture")) {
-+    architecture_ =
-+        String(uxr_config.Get("uxr-webgpu-architecture").c_str());
-+  } else if (!use_real_gpu) {
-+    const std::string webgpu_vendor = vendor_.ToAsciiLower().Utf8();
-+    if (webgpu_vendor == "nvidia")
-+      architecture_ = "ampere";
-+    else if (webgpu_vendor == "intel")
-+      architecture_ = "gen-12-lp";
-+    else if (webgpu_vendor == "amd")
-+      architecture_ = "rdna2";
-+    else if (webgpu_vendor == "apple")
-+      architecture_ = "apple";
-+  }
-   if (info.deviceID <= 0xffff) {
-     device_ = String::Format("0x%04x", info.deviceID);
-   } else {

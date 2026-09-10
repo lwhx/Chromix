@@ -2,7 +2,7 @@ diff --git a/components/ungoogled/persona_profile.h b/components/ungoogled/perso
 new file mode 100644
 --- /dev/null
 +++ b/components/ungoogled/persona_profile.h
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,76 @@
 +// Copyright 2026.
 +#ifndef COMPONENTS_UNGOOGLED_PERSONA_PROFILE_H_
 +#define COMPONENTS_UNGOOGLED_PERSONA_PROFILE_H_
@@ -20,6 +20,8 @@ new file mode 100644
 +  std::string webgl_renderer =
 +      "ANGLE (Intel, Intel(R) UHD Graphics 770 (0x0000A780) Direct3D11 "
 +      "vs_5_0 ps_5_0, D3D11)";
++  std::string webgpu_vendor;
++  std::string webgpu_architecture;
 +  bool webgl_identity_explicit = false;
 +  bool webgl_fingerprint = false;
 +  bool webgl_real = false;

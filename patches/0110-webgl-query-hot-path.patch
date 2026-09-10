@@ -1,27 +1,23 @@
 diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-index 0c855b5..141346f 100644
+index 9e3748ea3b3e..8fb3c741c692 100644
 --- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 +++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-@@ -4556,6 +4556,12 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+@@ -4566,6 +4566,10 @@
        return ScriptValue::CreateNull(script_state->GetIsolate());
      case WebGLDebugRendererInfo::kUnmaskedRendererWebgl:
        if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
 +        if (!ungoogled::CurrentPersona().webgl_real) {
-+          // Keep the native GL query in the hot path without exposing its value.
-+          (void)ContextGL()->GetString(GL_RENDERER);
 +          return WebGLAny(script_state,
 +                          String(ungoogled::CurrentPersona().webgl_renderer));
 +        }
          if (ungoogled::CurrentPersona().webgl_real)
            return WebGLAny(script_state,
                            String(ContextGL()->GetString(GL_RENDERER)));
-@@ -4586,6 +4591,12 @@ ScriptValue WebGLRenderingContextBase::getParameter(ScriptState* script_state,
+@@ -4595,6 +4599,10 @@
        return ScriptValue::CreateNull(script_state->GetIsolate());
      case WebGLDebugRendererInfo::kUnmaskedVendorWebgl:
        if (ExtensionEnabled(kWebGLDebugRendererInfoName)) {
 +        if (!ungoogled::CurrentPersona().webgl_real) {
-+          // Keep the native GL vendor query in the hot path without exposing its value.
-+          (void)ContextGL()->GetString(GL_VENDOR);
 +          return WebGLAny(script_state,
 +                          String(ungoogled::CurrentPersona().webgl_vendor));
 +        }

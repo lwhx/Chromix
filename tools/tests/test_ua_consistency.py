@@ -75,27 +75,25 @@ def test_renderer_receives_ua_config_before_initialize_renderer():
     assert host.index(config_call) < host.index(initialize_call)
 
 
-def test_renderer_initialization_rebuilds_ua_and_brand_versions_from_override():
+def test_renderer_initialization_preserves_browser_ua_and_metadata():
     host = (PATCHES / "0005-content-browser-renderer_host-render_process_host_impl-cc.patch").read_text(
         encoding="utf-8"
     )
-    assert "effective_user_agent_metadata.full_version = ua_full_version;" in host
-    assert "effective_user_agent.replace(version_start + 1" in host
-    assert "brand_full_version_list" in host
+    assert "effective_user_agent.replace" not in host
+    assert "effective_user_agent_metadata" not in host
+    assert "GetContentClient()->browser()->GetUserAgent()," in host
+    assert "GetContentClient()->browser()->GetUserAgentMetadata()," in host
 
 def test_version_override_alias_remains_the_single_cli_entry_point():
     main = added_lines("0036-chrome-app-chrome_main-fingerprint-normalize.patch")
     assert '"fingerprint-brand-version",        "uxr-ua-full-version"' in main
 
 
-def test_browser_override_rewrite_has_required_version_include_and_cache_migration():
-    host = (PATCHES / "0005-content-browser-renderer_host-render_process_host_impl-cc.patch").read_text(
-        encoding="utf-8"
-    )
-    assert '+#include "base/version.h"' in host
+def test_legacy_windows_cache_migration_keeps_its_version_dependency():
     update = (ROOT / "build" / "windows" / "update-restored-source.ps1").read_text(
         encoding="utf-8"
     )
+    assert '#include "base/version.h"' in update
     assert "render_process_host_impl.cc" in update
     assert "effective_user_agent_metadata.full_version = ua_full_version;" in update
     assert "user_agent_utils.cc" in update
