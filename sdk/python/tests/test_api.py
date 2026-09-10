@@ -223,7 +223,8 @@ def offline_launch(monkeypatch, tmp_path):
         if calls.fail:
             raise RuntimeError("fixture launch failure")
         return SimpleNamespace(options=kwargs, pages=[], close=lambda: None,
-                               new_context=lambda **kw: SimpleNamespace(close=lambda: None))
+                               new_context=lambda **kw: SimpleNamespace(options=kw, close=lambda: None),
+                               new_page=lambda **kw: SimpleNamespace(options=kw, close=lambda: None))
 
     def stop():
         calls.stops += 1
@@ -237,8 +238,8 @@ def offline_launch(monkeypatch, tmp_path):
         async def close():
             pass
         async def new_context(**kw):
-            return SimpleNamespace(close=close)
-        context.close, context.new_context = close, new_context
+            return SimpleNamespace(options=kw, close=close)
+        context.close, context.new_context, context.new_page = close, new_context, new_context
         return context
 
     async def stop_async():
@@ -427,3 +428,181 @@ def test_nonpersistent_launches_keep_per_launch_randomness(tmp_path, monkeypatch
     asyncio.run(run())
     assert [fingerprint(call["args"]) for call in offline_launch.launches] == [str(i) for i in range(1, 9)]
     assert list(tmp_path.iterdir()) == []
+
+
+def test_persona_geometry_is_complete_coherent_and_idempotent():
+    from chromix._persona import SCREEN_POOL, ensure_persona_geometry
+    import random
+    args, g = ensure_persona_geometry(None, random.Random(42))
+    keys = {a.split("=", 1)[0] for a in args}
+    for k in ("--uxr-screen-width", "--uxr-screen-height",
+              "--uxr-device-pixel-ratio", "--uxr-taskbar-height",
+              "--uxr-outer-width", "--uxr-outer-height"):
+        assert k in keys, k
+    assert g["avail_height"] == g["height"] - g["taskbar"]
+    assert g["inner_height"] == g["avail_height"] - 85
+    assert g["inner_height"] >= 580
+    assert (g["width"], g["dpr"]) in [(s[0], s[2]) for s in SCREEN_POOL]
+    # idempotent — re-ensuring adds nothing
+    args2, g2 = ensure_persona_geometry(args, random.Random(1))
+    assert args2 == args and g2 == g
+
+
+def test_persona_geometry_respects_explicit_user_values():
+    from chromix._persona import ensure_persona_geometry
+    import random
+    args, g = ensure_persona_geometry(
+        ["--uxr-screen-width=1366", "--uxr-screen-height=768"], random.Random(7))
+    assert g["width"] == 1366 and g["height"] == 768
+    assert not any(a.startswith("--uxr-screen-width=") and a != "--uxr-screen-width=1366"
+                   for a in args)
+    # missing pieces completed from one pick
+    assert g["dpr"] in (1.0, 1.25, 1.5) and g["taskbar"] in (40, 48)
+
+
+def test_split_context_kwargs_viewport_matches_persona_geometry():
+    geometry = {"width": 1536, "height": 864, "dpr": 1.25, "taskbar": 48,
+                "avail_height": 816, "inner_height": 731}
+    ctx = api._split_context_kwargs(api._VIEWPORT_UNSET, None, None, None, {},
+                                    geometry=geometry)
+    assert ctx["viewport"] == {"width": 1536, "height": 731}
+    assert ctx["device_scale_factor"] == 1.25
+    # dpr=1.0 omits device_scale_factor (native default)
+    geometry["dpr"] = 1.0
+    ctx = api._split_context_kwargs(api._VIEWPORT_UNSET, None, None, None, {},
+                                    geometry=geometry)
+    assert "device_scale_factor" not in ctx
+    # explicit viewport still wins
+    ctx = api._split_context_kwargs({"width": 800, "height": 600}, None, None,
+                                    None, {}, geometry=geometry)
+    assert ctx["viewport"] == {"width": 800, "height": 600}
+
+
+@pytest.mark.parametrize("seed,width,height,taskbar", [
+    (1, 1920, 1200, 48), (42, 1680, 1050, 40),
+    (101, 1600, 900, 40), (4294967295, 1920, 1080, 40),
+])
+def test_seeded_geometry_cross_sdk_vectors(seed, width, height, taskbar):
+    from chromix._persona import ensure_persona_geometry
+    args, geometry = ensure_persona_geometry([f"--fingerprint={seed}"])
+    assert ensure_persona_geometry([f"--fingerprint={seed}"]) == (args, geometry)
+    assert (geometry["width"], geometry["height"], geometry["taskbar"]) == (width, height, taskbar)
+
+
+def test_persistent_geometry_follows_saved_seed(tmp_path, offline_launch):
+    (tmp_path / SEED_FILE).write_bytes(b"42\n")
+    first = persistent(tmp_path)
+    second = persistent(tmp_path, True)
+    assert [a for a in first if a.startswith("--uxr-")] == [a for a in second if a.startswith("--uxr-")]
+    for launch in offline_launch.launches:
+        assert launch["viewport"] == {"width": 1680, "height": 925}
+    assert (tmp_path / SEED_FILE).read_bytes() == b"42\n"
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("kind", ["browser", "context", "persistent"])
+def test_launch_paths_share_geometry_and_fonts(tmp_path, offline_launch, monkeypatch, asynchronous, kind):
+    font_calls = []
+    def font_env(binary, kwargs, fonts_dir=None):
+        font_calls.append(fonts_dir)
+        kwargs["env"] = {"GENERATED": "yes", **kwargs.get("env", {})}
+    monkeypatch.setattr(api, "apply_font_env", font_env)
+    monkeypatch.setattr(api, "font_dir_whitelist_arg", lambda path: "--uxr-font-whitelist=Fixture")
+    options = {"args": ["--fingerprint=42", "--uxr-device-pixel-ratio=1.25"],
+               "fonts_dir": tmp_path, "env": {"USER": "yes"}}
+    def check_context(context):
+        assert context.options["viewport"] == {"width": 1680, "height": 925}
+        assert context.options["device_scale_factor"] == 1.25
+        assert "fonts_dir" not in context.options
+        if kind != "persistent":
+            assert "env" not in context.options
+    if asynchronous:
+        async def run():
+            if kind == "persistent":
+                obj = await api.launch_persistent_context_async(user_data_dir=tmp_path, **options)
+            elif kind == "context":
+                obj = await api.launch_context_async(**options)
+            else:
+                obj = await api.launch_async(**options)
+                check_context(await obj.new_context())
+                check_context(await obj.new_page())
+                native = await obj.new_context(viewport=None)
+                assert native.options["viewport"] is None
+                assert native.options["no_viewport"] is True
+                assert "device_scale_factor" not in native.options
+            if kind != "browser":
+                check_context(obj)
+            await obj.close()
+        asyncio.run(run())
+    else:
+        if kind == "persistent":
+            obj = api.launch_persistent_context(tmp_path, **options)
+        elif kind == "context":
+            obj = api.launch_context(**options)
+        else:
+            obj = api.launch(**options)
+            check_context(obj.new_context())
+            check_context(obj.new_page())
+            native = obj.new_context(viewport=None)
+            assert native.options["viewport"] is None
+            assert native.options["no_viewport"] is True
+            assert "device_scale_factor" not in native.options
+        if kind != "browser":
+            check_context(obj)
+        obj.close()
+    assert font_calls == [tmp_path]
+    launch = offline_launch.launches[-1]
+    assert "--uxr-font-whitelist=Fixture" in launch["args"]
+    assert "--uxr-screen-width=1680" in launch["args"]
+    assert "fonts_dir" not in launch
+    assert launch["env"] == {"GENERATED": "yes", "USER": "yes"}
+    assert offline_launch.starts == offline_launch.stops == 1
+
+
+@pytest.mark.parametrize("options", [{"stealth_args": False}, {"args": ["--fingerprint=off"]}])
+def test_disabled_stealth_does_not_inject_geometry(offline_launch, options):
+    api.launch_context(**options).close()
+    assert not any(a.startswith("--uxr-") for a in offline_launch.launches[-1]["args"])
+
+
+def test_screen_aliases_and_explicit_outer_size(offline_launch):
+    options = {"headless": False, "args": ["--fingerprint=42", "--fingerprint-screen-width=1366",
+               "--fingerprint-screen-height=768", "--uxr-taskbar-height=0",
+               "--uxr-outer-width=1000", "--uxr-outer-height=700"]}
+    ctx = api.launch_context(**options)
+    assert ctx.options["viewport"] is None
+    assert "--window-size=1000,700" in offline_launch.launches[-1]["args"]
+    assert not any(a.startswith("--uxr-screen-width=") for a in offline_launch.launches[-1]["args"])
+    ctx.close()
+    options["headless"] = True
+    ctx = api.launch_context(**options)
+    assert ctx.options["viewport"] == {"width": 1000, "height": 615}
+    ctx.close()
+    api.launch_context(headless=False, args=["--fingerprint=42", "--window-size=800,600"]).close()
+    args = offline_launch.launches[-1]["args"]
+    assert "--uxr-outer-width=800" in args and "--uxr-outer-height=600" in args
+    assert "--start-maximized" not in args
+
+
+def test_font_parser_and_explicit_whitelist(offline_launch):
+    from chromix._fonts import font_families_in_dir
+    fonts_dir = Path(__file__).resolve().parents[3] / "assets" / "fonts"
+    families = font_families_in_dir(fonts_dir)
+    assert len(families) >= 50
+    assert {"Arial", "MS Gothic", "Segoe UI", "ＭＳ ゴシック"} <= set(families)
+    api.launch(fonts_dir=fonts_dir, args=["--uxr-font-whitelist=Custom"]).close()
+    assert [a for a in offline_launch.launches[-1]["args"] if a.startswith("--uxr-font-whitelist=")] == [
+        "--uxr-font-whitelist=Custom"]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux Fontconfig")
+def test_fontconfig_directories_do_not_overwrite_each_other(tmp_path, monkeypatch):
+    from chromix import _fonts
+    import xml.etree.ElementTree as ET
+    monkeypatch.setattr(_fonts.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    first = Path(_fonts.linux_font_env("unused", tmp_path / "one & two")["FONTCONFIG_FILE"])
+    before = first.read_bytes()
+    second = Path(_fonts.linux_font_env("unused", tmp_path / "other")["FONTCONFIG_FILE"])
+    assert first != second and first.read_bytes() == before
+    assert ET.fromstring(before).find("dir").text == str(tmp_path / "one & two")

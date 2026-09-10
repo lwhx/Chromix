@@ -110,9 +110,34 @@ The runner serves only its own loopback HTTP origin, rejects external proxy requ
 
 Checks cover negotiated HTTP hints versus JS in window/iframe/dedicated worker, requested platform/default Intl locale, repeated Canvas reads, selected offline audio invariants, denied media behavior, reload stability, and persistent-profile restart stability. Network Information and StorageManager estimates are also collected in all three contexts and checked for types/ranges and explicit API failures. Dynamic network estimates and quotas are excluded from identity/restart comparisons; existing usage above a reduced quota is allowed. These probes do not test connection events, real throughput, disk enforcement or storage buckets. Each persona/seed family gets a fresh temporary profile; restarts reuse that profile. The control uses `--fingerprint=off` without locale/platform overrides, not a separate stock Chromium binary. Missing evidence, crashes, mismatches and unexpected external requests produce a failed JSON report and nonzero exit. Unsupported optional probes are reported separately and do not complete their backlog category.
 
-## Verified local results
+## Merge integration (2026-09-10)
 
-The latest local validation includes the storage/network/codec follow-up and expanded smoke probes. Historical GPU/UA harness results remain listed separately from the rerun results below.
+The local merge of `origin/main` at `a727c817` retains the earlier Canvas copy/bounds fixes, notifier-owned network state, mutable AudioBuffer data, native WebGPU capabilities, and shared persistent SDK seeds. It also preserves the correct Windows restored-source patch paths and `fingerprint_data.h` build input. The duplicate trailing time-clamper patch is removed rather than applied twice.
+
+Incoming CPU/memory and display templates are synthetic, not a measured device corpus. Configuration seeds accept the full unsigned 64-bit range and use integer-weight selection instead of standard-library-specific floating distributions. Typed configuration accessors support the merged GPU code. The incoming independent seed-derived `outerHeight` and DPR defaults are not enabled: `screen` and actual layout do not consume the same defaults, so explicit configuration and native fallbacks are retained. The SDK supplies explicit geometry separately; full browser layout agreement still requires runtime validation.
+
+The new planning documents under `docs/` describe future work, not completed cross-process integration. Font mappings do not prove glyph-file provenance; `0112` only adds includes and does not implement layout-theme system fonts. Speech voice-list configuration changes reported entries, not the installed speech backend. Added battery, shader, font and timing hooks likewise require matching-build and browser validation before their categories can be accepted. Native audio latency and maximum-channel reporting are retained rather than enabling getter-only replacements. The CSS pointer/hover patch is rebased to the actual Chromium 152 method locations and uses its declared Mojo enum names.
+
+## Merge validation results
+
+Final validation was run on the merged working tree with local pre-Chromix source fixtures supplied; no tests were deselected.
+
+| Validation | Result | Scope |
+|---|---|---|
+| Patch linter | 120 patches; all 8 checks passed | Contiguous `0001`–`0120`, syntax and patch conventions |
+| Full Python suite | 2,560 passed, 50 skipped, 1 existing warning | Includes added-patch source/API tests and full three-platform patch-chain tests |
+| Node SDK suite | 108 passed | Node v24.8.0; launch, persistent seed, geometry, fonts and packaging regressions |
+| Three-platform full patch chain | 3 passed; also included in full suite | Linux/macOS/Windows sparse copies, normal/restored equivalence, repeat/check mode, input bytes/mtime unchanged |
+| Typed configuration and CSS harnesses | 22 passed; also included in full suite | Actual extracted C++ functions compiled with interface stubs, including uint64 boundaries and Chromium 152 pointer/hover enums |
+| SDK cross-language geometry comparison | 1,000 seeds matched | Node/Python explicit geometry generation; not native window verification |
+| Whitespace and merge conflicts | Passed; no unresolved entries | Working tree and staged diff checks |
+| Matching Chromium build / real browser | Not run | No matching verified executable, no browser integration available, no new build dispatched |
+
+The 50 skipped tests remain unverified. The warning comes from the existing intentional duplicate-ZIP-entry fixture. These results validate the merge's patch application and local contracts, not full-device fidelity or browser integration.
+
+## Historical pre-merge results
+
+The results below predate the merge and cover the storage/network/codec follow-up and expanded smoke probes.
 
 | Validation | Result | Scope |
 |---|---|---|

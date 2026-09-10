@@ -1,0 +1,13 @@
+diff --git a/third_party/blink/renderer/modules/webaudio/realtime_audio_destination_handler.cc b/third_party/blink/renderer/modules/webaudio/realtime_audio_destination_handler.cc
+--- a/third_party/blink/renderer/modules/webaudio/realtime_audio_destination_handler.cc
++++ b/third_party/blink/renderer/modules/webaudio/realtime_audio_destination_handler.cc
+@@ -206,7 +206,8 @@
+ }
+ 
+ uint32_t RealtimeAudioDestinationHandler::MaxChannelCount() const {
+-  return platform_destination_->MaxChannelCount();
++  // Channel capacity remains bounded by the active audio backend.
++  return platform_destination_ ? platform_destination_->MaxChannelCount() : 0;
+ }
+ 
+ double RealtimeAudioDestinationHandler::SampleRate() const {

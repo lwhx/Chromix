@@ -3,13 +3,14 @@ new file mode 100644
 index 0000000000..6eead77d0f
 --- /dev/null
 +++ b/base/uxr_config.h
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,57 @@
 +// Copyright 2026. Process-global persona config delivered to the renderer over
 +// IPC (NOT the command line) so persona values + seeds never appear in the
 +// renderer's /proc/cmdline. Populated once at renderer init; read-only after.
 +#ifndef BASE_UXR_CONFIG_H_
 +#define BASE_UXR_CONFIG_H_
 +
++#include <cstdint>
 +#include <map>
 +#include <string>
 +
@@ -37,6 +38,16 @@ index 0000000000..6eead77d0f
 +  std::string Get(const std::string& key) const;
 +  // Parses the value as an int; returns false if absent or unparseable.
 +  bool GetInt(const std::string& key, int* out) const;
++  bool GetDouble(const std::string& key, double* out) const;
++  bool GetUint64(const std::string& key, uint64_t* out) const;
++
++  // Synthetic hardware/display templates derived from "uxr-canvas-seed".
++  // Zero/false selects the caller's native fallback when no valid seed exists.
++  int GetSeededHwConcurrency() const;
++  float GetSeededDeviceMemory() const;
++  bool GetSeededScreen(int* w, int* h, float* dpr) const;
++  int GetSeededTaskbarHeight() const;
++  int GetSeededNetRttMs() const;
 +
 + private:
 +  friend class NoDestructor<UxrConfig>;

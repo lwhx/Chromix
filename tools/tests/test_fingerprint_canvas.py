@@ -111,8 +111,11 @@ def test_includes_and_bounded_scope(patched_sources):
         assert "UNSAFE_BUFFERS" not in additions
         assert "base/command_line.h" not in additions
     assert patched_sources["0031"].count("UxrCopyAndNoiseEncodeBuffer(pixmap_, retained_image_)") == 2
-    assert len([line for line in (ROOT / "patches/series").read_text().splitlines()
-                if line.strip() and not line.startswith("#")]) == 110
+    series = [line.strip() for line in (ROOT / "patches/series").read_text().splitlines()
+              if line.strip() and not line.lstrip().startswith("#")]
+    assert [Path(line).name[:4] for line in series] == [f"{i:04d}" for i in range(1, 121)]
+    for number in ("0020", "0031"):
+        assert series[int(number) - 1] == patch_path(number).relative_to(ROOT).as_posix()
 
 
 def test_real_header_api_syntax(tmp_path, patched_sources):

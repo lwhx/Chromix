@@ -24,7 +24,28 @@ import {
   VERSION as BROWSER_VERSION, CHANNELS, CACHE, hostFor, resolvePlatform, ensureNative,
   binaryPath, bundleComplete,
 } from "./_binary.js";
-import { fontLaunchEnv } from "./_fonts.js";
+import { fontLaunchEnv, fontDirWhitelistArg } from "./_fonts.js";
+import { ensurePersonaGeometry } from "./_persona.js";
+
+// One geometry pick per options object, shared by buildLaunchOptions and
+// buildContextOptions (launchPersistentContext calls them separately).
+const _personaGeoCache = new WeakMap();
+function personaGeometryFor(options) {
+  const args = options.launchOptions?.args ?? options.args ?? [];
+  const key = JSON.stringify([args, options.stealthArgs]);
+  let entry = _personaGeoCache.get(options);
+  if (!entry || entry.key !== key) {
+    const fingerprint = args.filter((a) => a.split("=", 1)[0] === "--fingerprint").at(-1);
+    if (options.stealthArgs === false || fingerprint === "--fingerprint=off") {
+      entry = { args, geometry: null };
+    } else {
+      entry = ensurePersonaGeometry(buildArgs({ extraArgs: args }));
+    }
+    entry.key = key;
+    _personaGeoCache.set(options, entry);
+  }
+  return entry;
+}
 
 export const VERSION = "0.1.0";
 export const CHROMIUM_VERSION = "152";
@@ -303,13 +324,21 @@ export function buildContextOptions(options = {}) {
   const { locale, timezoneId, ...ctx } = options.contextOptions || {};
   if (locale !== undefined || timezoneId !== undefined)
     console.warn("[chromix] contextOptions.locale/timezoneId ignored — use top-level locale/timezone (binary flag)");
+  // Viewport must match the persona screen: inner = screen - taskbar - Chrome
+  // UI strip, and deviceScaleFactor keeps canvas backing stores consistent
+  // with the spoofed devicePixelRatio.
+  const persona = personaGeometryFor(options).geometry;
+  const personaViewport = persona
+    ? { width: persona.outerWidth, height: persona.innerHeight } : DEFAULT_VIEWPORT;
   const viewport = options.viewport !== undefined
     ? options.viewport
-    : headless ? DEFAULT_VIEWPORT : null;
+    : ctx.viewport !== undefined ? ctx.viewport : headless ? personaViewport : null;
   return {
     ...ctx,
     ...(options.userAgent ? { userAgent: options.userAgent } : {}),
     viewport,
+    ...(viewport && persona && persona.dpr !== 1 && ctx.deviceScaleFactor === undefined
+      ? { deviceScaleFactor: persona.dpr } : {}),
     ...(options.colorScheme ? { colorScheme: options.colorScheme } : {}),
   };
 }
@@ -317,16 +346,29 @@ export function buildContextOptions(options = {}) {
 export async function buildLaunchOptions(options = {}) {
   const headless = effectiveHeadless(options);
   const binary = await ensureBinary(options);
+  const persona = personaGeometryFor(options);
   const { timezone, locale, exitIp } = await maybeResolveGeoip(
-    options.geoip, options.proxy, options.timezone ?? options.timezoneId, options.locale, options.args);
-  let args = await resolveWebrtcArgs(options.args, options.proxy);
+    options.geoip, options.proxy, options.timezone ?? options.timezoneId, options.locale, persona.args);
+  let args = await resolveWebrtcArgs(persona.args, options.proxy);
   args = appendWebrtcExitIp(args, exitIp);
   // Widevine / DRM: auto-enable when a CDM is present; CLOAKBROWSER_WIDEVINE=0 opts out.
   if (process.env.CLOAKBROWSER_WIDEVINE !== "0" && !(args || []).some((a) => a.startsWith("--uxr-widevine-cdm"))) {
     const cdm = findWidevineCdm();
     if (cdm) args = [...(args || []), `--uxr-widevine-cdm=${cdm}`];
   }
-  const chromeArgs = buildArgs({
+  // Custom font directory: whitelist exactly the families it contains.
+  // Injected before user args so an explicit --uxr-font-whitelist still wins.
+  if (options.fontsDir) {
+    const whitelist = fontDirWhitelistArg(options.fontsDir);
+    if (whitelist) args = [whitelist, ...(args || [])];
+    else console.warn(`[chromix] fontsDir=${options.fontsDir}: no parseable fonts found`);
+  }
+  // Headed windows use the same outer geometry as the persona.
+  if (!headless && persona.geometry && !(args || []).some((a) => a.startsWith("--window-size"))) {
+    args = [`--window-size=${persona.geometry.outerWidth},${persona.geometry.outerHeight}`, ...(args || [])];
+  }
+  const chromeArgs = options.stealthArgs === false && options.launchOptions?.args !== undefined
+    ? args : buildArgs({
     stealthArgs: options.stealthArgs ?? true,
     extraArgs: args,
     timezone, locale, headless,
@@ -334,14 +376,14 @@ export async function buildLaunchOptions(options = {}) {
     startMaximized: options.startMaximized ?? true,
   });
   const proxy = splitProxy(options.proxy);
-  const env = fontLaunchEnv(binary, options.launchOptions?.env);
+  const env = fontLaunchEnv(binary, options.launchOptions?.env, options.fontsDir);
   return {
     executablePath: binary,
     headless,
-    args: chromeArgs,
     ignoreDefaultArgs: ["--enable-automation"],
     ...(proxy ? { proxy } : {}),
     ...options.launchOptions,
+    args: chromeArgs,
     ...(env ? { env } : {}),
   };
 }
@@ -496,15 +538,26 @@ async function loadChromium() {
 }
 
 export async function launch(options = {}) {
+  options = { ...options };
   const chromium = await loadChromium();
   const launchOpts = await buildLaunchOptions(options);
   const browser = await chromium.launch(launchOpts);
+  for (const method of ["newPage", "newContext"]) {
+    if (!browser[method] || !personaGeometryFor(options).geometry) continue;
+    const original = browser[method].bind(browser);
+    browser[method] = (contextOptions = {}) => {
+      const defaults = buildContextOptions(options);
+      if (contextOptions.viewport === null) delete defaults.deviceScaleFactor;
+      return original({ ...defaults, ...contextOptions });
+    };
+  }
   if (options.humanize)
     await humanizeBrowser(browser, resolveHumanConfig(options.humanPreset, options.humanConfig));
   return browser;
 }
 
 export async function launchContext(options = {}) {
+  options = { ...options };
   const chromium = await loadChromium();
   const browser = await chromium.launch(await buildLaunchOptions(options));
   const ctx = await browser.newContext(buildContextOptions(options));
@@ -521,14 +574,16 @@ export async function launchContext(options = {}) {
 export async function launchPersistentContext(options = {}) {
   const chromium = await loadChromium();
   if (!options.userDataDir) throw new Error("launchPersistentContext requires options.userDataDir");
-  const ctxOpts = buildContextOptions(options);
-  const launchOpts = { ...(await buildLaunchOptions(options)), ...ctxOpts };
-  const explicitArgs = ctxOpts.args ?? options.launchOptions?.args ?? options.args ?? [];
-  if ((options.stealthArgs ?? true) && !explicitArgs.some((a) => a.split("=", 1)[0] === "--fingerprint")) {
-    const seed = await profileSeed(options.userDataDir);
-    launchOpts.args = [...(launchOpts.args || []).filter((a) => a.split("=", 1)[0] !== "--fingerprint"),
-                       `--fingerprint=${seed}`];
+  let args = options.contextOptions?.args ?? options.launchOptions?.args ?? options.args ?? [];
+  if ((options.stealthArgs ?? true) && !args.some((a) => a.split("=", 1)[0] === "--fingerprint")) {
+    args = [...args, `--fingerprint=${await profileSeed(options.userDataDir)}`];
   }
+  const launchOptions = { ...options.launchOptions };
+  if (options.contextOptions?.args !== undefined || options.launchOptions?.args !== undefined)
+    launchOptions.args = args;
+  const { args: contextArgs, ...contextOptions } = options.contextOptions || {};
+  const prepared = { ...options, args, launchOptions, contextOptions };
+  const launchOpts = { ...(await buildLaunchOptions(prepared)), ...buildContextOptions(prepared) };
   const ctx = await chromium.launchPersistentContext(options.userDataDir, launchOpts);
   if (options.humanize) {
     const cfg = resolveHumanConfig(options.humanPreset, options.humanConfig);

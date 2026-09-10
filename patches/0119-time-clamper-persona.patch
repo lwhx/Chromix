@@ -1,0 +1,36 @@
+diff --git a/third_party/blink/renderer/core/timing/time_clamper.cc b/third_party/blink/renderer/core/timing/time_clamper.cc
+--- a/third_party/blink/renderer/core/timing/time_clamper.cc
++++ b/third_party/blink/renderer/core/timing/time_clamper.cc
+@@ -6,6 +6,8 @@
+ 
+ #include "base/bit_cast.h"
+ #include "base/rand_util.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/uxr_config.h"
+ 
+ #include <cmath>
+ 
+@@ -15,7 +17,22 @@
+ const int64_t kTenLowerDigitsMod = 10000000000;
+ }  // namespace
+ 
+-TimeClamper::TimeClamper() : secret_(base::RandUint64()) {}
++TimeClamper::TimeClamper() : secret_([] {
++  // Valid nonzero persona seeds share rounding boundaries across processes.
++  uint64_t seed = 0;
++  if (base::StringToUint64(
++          base::UxrConfig::GetInstance().Get("uxr-canvas-seed"), &seed) &&
++      seed != 0) {
++    uint64_t x = seed;
++    x ^= x >> 33;
++    x *= uint64_t{0xff51afd7ed558ccd};
++    x ^= x >> 33;
++    x *= uint64_t{0xc4ceb9fe1a85ec53};
++    x ^= x >> 33;
++    return x;
++  }
++  return base::RandUint64();
++}()) {}
+ 
+ // This is using int64 for timestamps, because https://bit.ly/doubles-are-bad
+ base::TimeDelta TimeClamper::ClampTimeResolution(

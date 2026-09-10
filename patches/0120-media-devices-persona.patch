@@ -1,0 +1,11 @@
+diff --git a/third_party/blink/renderer/modules/mediastream/media_devices.cc b/third_party/blink/renderer/modules/mediastream/media_devices.cc
+--- a/third_party/blink/renderer/modules/mediastream/media_devices.cc
++++ b/third_party/blink/renderer/modules/mediastream/media_devices.cc
+@@ -1456,6 +1456,7 @@
+     for (wtf_size_t j = 0; j < enumeration[i].size(); ++j) {
+       mojom::blink::MediaDeviceType device_type =
+           static_cast<mojom::blink::MediaDeviceType>(i);
++      // Preserve browser-filtered IDs, labels, capability alignment and order.
+       WebMediaDeviceInfo device_info = enumeration[i][j];
+       String device_label = String::FromUtf8(device_info.label);
+       if (device_type == mojom::blink::MediaDeviceType::kMediaAudioInput ||

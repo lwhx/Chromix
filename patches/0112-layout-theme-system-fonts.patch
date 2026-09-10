@@ -1,0 +1,12 @@
+diff --git a/third_party/blink/renderer/core/layout/layout_theme_font_provider_default.cc b/third_party/blink/renderer/core/layout/layout_theme_font_provider_default.cc
+--- a/third_party/blink/renderer/core/layout/layout_theme_font_provider_default.cc
++++ b/third_party/blink/renderer/core/layout/layout_theme_font_provider_default.cc
+@@ -26,6 +26,8 @@
+ #include "third_party/blink/renderer/core/layout/layout_theme_font_provider.h"
+ 
+ #include "third_party/blink/renderer/core/css_value_keywords.h"
++#include "base/strings/string_util.h"
++#include "base/uxr_config.h"
+ #include "third_party/blink/renderer/platform/fonts/font_cache.h"
+ #include "third_party/blink/renderer/platform/fonts/font_description.h"
+ #include "third_party/blink/renderer/platform/wtf/std_lib_extras.h"

@@ -79,7 +79,7 @@ def test_independent_fixture_apply_reverse(patched_source):
     assert patched_source.replace(RETIREMENT, "") == NETWORK_SOURCE
 
 
-def test_retirement_is_one_comment_and_preserves_110_slots():
+def test_retirement_is_one_comment_and_preserves_120_slots():
     patch = PATCH.read_text()
     additions = [line[1:] for line in patch.splitlines()
                  if line.startswith("+") and not line.startswith("+++")]
@@ -92,9 +92,9 @@ def test_retirement_is_one_comment_and_preserves_110_slots():
     assert not re.search(r"uxr|persona|StringToDouble", patch, re.I)
     series = [line for line in (ROOT / "patches/series").read_text().splitlines()
               if line.strip() and not line.startswith("#")]
-    assert [Path(line).name[:4] for line in series] == [f"{i:04d}" for i in range(1, 111)]
+    assert [Path(line).name[:4] for line in series] == [f"{i:04d}" for i in range(1, 121)]
     assert series[22] == PATCH.relative_to(ROOT).as_posix()
-    assert len(list((ROOT / "patches").glob("[0-9][0-9][0-9][0-9]-*.patch"))) == 110
+    assert len(list((ROOT / "patches").glob("[0-9][0-9][0-9][0-9]-*.patch"))) == 120
 
 
 @pytest.mark.parametrize("context", [

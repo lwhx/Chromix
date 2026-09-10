@@ -3,9 +3,13 @@ new file mode 100644
 index 0000000000..cac1a6896b
 --- /dev/null
 +++ b/base/uxr_config.cc
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,156 @@
 +// Copyright 2026.
 +#include "base/uxr_config.h"
++
++#include <array>
++#include <cstdint>
++#include <random>
 +
 +#include "base/no_destructor.h"
 +#include "base/strings/string_number_conversions.h"
@@ -44,6 +48,115 @@ index 0000000000..cac1a6896b
 +    return false;
 +  }
 +  return StringToInt(it->second, out);
++}
++
++bool UxrConfig::GetDouble(const std::string& key, double* out) const {
++  AutoLock locker(lock_);
++  auto it = map_.find(key);
++  return it != map_.end() && StringToDouble(it->second, out);
++}
++
++bool UxrConfig::GetUint64(const std::string& key, uint64_t* out) const {
++  AutoLock locker(lock_);
++  auto it = map_.find(key);
++  return it != map_.end() && StringToUint64(it->second, out);
++}
++
++namespace {
++
++uint64_t SeedFromCanvasKey(const UxrConfig& cfg) {
++  uint64_t seed = 0;
++  const std::string raw = cfg.Get("uxr-canvas-seed");
++  if (raw.empty() || !base::StringToUint64(raw, &seed))
++    return 0u;
++  return seed;
++}
++
++template <typename T, size_t N>
++const T& PickSeeded(const std::array<T, N>& pool, uint64_t seed,
++                    unsigned T::*weight_field) {
++  std::mt19937_64 rng(seed);
++  unsigned total_weight = 0;
++  for (const auto& entry : pool)
++    total_weight += entry.*weight_field;
++  unsigned bucket = static_cast<unsigned>(rng() % total_weight);
++  for (const auto& entry : pool) {
++    if (bucket < entry.*weight_field)
++      return entry;
++    bucket -= entry.*weight_field;
++  }
++  return pool.back();
++}
++
++}  // namespace
++
++int UxrConfig::GetSeededHwConcurrency() const {
++  const uint64_t seed = SeedFromCanvasKey(*this);
++  if (seed == 0u)
++    return 0;
++  // Synthetic desktop core-count templates, not measured device samples.
++  struct E { int cores; unsigned w; };
++  static constexpr std::array<E, 9> kPool = {{
++      {8, 30}, {4, 22}, {12, 16}, {16, 13}, {20, 7},
++      {6, 5}, {24, 3}, {2, 2}, {14, 2}}};
++  return PickSeeded(kPool, seed ^ 0x6877636f6e63ULL, &E::w).cores;
++}
++
++float UxrConfig::GetSeededDeviceMemory() const {
++  const uint64_t seed = SeedFromCanvasKey(*this);
++  if (seed == 0u)
++    return 0.0f;
++  // deviceMemory buckets cap at 8: every 16GB/32GB machine reports 8.
++  struct E { float gb; unsigned w; };
++  static constexpr std::array<E, 2> kPool = {{{8.0f, 75}, {4.0f, 25}}};
++  return PickSeeded(kPool, seed ^ 0x6465766d656dULL, &E::w).gb;
++}
++
++bool UxrConfig::GetSeededScreen(int* w, int* h, float* dpr) const {
++  const uint64_t seed = SeedFromCanvasKey(*this);
++  if (seed == 0u)
++    return false;
++  // Logical dimensions and DPR belong to one synthetic display template.
++  struct E { int w; int h; float dpr; unsigned wgt; };
++  static constexpr std::array<E, 11> kPool = {{
++      {1920, 1080, 1.0f, 42},
++      {1366, 768, 1.0f, 14},
++      {2560, 1440, 1.0f, 12},
++      {1536, 864, 1.25f, 11},
++      {1440, 900, 1.0f, 5},
++      {1680, 1050, 1.0f, 5},
++      {1280, 720, 1.0f, 3},
++      {1600, 900, 1.0f, 3},
++      {1920, 1200, 1.0f, 2},
++      {2560, 1440, 1.5f, 2},
++      {1280, 800, 1.0f, 1},
++  }};
++  const E& e = PickSeeded(kPool, seed ^ 0x73637265656eULL, &E::wgt);
++  if (w) *w = e.w;
++  if (h) *h = e.h;
++  if (dpr) *dpr = e.dpr;
++  return true;
++}
++
++int UxrConfig::GetSeededTaskbarHeight() const {
++  const uint64_t seed = SeedFromCanvasKey(*this);
++  if (seed == 0u)
++    return 0;
++  // Synthetic Windows taskbar dimensions.
++  struct E { int px; unsigned w; };
++  static constexpr std::array<E, 2> kPool = {{{48, 70}, {40, 30}}};
++  return PickSeeded(kPool, seed ^ 0x7461736b626172ULL, &E::w).px;
++}
++
++int UxrConfig::GetSeededNetRttMs() const {
++  const uint64_t seed = SeedFromCanvasKey(*this);
++  if (seed == 0u)
++    return 0;
++  // Synthetic RTT buckets; this helper does not configure the notifier.
++  struct E { int ms; unsigned w; };
++  static constexpr std::array<E, 3> kPool = {{
++      {50, 55}, {100, 30}, {150, 15}}};
++  return PickSeeded(kPool, seed ^ 0x6e6574727474ULL, &E::w).ms;
 +}
 +
 +}  // namespace base

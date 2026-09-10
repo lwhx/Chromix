@@ -1,0 +1,23 @@
+diff --git a/third_party/blink/renderer/modules/webgl/webgl_debug_shaders.cc b/third_party/blink/renderer/modules/webgl/webgl_debug_shaders.cc
+--- a/third_party/blink/renderer/modules/webgl/webgl_debug_shaders.cc
++++ b/third_party/blink/renderer/modules/webgl/webgl_debug_shaders.cc
+@@ -25,6 +25,8 @@
+ 
+ #include "third_party/blink/renderer/modules/webgl/webgl_debug_shaders.h"
+ 
++#include "base/uxr_config.h"
++
+ #include "third_party/blink/renderer/modules/webgl/gl_string_query.h"
+ #include "third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.h"
+ #include "third_party/blink/renderer/modules/webgl/webgl_shader.h"
+@@ -44,6 +46,10 @@
+ }
+ 
+ String WebGLDebugShaders::getTranslatedShaderSource(WebGLShader* shader) {
++  const std::string disabled =
++      base::UxrConfig::GetInstance().Get("uxr-disable-translated-shaders");
++  if (disabled == "1" || disabled == "true")
++    return String();
+   WebGLExtensionScopedContext scoped(this);
+   if (scoped.IsLost())
+     return String();

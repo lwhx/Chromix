@@ -261,13 +261,13 @@ def test_optional_real_baseline_provenance_and_round_trip(tmp_path, number):
     assert source.read_bytes() == original
 
 
-def test_numbered_series_still_has_110_entries():
+def test_numbered_series_has_120_entries():
     entries = [line.strip() for line in (ROOT / "patches/series").read_text().splitlines()
                if line.strip() and not line.lstrip().startswith("#")]
     assert entries == sorted(path.relative_to(ROOT).as_posix()
                              for path in (ROOT / "patches").glob("*.patch"))
     names = [Path(entry).name for entry in entries]
-    assert [name[:4] for name in names] == [f"{number:04d}" for number in range(1, 111)]
+    assert [name[:4] for name in names] == [f"{number:04d}" for number in range(1, 121)]
     for number, path in PATCHES.items():
         assert names[int(number) - 1] == path.name
 

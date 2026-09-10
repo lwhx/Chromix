@@ -43,7 +43,9 @@ test("default stealth args carry one seed and preserve the sandbox", () => {
 });
 
 test("context options: default viewport, explicit null, CDP emulation stripped", () => {
-  const ctx = buildContextOptions({ headless: true });
+  const ctx = buildContextOptions({ headless: true, args: [
+    "--uxr-screen-width=1920", "--uxr-screen-height=1080", "--uxr-taskbar-height=48",
+  ] });
   assert.equal(ctx.viewport?.width, 1920);
   assert.equal(ctx.viewport?.height, 947);
   assert.equal(buildContextOptions({ headless: true, viewport: null }).viewport, null);
@@ -95,7 +97,8 @@ export const chromium = {
   },
   launch: async (options) => {
     calls.push({ options });
-    return { ...context(options), newContext: async () => context(options) };
+    return { ...context(options), newContext: async (ctx) => ({ ...context(options), contextOptions: ctx }),
+             newPage: async (ctx) => ({ ...context(options), contextOptions: ctx }) };
   },
 };
 `);
@@ -254,6 +257,7 @@ test("concurrent async first launches publish only a complete seed", async (t) =
   try {
     const results = await Promise.all(Array.from({ length: 12 }, () => persistent(profile)));
     assert.equal(new Set(results.map(fingerprint)).size, 1);
+    assert.equal(new Set(results.map((args) => JSON.stringify(geometryArgs(args)))).size, 1);
     assert.equal(readFileSync(join(profile, SEED_FILE), "utf8"), `${fingerprint(results[0])}\n`);
   } finally {
     fsPromises.link = original;
@@ -343,4 +347,174 @@ test("separate Node processes converge on the same first seed", { timeout: 30000
   assert.equal(new Set(seeds).size, 1);
   assert.equal(seeds[0], `--fingerprint=${readFileSync(join(profile, SEED_FILE), "utf8").trim()}`);
   assert.deepEqual(readdirSync(profile), [SEED_FILE]);
+});
+
+test("font dir parser reproduces the bundled Windows families", async () => {
+  const { fontFamiliesInDir, fontDirWhitelistArg } = await import("../_fonts.js");
+  const { fileURLToPath } = await import("node:url");
+  const fontsDir = fileURLToPath(new URL("../../../assets/fonts", import.meta.url));
+  const families = fontFamiliesInDir(fontsDir);
+  assert.ok(families.length >= 50, `expected >= 50 families, got ${families.length}`);
+  for (const f of ["Arial", "Arial Narrow", "Calibri", "Cambria Math", "Consolas",
+                   "MS Gothic", "MS PGothic", "Segoe UI", "Segoe UI Light",
+                   "Tahoma", "Times New Roman", "Verdana", "Wingdings 3",
+                   "ＭＳ ゴシック"]) {
+    assert.ok(families.includes(f), `missing family: ${f}`);
+  }
+  const arg = fontDirWhitelistArg(fontsDir);
+  assert.ok(arg.startsWith("--uxr-font-whitelist="));
+  assert.ok(arg.includes("Segoe UI"));
+});
+
+test("persona geometry is complete, coherent and idempotent", async () => {
+  const { ensurePersonaGeometry, SCREEN_POOL } = await import("../_persona.js");
+  const r = ensurePersonaGeometry(undefined, () => 0.5);
+  const keys = new Set(r.switches.map((a) => a.split("=", 1)[0]));
+  for (const k of ["--uxr-screen-width", "--uxr-screen-height",
+                   "--uxr-device-pixel-ratio", "--uxr-taskbar-height",
+                   "--uxr-outer-width", "--uxr-outer-height"]) {
+    assert.ok(keys.has(k), k);
+  }
+  const g = r.geometry;
+  assert.equal(g.availHeight, g.height - g.taskbar);
+  assert.equal(g.innerHeight, g.availHeight - 85);
+  assert.ok(g.innerHeight >= 580);
+  assert.ok(SCREEN_POOL.some((s) => s[0] === g.width && s[2] === g.dpr));
+  const r2 = ensurePersonaGeometry(r.args, () => 0.1);
+  assert.deepEqual(r2.args, r.args, "idempotent");
+});
+
+test("persona geometry respects explicit values and dpr viewport", async () => {
+  const { ensurePersonaGeometry } = await import("../_persona.js");
+  const r = ensurePersonaGeometry(
+    ["--uxr-screen-width=1366", "--uxr-screen-height=768"], () => 0.5);
+  assert.equal(r.geometry.width, 1366);
+  assert.equal(r.geometry.height, 768);
+  assert.ok(!r.switches.some((a) => a.startsWith("--uxr-screen-width=")));
+  // forced pick of 1536x864@1.25 (roll 0.7) -> deviceScaleFactor-ready geometry
+  const r2 = ensurePersonaGeometry([], () => 0.7);
+  assert.equal(r2.geometry.dpr, 1.25);
+  assert.equal(r2.geometry.innerHeight, 731);
+  assert.ok(r2.switches.includes("--uxr-device-pixel-ratio=1.25"));
+});
+
+test("context viewport comes from the same persona pick per options object", () => {
+  const opts = { args: [] };
+  const c1 = buildContextOptions(opts);
+  const c2 = buildContextOptions(opts);
+  assert.deepEqual(c1.viewport, c2.viewport, "one pick per options object");
+  assert.ok(c1.viewport.width > 0 && c1.viewport.height >= 580);
+  // explicit viewport wins
+  const c3 = buildContextOptions({ viewport: null, args: [] });
+  assert.equal(c3.viewport, null);
+});
+
+function geometryArgs(args) {
+  return args.filter((a) => /^--uxr-(screen-|outer-|taskbar-|device-pixel)/.test(a));
+}
+
+for (const [seed, width, height, taskbar] of [[1, 1920, 1200, 48], [42, 1680, 1050, 40],
+                                           [101, 1600, 900, 40], [4294967295, 1920, 1080, 40]]) {
+  test(`seeded geometry cross-SDK vector: ${seed}`, async () => {
+    const { ensurePersonaGeometry } = await import("../_persona.js");
+    const first = ensurePersonaGeometry([`--fingerprint=${seed}`]);
+    const second = ensurePersonaGeometry([`--fingerprint=${seed}`]);
+    assert.deepEqual(first, second);
+    assert.deepEqual([first.geometry.width, first.geometry.height, first.geometry.taskbar],
+                     [width, height, taskbar]);
+  });
+}
+
+test("persistent geometry follows the saved seed before context construction", async (t) => {
+  const profile = offline(t);
+  writeFileSync(join(profile, SEED_FILE), "42\n");
+  const first = await persistent(profile);
+  const firstOptions = calls.at(-1).options;
+  const second = await persistent(profile);
+  assert.deepEqual(geometryArgs(first), geometryArgs(second));
+  assert.deepEqual(firstOptions.viewport, { width: 1680, height: 925 });
+  assert.deepEqual(calls.at(-1).options.viewport, firstOptions.viewport);
+  assert.equal(readFileSync(join(profile, SEED_FILE), "utf8"), "42\n");
+});
+
+test("launch and context options share geometry with DPR at context level", async (t) => {
+  offline(t);
+  const options = { args: ["--fingerprint=42", "--uxr-device-pixel-ratio=1.25"] };
+  const context = buildContextOptions(options);
+  const launch = await fixtureApi.buildLaunchOptions(options);
+  assert.deepEqual(context.viewport, { width: 1680, height: 925 });
+  assert.equal(context.deviceScaleFactor, 1.25);
+  assert.equal(context.viewport.deviceScaleFactor, undefined);
+  assert.ok(launch.args.includes("--uxr-screen-width=1680"));
+  options.args = ["--fingerprint=1"];
+  assert.deepEqual(buildContextOptions(options).viewport, { width: 1920, height: 1067 });
+  const nested = buildContextOptions({ ...options, contextOptions: { viewport: { width: 800, height: 600 } } });
+  assert.deepEqual(nested.viewport, { width: 800, height: 600 });
+});
+
+test("browser newPage and newContext inherit geometry but allow explicit overrides", async (t) => {
+  offline(t);
+  const options = { args: ["--fingerprint=42", "--uxr-device-pixel-ratio=1.25"] };
+  const browser = await fixtureApi.launch(options);
+  for (const method of ["newPage", "newContext"]) {
+    const context = await browser[method]();
+    assert.deepEqual(context.contextOptions.viewport, { width: 1680, height: 925 });
+    assert.equal(context.contextOptions.deviceScaleFactor, 1.25);
+    const native = await browser[method]({ viewport: null });
+    assert.equal(native.contextOptions.viewport, null);
+    assert.equal(native.contextOptions.deviceScaleFactor, undefined);
+  }
+  await browser.close();
+  const reused = {};
+  const first = await fixtureApi.launch(reused), second = await fixtureApi.launch(reused);
+  assert.notEqual(fingerprint(first.options.args), fingerprint(second.options.args));
+  await first.close(); await second.close();
+});
+
+test("disabled stealth and fingerprint off do not inject geometry", async (t) => {
+  offline(t);
+  for (const options of [{ stealthArgs: false }, { args: ["--fingerprint=off"] }]) {
+    assert.deepEqual(geometryArgs((await fixtureApi.buildLaunchOptions(options)).args), []);
+  }
+});
+
+test("screen aliases, explicit outer size and headed window remain coherent", async (t) => {
+  offline(t);
+  const options = { headless: false, args: ["--fingerprint=42", "--fingerprint-screen-width=1366",
+    "--fingerprint-screen-height=768", "--uxr-taskbar-height=0", "--uxr-outer-width=1000", "--uxr-outer-height=700"] };
+  const launch = await fixtureApi.buildLaunchOptions(options);
+  assert.ok(!launch.args.some((a) => a.startsWith("--uxr-screen-width=")));
+  assert.ok(launch.args.includes("--window-size=1000,700"));
+  assert.equal(buildContextOptions(options).viewport, null);
+  assert.deepEqual(buildContextOptions({ ...options, headless: true }).viewport, { width: 1000, height: 615 });
+  const sized = { headless: false, args: ["--fingerprint=42", "--window-size=800,600"] };
+  const sizedLaunch = await fixtureApi.buildLaunchOptions(sized);
+  assert.ok(sizedLaunch.args.includes("--uxr-outer-width=800"));
+  assert.ok(sizedLaunch.args.includes("--uxr-outer-height=600"));
+  assert.ok(!sizedLaunch.args.includes("--start-maximized"));
+});
+
+test("font directory reaches launch args and isolated Fontconfig paths", async (t) => {
+  const root = offline(t);
+  const { linuxFontEnv } = await import("../_fonts.js");
+  const fontsDir = new URL("../../../assets/fonts", import.meta.url).pathname;
+  const launch = await fixtureApi.buildLaunchOptions({ fontsDir, launchOptions: { env: { FIXTURE: "yes" } } });
+  assert.ok(launch.args.some((a) => a.startsWith("--uxr-font-whitelist=") && a.includes("Arial")));
+  assert.equal(launch.env.FIXTURE, "yes");
+  const override = await fixtureApi.buildLaunchOptions({ fontsDir, args: ["--uxr-font-whitelist=Custom"] });
+  assert.deepEqual(override.args.filter((a) => a.startsWith("--uxr-font-whitelist=")), ["--uxr-font-whitelist=Custom"]);
+  if (process.platform === "linux") {
+    const first = linuxFontEnv("unused", join(root, "one & two")).FONTCONFIG_FILE;
+    const before = readFileSync(first, "utf8");
+    const second = linuxFontEnv("unused", join(root, "other")).FONTCONFIG_FILE;
+    t.after(() => { rmSync(first, { force: true }); rmSync(second, { force: true }); });
+    assert.notEqual(first, second);
+    assert.match(before, /one &amp; two/);
+    assert.equal(readFileSync(first, "utf8"), before);
+  }
+});
+
+test("published Node package includes its persona import", () => {
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  assert.ok(pkg.files.includes("_persona.js"));
 });

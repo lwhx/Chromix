@@ -232,6 +232,70 @@ def test_persona_new_file_patch_applies_and_reverses(persona_sources, number):
     assert persona_sources[number].startswith("// Copyright 2026.\n")
 
 
+def test_config_stub_typed_numeric_parsers(tmp_path):
+    if CXX is None:
+        pytest.skip("a local C++20 compiler is required")
+    support = CPP_SUPPORT[:CPP_SUPPORT.index("namespace wgpu {")]
+    source = tmp_path / "config.cc"
+    source.write_text(support + r'''
+int main() {
+  base::UxrConfig config;
+  int integer = 7;
+  uint64_t seed = 7;
+  double real = 7;
+  assert(!config.GetInt("missing", &integer) && integer == 7);
+  assert(!config.GetUint64("missing", &seed) && seed == 7);
+  assert(!config.GetDouble("missing", &real) && real == 7);
+  for (const char* raw : {"", "+", "-", "+-1", "++1", "--1", " 1", "1 ",
+                          "1x", "abc", "0x10", "9999999999999999999999999999999999999999"}) {
+    config.values["value"] = raw;
+    assert(!config.GetInt("value", &integer));
+    assert(!config.GetUint64("value", &seed));
+  }
+  for (const char* raw : {"", "+", "-", "+-1", "++1", "--1", " 1", "1 ",
+                          "1x", "abc", "0x10", "nan", "inf", "-inf", "1e309"}) {
+    config.values["value"] = raw;
+    assert(!config.GetDouble("value", &real));
+  }
+  for (int value : {std::numeric_limits<int>::min(), -1, 0, 1,
+                    std::numeric_limits<int>::max()}) {
+    config.values["value"] = std::to_string(value);
+    assert(config.GetInt("value", &integer) && integer == value);
+  }
+  for (const char* raw : {"2147483648", "-2147483649", "1.5", "1e2"}) {
+    config.values["value"] = raw;
+    assert(!config.GetInt("value", &integer));
+  }
+  config.values["value"] = "18446744073709551615";
+  assert(config.GetUint64("value", &seed) && seed == std::numeric_limits<uint64_t>::max());
+  for (const char* raw : {"-0", "-1", "18446744073709551616", "1.5", "1e2"}) {
+    config.values["value"] = raw;
+    assert(!config.GetUint64("value", &seed));
+  }
+  config.values["value"] = "+42";
+  assert(config.GetInt("value", &integer) && integer == 42);
+  assert(config.GetUint64("value", &seed) && seed == 42);
+  assert(config.GetDouble("value", &real) && real == 42);
+  config.values["value"] = "+1.5e2";
+  assert(config.GetDouble("value", &real) && real == 150);
+  config.values["value"] = "-0.25";
+  assert(config.GetDouble("value", &real) && real == -0.25);
+  config.values["value"] = "1.7976931348623157e308";
+  assert(config.GetDouble("value", &real) && real == std::numeric_limits<double>::max());
+  config.values["value"] = std::string("1\0x", 3);
+  assert(!config.GetInt("value", &integer));
+  assert(!config.GetUint64("value", &seed));
+  assert(!config.GetDouble("value", &real));
+}
+''')
+    binary = tmp_path / "config"
+    result = subprocess.run([CXX, "-std=c++20", "-O0", "-Wall", "-Wextra", "-Werror",
+                             str(source), "-o", str(binary)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 SIMULATED_PLATFORMS = {
     "windows-x86_64": ("IS_WIN", "ARCH_CPU_X86_64"),
     "windows-x86": ("IS_WIN", "ARCH_CPU_X86"),
@@ -674,6 +738,8 @@ CPP_SUPPORT = r'''
 #include <algorithm>
 #include <bit>
 #include <cassert>
+#include <charconv>
+#include <cmath>
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
@@ -717,9 +783,27 @@ struct UxrConfig {
   std::map<std::string, std::string> values;
   static UxrConfig& GetInstance() { static UxrConfig config; return config; }
   bool Has(const std::string& key) const { return values.contains(key); }
+  template <typename T> bool GetNumber(const std::string& key, T* out) const {
+    auto it = values.find(key);
+    if (it == values.end()) return false;
+    const std::string& raw = it->second;
+    const char* begin = raw.data();
+    const char* end = begin + raw.size();
+    if (begin != end && *begin == '+') {
+      ++begin;
+      if (begin != end && (*begin == '+' || *begin == '-')) return false;
+    }
+    auto result = std::from_chars(begin, end, *out);
+    return result.ec == std::errc() && result.ptr == end;
+  }
   bool GetInt(const std::string& key, int* out) const {
-    auto it = values.find(key); if (it == values.end()) return false;
-    try { *out = std::stoi(it->second); return true; } catch (...) { return false; }
+    return GetNumber(key, out);
+  }
+  bool GetDouble(const std::string& key, double* out) const {
+    return GetNumber(key, out) && std::isfinite(*out);
+  }
+  bool GetUint64(const std::string& key, uint64_t* out) const {
+    return GetNumber(key, out);
   }
   std::string Get(const std::string& key) const {
     auto it = values.find(key); return it == values.end() ? "" : it->second;

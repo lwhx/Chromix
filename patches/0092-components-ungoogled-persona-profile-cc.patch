@@ -9,10 +9,10 @@ new file mode 100644
 +#include <array>
 +#include <cstddef>
 +#include <cstdint>
++#include <limits>
 +#include <mutex>
 +#include <random>
 +
-+#include "base/strings/string_number_conversions.h"
 +#include "base/strings/string_util.h"
 +#include "base/uxr_config.h"
 +#include "build/build_config.h"
@@ -59,10 +59,10 @@ new file mode 100644
 +
 +uint64_t SeedFromConfig(const base::UxrConfig& config) {
 +  uint64_t seed = 0;
-+  std::string raw = config.Get("uxr-fingerprint-seed");
-+  if (raw.empty())
-+    raw = config.Get("uxr-canvas-seed");
-+  if (raw.empty() || !base::StringToUint64(raw, &seed))
++  const char* key = config.Get("uxr-fingerprint-seed").empty()
++                        ? "uxr-canvas-seed"
++                        : "uxr-fingerprint-seed";
++  if (!config.GetUint64(key, &seed))
 +    return 0;
 +  return seed;
 +}
@@ -107,8 +107,8 @@ new file mode 100644
 +                   const char* key,
 +                   float* value) {
 +  double parsed = 0.0;
-+  const std::string raw = config.Get(key);
-+  if (!raw.empty() && base::StringToDouble(raw, &parsed) && parsed >= 0.0)
++  if (config.GetDouble(key, &parsed) && parsed >= 0.0 &&
++      parsed <= std::numeric_limits<float>::max())
 +    *value = static_cast<float>(parsed);
 +}
 +

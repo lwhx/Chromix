@@ -12,7 +12,7 @@ index 3b1a90d..dd0b2d9 100644
  #include "build/build_config.h"
  #include "skia/ext/font_utils.h"
  #include "third_party/blink/public/common/features.h"
-@@ -79,6 +82,75 @@
+@@ -79,6 +82,112 @@
  
  namespace blink {
  
@@ -31,6 +31,43 @@ index 3b1a90d..dd0b2d9 100644
 +      return true;
 +  }
 +  return false;
++}
++
++const char* UxrSystemFontSubstitute(const AtomicString& family) {
++  const std::string persona =
++      base::UxrConfig::GetInstance().Get("uxr-platform");
++  if ((!base::EqualsCaseInsensitiveASCII(persona, "windows") &&
++       !base::EqualsCaseInsensitiveASCII(persona, "win32")) ||
++      !base::UxrConfig::GetInstance().Get("uxr-font-whitelist").empty()) {
++    return nullptr;
++  }
++
++  static constexpr struct {
++    const char* generic;
++    const char* family;
++  } kWindowsGenericFamilies[] = {
++      {"system-ui", "Segoe UI"},
++      {"sans-serif", "Arial"},
++      {"serif", "Times New Roman"},
++      {"monospace", "Consolas"},
++      {"emoji", "Segoe UI Emoji"},
++      {"cursive", "Comic Sans MS"},
++      {"fantasy", "Impact"},
++      {"math", "Cambria Math"},
++      {"ui-monospace", "Consolas"},
++      {"ui-serif", "Times New Roman"},
++      {"ui-sans-serif", "Segoe UI"},
++      {"ui-rounded", "Segoe UI"},
++      {"-webkit-body", "Times New Roman"},
++      {"-webkit-pictograph", "Segoe UI Emoji"},
++      {"-webkit-system-font", "Segoe UI"},
++      {"-webkit-control", "Segoe UI"}};
++  const std::string requested = family.GetString().Utf8();
++  for (const auto& entry : kWindowsGenericFamilies) {
++    if (base::EqualsCaseInsensitiveASCII(entry.generic, requested))
++      return entry.family;
++  }
++  return nullptr;
 +}
 +
 +bool UxrFontFamilyAllowed(const AtomicString& family) {
@@ -88,14 +125,26 @@ index 3b1a90d..dd0b2d9 100644
  const char kColorEmojiLocale[] = "und-Zsye";
  const char kMonoEmojiLocale[] = "und-Zsym";
  
-@@ -156,6 +228,15 @@ const FontPlatformData* FontCache::GetFontPlatformData(
+@@ -156,6 +265,27 @@ const FontPlatformData* FontCache::GetFontPlatformData(
      const FontDescription& font_description,
      const FontFaceCreationParams& creation_params,
      AlternateFontName alternate_font_name) {
-+  // Restrict only native family lookup. Downloaded faces, unique-name lookup,
-+  // and last-resort fallback retain normal Blink behavior.
++  // Only CSS family lookup substitutes generics; src:local() stays exact.
 +  if (creation_params.CreationType() == kCreateFontByFamily &&
-+      alternate_font_name != AlternateFontName::kLocalUniqueFace &&
++      (alternate_font_name == AlternateFontName::kAllowAlternate ||
++       alternate_font_name == AlternateFontName::kNoAlternate)) {
++    if (const char* ux_sub = UxrSystemFontSubstitute(creation_params.Family())) {
++      if (const FontPlatformData* data = GetFontPlatformData(
++              font_description, FontFaceCreationParams(AtomicString(ux_sub)),
++              alternate_font_name)) {
++        return data;
++      }
++    }
++  }
++
++  // Filter native families and src:local() probes. Downloaded faces and
++  // last-resort fallback retain normal Blink behavior.
++  if (creation_params.CreationType() == kCreateFontByFamily &&
 +      alternate_font_name != AlternateFontName::kLastResort &&
 +      !UxrFontFamilyAllowed(creation_params.Family())) {
 +    return nullptr;

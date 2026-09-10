@@ -2,7 +2,7 @@
 
 The small source fixtures are independent of patch bodies and build caches.
 Optional full-series smoke: set CHROMIX_RESTORED_SMOKE_ROOT (containing
-macos/upstream and windows/upstream), CHROMIX_RESTORED_SMOKE_CORE and
+linux/upstream, macos/upstream and windows/upstream), CHROMIX_RESTORED_SMOKE_CORE and
 CHROMIX_RESTORED_SMOKE_WINDOWS to pre-domain-substitution input trees.
 """
 from __future__ import annotations
@@ -28,12 +28,12 @@ PATCHES = {
     "0033": "0033-third_party-blink-renderer-core-html-canvas-text_metrics-cc.patch",
     "0047": "0047-third_party-blink-renderer-platform-fonts-font_cache-cc.patch",
 }
-# Original functional additions, excluding empty lines only; indentation is hashed.
+# Expected functional additions, excluding empty lines only; indentation is hashed.
 ADDITION_HASHES = {
     "0018": "938125a87df94a17835e9efe3c344f813688ed5f6cdaf6657845a8953c105e1c",
     "0031": "9f2c6d746caf9289e97c04a6136ea5295076713ef92ea800b3caade0e15284d1",
     "0033": "61b5b3ae456468cdf8ee6a901a1014d77dfef2880c9d64588bdd1f0a59980fce",
-    "0047": "4692e6aa285951ec94060c8dccbd6945ab9479f84a5121976afe2d90a42df204",
+    "0047": "1d453ce398caed30c76bff4f7878fad8c21017435d981c39ff7d838647769bd9",
 }
 
 # Line numbers and snippets come from pinned pre-Chromix sources, not the diffs.
@@ -372,6 +372,41 @@ def test_small_domain_restored_series(tmp_path, platform):
     assert arp.run_apply(src, repo, core, tooling, platform, PATCH_BIN, check=True)["status"] == "checked"
 
 
+def patch_application_signature(data):
+    arp.transform_patch(data, set(), [])
+    lines = []
+    for line in data.splitlines(keepends=True):
+        if line.startswith(b"index "):
+            continue
+        if line.startswith(b"@@ "):
+            line = b"@@\n"
+        lines.append(line)
+    return hashlib.sha256(b"".join(lines)).digest()
+
+
+def test_series_has_no_duplicate_applications():
+    series = [line.split("#", 1)[0].strip()
+              for line in (REPO / "patches/series").read_text().splitlines()]
+    series = [name for name in series if name]
+    assert len(series) == len(set(series))
+    assert {REPO / name for name in series} == set((REPO / "patches").glob("*.patch"))
+    assert [int(Path(name).name[:4]) for name in series] == list(range(1, len(series) + 1))
+    seen = {}
+    for name in series:
+        signature = patch_application_signature((REPO / name).read_bytes())
+        assert signature not in seen, f"duplicate application: {seen.get(signature)} and {name}"
+        seen[signature] = name
+
+
+def test_duplicate_signature_ignores_index_and_hunk_locations():
+    original = (REPO / "patches/0119-time-clamper-persona.patch").read_bytes()
+    relocated = re.sub(rb"^@@ -\d+", b"@@ -999", original, flags=re.M)
+    relocated = re.sub(rb"(?m)^(diff --git [^\n]+\n)",
+                       rb"\1index 1234567..89abcde 100644\n", relocated)
+    assert original != relocated
+    assert patch_application_signature(original) == patch_application_signature(relocated)
+
+
 @pytest.mark.parametrize("platform", ["linux", "macos", "windows"])
 def test_full_series_on_supplied_sparse_upstream(tmp_path, platform):
     names = ("CHROMIX_RESTORED_SMOKE_ROOT", "CHROMIX_RESTORED_SMOKE_CORE", "CHROMIX_RESTORED_SMOKE_WINDOWS")
@@ -384,7 +419,8 @@ def test_full_series_on_supplied_sparse_upstream(tmp_path, platform):
     tooling = windows if platform == "windows" else core
     series = [line.split("#", 1)[0].strip() for line in (REPO / "patches/series").read_text().splitlines()]
     series = [name for name in series if name]
-    assert len(series) == 110
+    assert series
+    assert len(series) == len(set(series))
     targets = set()
     patch_stats = {}
     for name in series:
@@ -428,7 +464,7 @@ def test_full_series_on_supplied_sparse_upstream(tmp_path, platform):
             path.write_bytes(arp._substitute(text, rules).encode(encoding))
     result = arp.run_apply(restored, REPO, core, tooling, platform, PATCH_BIN)
     assert result["status"] == "applied"
-    assert result["patch_count"] == 110
+    assert result["patch_count"] == len(series)
     assert arp.run_apply(restored, REPO, core, tooling, platform, PATCH_BIN)["status"] == "skipped"
     assert arp.run_apply(restored, REPO, core, tooling, platform, PATCH_BIN, check=True)["status"] == "checked"
     for name in targets:

@@ -1,0 +1,39 @@
+diff --git a/third_party/blink/renderer/modules/battery/battery_manager.cc b/third_party/blink/renderer/modules/battery/battery_manager.cc
+--- a/third_party/blink/renderer/modules/battery/battery_manager.cc
++++ b/third_party/blink/renderer/modules/battery/battery_manager.cc
+@@ -13,6 +13,9 @@
+ #include "third_party/blink/renderer/core/frame/navigator.h"
+ #include "third_party/blink/renderer/core/frame/web_feature.h"
+ #include "third_party/blink/renderer/modules/battery/battery_dispatcher.h"
++#include "base/uxr_config.h"
++#include "base/strings/string_number_conversions.h"
++#include <algorithm>
+ 
+ namespace blink {
+ 
+@@ -100,6 +103,25 @@
+ 
+   BatteryStatus old_status = battery_status_;
+   battery_status_ = *battery_dispatcher_->LatestData();
++  // Keep the exposed BatteryManager state stable and persona-controlled.
++  // The same value is used for getters and change-event comparisons.
++  auto& config = base::UxrConfig::GetInstance();
++  bool charging = battery_status_.Charging();
++  double level = battery_status_.Level();
++  double seconds = battery_status_.discharging_time().InSecondsF();
++  double charging_seconds = battery_status_.charging_time().InSecondsF();
++  if (config.Get("uxr-battery-charging") == "true") charging = true;
++  if (config.Get("uxr-battery-charging") == "false") charging = false;
++  double configured_level = 0.0;
++  if (base::StringToDouble(config.Get("uxr-battery-level"), &configured_level))
++    level = std::clamp(configured_level, 0.0, 1.0);
++  base::TimeDelta discharging = battery_status_.discharging_time();
++  base::TimeDelta charging_time = battery_status_.charging_time();
++  if (base::StringToDouble(config.Get("uxr-battery-charging-time"), &charging_seconds) && charging_seconds >= 0)
++    charging_time = base::Seconds(charging_seconds);
++  if (base::StringToDouble(config.Get("uxr-battery-discharging-time"), &seconds) && seconds >= 0)
++    discharging = base::Seconds(seconds);
++  battery_status_ = BatteryStatus(charging, charging_time, discharging, level);
+ 
+   if (battery_property_->GetState() == BatteryProperty::kPending) {
+     battery_property_->Resolve(this);

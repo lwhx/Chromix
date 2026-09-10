@@ -31,7 +31,8 @@ from typing import Any, TypedDict
 from ._binary import (
     _CACHE, _CHANNELS, _binary_path, _bundle_complete, _download, _host, resolve_platform,
 )
-from ._fonts import apply_font_env
+from ._fonts import apply_font_env, font_dir_whitelist_arg
+from ._persona import ensure_persona_geometry
 from .humanize import HumanConfig, HumanConfigOverrides, HumanPreset, resolve_human_config
 
 __all__ = [
@@ -363,7 +364,7 @@ _ua_warned = False
 
 def _prepare(headless, proxy, args, stealth_args, timezone, locale, geoip,
              extension_paths, start_maximized, browser_version=None,
-             release_channel=None):
+             release_channel=None, fonts_dir=None):
     binary = ensure_binary(browser_version=browser_version,
                            release_channel=release_channel)
     timezone, locale, exit_ip = maybe_resolve_geoip(geoip, proxy, timezone, locale, args)
@@ -378,11 +379,23 @@ def _prepare(headless, proxy, args, stealth_args, timezone, locale, geoip,
         cdm = find_cdm()
         if cdm:
             args = list(args or []) + [widevine_flag(cdm)]
+    if fonts_dir:
+        whitelist = font_dir_whitelist_arg(fonts_dir)
+        if whitelist:
+            args = [whitelist] + list(args or [])
+        else:
+            sys.stderr.write(f"[chromix] fonts_dir={fonts_dir}: no parseable fonts found\n")
     chrome_args = build_args(stealth_args, (args or []) + proxy_extra,
                              timezone=timezone, locale=locale, headless=headless,
                              extension_paths=extension_paths,
                              start_maximized=start_maximized)
-    return binary, chrome_args, proxy_kwargs
+    geometry = None
+    if stealth_args and "--fingerprint=off" not in chrome_args:
+        chrome_args, geometry = ensure_persona_geometry(chrome_args)
+        if not headless and not any(a.split("=", 1)[0] == "--window-size" for a in chrome_args):
+            chrome_args = [a for a in chrome_args if a != "--start-maximized"]
+            chrome_args.append(f"--window-size={geometry['outer_width']},{geometry['outer_height']}")
+    return binary, chrome_args, proxy_kwargs, geometry
 
 
 def _patch_close(closeable, pw):
@@ -428,6 +441,29 @@ def _wrap_new_page(browser, humanize: bool, cfg_factory):
     browser.new_page = new_page
 
 
+def _wrap_geometry(browser, geometry, headless, asynchronous=False):
+    browser._chromix_geometry = geometry
+    if geometry is None:
+        return
+
+    def wrap(original):
+        if asynchronous:
+            async def call(*args, **kwargs):
+                kwargs = _split_context_kwargs(_VIEWPORT_UNSET, None, None, None,
+                                                kwargs, geometry=geometry, headless=headless)
+                return await original(*args, **kwargs)
+        else:
+            def call(*args, **kwargs):
+                kwargs = _split_context_kwargs(_VIEWPORT_UNSET, None, None, None,
+                                                kwargs, geometry=geometry, headless=headless)
+                return original(*args, **kwargs)
+        return call
+
+    for name in ("new_page", "new_context"):
+        if hasattr(browser, name):
+            setattr(browser, name, wrap(getattr(browser, name)))
+
+
 def launch(headless: bool = True,
            proxy: str | ProxySettings | None = None,
            args: list[str] | None = None,
@@ -450,11 +486,12 @@ def launch(headless: bool = True,
     """
     from playwright.sync_api import sync_playwright
 
-    binary, chrome_args, proxy_kwargs = _prepare(
+    fonts_dir = kwargs.pop("fonts_dir", None)
+    binary, chrome_args, proxy_kwargs, geometry = _prepare(
         headless, proxy, args, stealth_args, timezone, locale, geoip,
         extension_paths, start_maximized=not _suppress_maximize,
-        browser_version=browser_version, release_channel=release_channel)
-    apply_font_env(binary, kwargs)
+        browser_version=browser_version, release_channel=release_channel, fonts_dir=fonts_dir)
+    apply_font_env(binary, kwargs, fonts_dir=fonts_dir)
 
     pw = sync_playwright().start()
     try:
@@ -465,6 +502,7 @@ def launch(headless: bool = True,
         pw.stop()
         raise
     _patch_close(browser, pw)
+    _wrap_geometry(browser, geometry, headless)
     _wrap_new_page(browser, humanize,
                    lambda: resolve_human_config(human_preset, human_config))
     return browser
@@ -488,11 +526,12 @@ async def launch_async(headless: bool = True,
     """Async variant of launch(); returns an async Playwright Browser."""
     from playwright.async_api import async_playwright
 
-    binary, chrome_args, proxy_kwargs = _prepare(
+    fonts_dir = kwargs.pop("fonts_dir", None)
+    binary, chrome_args, proxy_kwargs, geometry = _prepare(
         headless, proxy, args, stealth_args, timezone, locale, geoip,
         extension_paths, start_maximized=True,
-        browser_version=browser_version, release_channel=release_channel)
-    apply_font_env(binary, kwargs)
+        browser_version=browser_version, release_channel=release_channel, fonts_dir=fonts_dir)
+    apply_font_env(binary, kwargs, fonts_dir=fonts_dir)
     pw = await async_playwright().start()
     try:
         browser = await pw.chromium.launch(
@@ -509,6 +548,7 @@ async def launch_async(headless: bool = True,
         finally:
             await pw.stop()
     browser.close = _close
+    _wrap_geometry(browser, geometry, headless, asynchronous=True)
     if humanize:
         from .humanize import patch_page
         orig_np = browser.new_page
@@ -521,7 +561,8 @@ async def launch_async(headless: bool = True,
     return browser
 
 
-def _split_context_kwargs(viewport, locale, color_scheme, user_agent, kwargs):
+def _split_context_kwargs(viewport, locale, color_scheme, user_agent, kwargs,
+                          geometry=None, headless=True):
     """Assemble new_context() kwargs from dedicated params + **kwargs."""
     global _ua_warned
     if user_agent and not _ua_warned:
@@ -532,9 +573,15 @@ def _split_context_kwargs(viewport, locale, color_scheme, user_agent, kwargs):
     if viewport is not _VIEWPORT_UNSET:
         ctx_kwargs["viewport"] = viewport
     elif ("viewport" not in ctx_kwargs and "no_viewport" not in ctx_kwargs):
-        # Headless: fixed 1080p-maximized-Chrome viewport keeps outer==inner
-        # coherent; headed callers pass viewport=None for the real window.
-        ctx_kwargs.setdefault("viewport", DEFAULT_VIEWPORT)
+        ctx_kwargs["viewport"] = (
+            {"width": geometry.get("outer_width", geometry["width"]),
+             "height": geometry["inner_height"]} if geometry else DEFAULT_VIEWPORT
+        ) if headless else None
+    if "viewport" in ctx_kwargs and ctx_kwargs["viewport"] is None:
+        ctx_kwargs.setdefault("no_viewport", True)
+    if (ctx_kwargs.get("viewport") is not None and not ctx_kwargs.get("no_viewport")
+            and geometry and geometry["dpr"] != 1):
+        ctx_kwargs.setdefault("device_scale_factor", geometry["dpr"])
     if locale:
         ctx_kwargs.setdefault("locale", locale)
     if color_scheme:
@@ -567,16 +614,16 @@ def launch_context(headless: bool = True,
     All **kwargs (viewport, geolocation, permissions, ...) go to
     ``browser.new_context()`` exactly as in CloakBrowser.
     """
-    ctx_kwargs = _split_context_kwargs(viewport, locale, color_scheme, user_agent, kwargs)
-    browser_kwargs = {}
-    if "env" in ctx_kwargs:
-        browser_kwargs["env"] = ctx_kwargs.pop("env")
+    fonts_dir = kwargs.pop("fonts_dir", None)
+    browser_kwargs = {"env": kwargs.pop("env")} if "env" in kwargs else {}
     browser = launch(headless=headless, proxy=proxy, args=args, stealth_args=stealth_args,
                      timezone=timezone, locale=locale, geoip=geoip, humanize=humanize,
                      human_preset=human_preset, human_config=human_config,
                      extension_paths=extension_paths, license_key=license_key,
                      browser_version=browser_version, release_channel=release_channel,
-                     _suppress_maximize=True, **browser_kwargs)
+                     _suppress_maximize=True, fonts_dir=fonts_dir, **browser_kwargs)
+    ctx_kwargs = _split_context_kwargs(viewport, locale, color_scheme, user_agent, kwargs,
+                                       geometry=browser._chromix_geometry, headless=headless)
     ctx = browser.new_context(**ctx_kwargs)
     orig_close = ctx.close
 
@@ -612,13 +659,15 @@ def launch_persistent_context(user_data_dir: str | os.PathLike,
     from playwright.sync_api import sync_playwright
 
     args = _persistent_args(user_data_dir, stealth_args, args)
-    ctx_kwargs = _split_context_kwargs(viewport, locale, color_scheme, user_agent, kwargs)
-    binary, chrome_args, proxy_kwargs = _prepare(
+    fonts_dir = kwargs.pop("fonts_dir", None)
+    binary, chrome_args, proxy_kwargs, geometry = _prepare(
         headless, proxy, args, stealth_args, timezone, locale, geoip,
         extension_paths, start_maximized=False,
-        browser_version=browser_version, release_channel=release_channel)
+        browser_version=browser_version, release_channel=release_channel, fonts_dir=fonts_dir)
+    ctx_kwargs = _split_context_kwargs(viewport, locale, color_scheme, user_agent, kwargs,
+                                       geometry=geometry, headless=headless)
     launch_kwargs = {"env": ctx_kwargs.pop("env")} if "env" in ctx_kwargs else {}
-    apply_font_env(binary, launch_kwargs)
+    apply_font_env(binary, launch_kwargs, fonts_dir=fonts_dir)
     pw = sync_playwright().start()
     try:
         ctx = pw.chromium.launch_persistent_context(
@@ -648,6 +697,14 @@ async def launch_context_async(**kw: Any) -> Any:
     """Async launch_context — same options, returns an async BrowserContext."""
     from playwright.async_api import async_playwright
 
+    headless = kw.get("headless", True)
+    fonts_dir = kw.get("fonts_dir")
+    binary, chrome_args, proxy_kwargs, geometry = _prepare(
+        headless, kw.get("proxy"), kw.get("args"), kw.get("stealth_args", True),
+        kw.get("timezone"), kw.get("locale"), kw.get("geoip", False),
+        kw.get("extension_paths"), start_maximized=True,
+        browser_version=kw.get("browser_version"), release_channel=kw.get("release_channel"),
+        fonts_dir=fonts_dir)
     ctx_kwargs = _split_context_kwargs(kw.get("viewport", _VIEWPORT_UNSET),
                                        kw.get("locale"), kw.get("color_scheme"),
                                        kw.get("user_agent"),
@@ -656,16 +713,13 @@ async def launch_context_async(**kw: Any) -> Any:
                                            "user_agent", "viewport", "locale", "timezone",
                                            "color_scheme", "geoip", "humanize",
                                            "human_preset", "human_config",
-                                           "extension_paths", "license_key",
-                                           "browser_version", "release_channel")})
-    headless = kw.get("headless", True)
-    binary, chrome_args, proxy_kwargs = _prepare(
-        headless, kw.get("proxy"), kw.get("args"), kw.get("stealth_args", True),
-        kw.get("timezone"), kw.get("locale"), kw.get("geoip", False),
-        kw.get("extension_paths"), start_maximized=True,
-        browser_version=kw.get("browser_version"), release_channel=kw.get("release_channel"))
+                                           "extension_paths", "license_key", "fonts_dir",
+                                           "browser_version", "release_channel")},
+                                       geometry=geometry, headless=headless)
     launch_kwargs = dict(proxy_kwargs)
-    apply_font_env(binary, launch_kwargs)
+    if "env" in ctx_kwargs:
+        launch_kwargs["env"] = ctx_kwargs.pop("env")
+    apply_font_env(binary, launch_kwargs, fonts_dir=fonts_dir)
     pw = await async_playwright().start()
     try:
         browser = await pw.chromium.launch(
@@ -705,6 +759,14 @@ async def launch_persistent_context_async(**kw: Any) -> Any:
 
     user_data_dir = kw.get("user_data_dir")
     args = _persistent_args(user_data_dir, kw.get("stealth_args", True), kw.get("args"))
+    headless = kw.get("headless", True)
+    fonts_dir = kw.get("fonts_dir")
+    binary, chrome_args, proxy_kwargs, geometry = _prepare(
+        headless, kw.get("proxy"), args, kw.get("stealth_args", True),
+        kw.get("timezone"), kw.get("locale"), kw.get("geoip", False),
+        kw.get("extension_paths"), start_maximized=False,
+        browser_version=kw.get("browser_version"), release_channel=kw.get("release_channel"),
+        fonts_dir=fonts_dir)
     ctx_kwargs = _split_context_kwargs(kw.get("viewport", _VIEWPORT_UNSET),
                                        kw.get("locale"), kw.get("color_scheme"),
                                        kw.get("user_agent"),
@@ -713,16 +775,11 @@ async def launch_persistent_context_async(**kw: Any) -> Any:
                                            "stealth_args", "user_agent", "viewport",
                                            "locale", "timezone", "color_scheme", "geoip",
                                            "humanize", "human_preset", "human_config",
-                                           "extension_paths", "license_key",
-                                           "browser_version", "release_channel")})
-    headless = kw.get("headless", True)
-    binary, chrome_args, proxy_kwargs = _prepare(
-        headless, kw.get("proxy"), args, kw.get("stealth_args", True),
-        kw.get("timezone"), kw.get("locale"), kw.get("geoip", False),
-        kw.get("extension_paths"), start_maximized=False,
-        browser_version=kw.get("browser_version"), release_channel=kw.get("release_channel"))
+                                           "extension_paths", "license_key", "fonts_dir",
+                                           "browser_version", "release_channel")},
+                                       geometry=geometry, headless=headless)
     launch_kwargs = {"env": ctx_kwargs.pop("env")} if "env" in ctx_kwargs else {}
-    apply_font_env(binary, launch_kwargs)
+    apply_font_env(binary, launch_kwargs, fonts_dir=fonts_dir)
     pw = await async_playwright().start()
     try:
         ctx = await pw.chromium.launch_persistent_context(
