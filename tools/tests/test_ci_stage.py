@@ -1041,7 +1041,20 @@ class RestoredSourceUpdateRegressionTest(unittest.TestCase):
         self.assertIn("RecordWebGLOp(50u", bridge)
         self.assertNotIn("kBridgeDisabledCanvasId", bridge)
         self.assertIn("canvas_id == kBridgeDisabledCanvasId", lifecycle)
-        self.assertIn("bridge_substituted = true", readback)
+        added_readback = "\n".join(
+            line[1:] for line in readback.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        )
+        removed_readback = "\n".join(
+            line[1:] for line in readback.splitlines()
+            if line.startswith("-") and not line.startswith("---")
+        )
+        self.assertIn("ContextGL()->ReadPixels(x, y, width, height, format, type, data);", readback)
+        self.assertIn("std::memcpy(data, remote->data(), remote->size());", removed_readback)
+        self.assertNotIn("std::memcpy", added_readback)
+        self.assertNotIn("GetImageDataCacheFirst", added_readback)
+        self.assertNotIn("bridge_substituted", added_readback)
+        self.assertNotIn("ApplyCanvasNoise", added_readback)
         self.assertIn("Preserve the native query path", fingerprint)
         self.assertIn("GetGLRendererStringForFingerprint", fingerprint)
 

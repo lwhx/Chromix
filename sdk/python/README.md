@@ -97,15 +97,38 @@ browser = launch(args=[
     "--fingerprint-devtools-runtime-suppression",
     "--fingerprint-canvas-bridge=127.0.0.1:9228",
     "--fingerprint-canvas-bridge-unsafe",
-    "--fingerprint-webrtc-fake-srflx=203.0.113.20",
-    "--fingerprint-webrtc-fake-srflx-allow-udp",
 ])
 ```
 
 Runtime suppression can break console/binding-based automation. Canvas Bridge
 removes the sandbox from bridge renderer processes and forwards canvas/WebGL
-operations to the configured endpoint. Fake srflx does not enable non-proxied
-UDP unless the separate `allow-udp` flag is supplied.
+operations to the configured endpoint.
+
+### Proxy and GeoIP behavior
+
+GeoIP is metadata, not a routing mechanism. The lookup uses the effective
+HTTP/HTTPS proxy and does not inherit environment proxies or `NO_PROXY`
+bypasses. Failed lookups do not fall back to the host connection. SOCKS
+remains a browser proxy option; use `geoip=False` and explicit `timezone`
+/ `locale` for SOCKS.
+
+With a proxy, the SDK defaults to the native
+`--force-webrtc-ip-handling-policy=disable_non_proxied_udp` unless an explicit
+native policy was supplied. This does not guarantee the routing of all DNS,
+HTTP, QUIC or operating-system traffic.
+
+The SDK rejects `--fingerprint-webrtc-ip`, `--fingerprint-webrtc-fake-srflx`
+and `--fingerprint-webrtc-fake-srflx-allow-udp` (including `uxr` equivalents).
+GeoIP no longer appends an ICE address override. Its HTTP metadata service
+is unauthenticated and must not be treated as proof of an exit route.
+
+GeoIP lookup failures now raise `ValueError`. The timeout defaults to 10
+seconds and accepts values greater than zero and at most 60. Python's
+synchronous DNS/connection setup cannot always be interrupted at that
+deadline; a late connection is rejected before sending the GeoIP request.
+IANA timezone data must be installed for timezone validation. Creating a
+later context with another proxy does not recompute browser-level locale
+or timezone.
 
 ## CLI
 

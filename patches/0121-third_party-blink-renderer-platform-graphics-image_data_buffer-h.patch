@@ -1,0 +1,11 @@
+diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.h b/third_party/blink/renderer/platform/graphics/image_data_buffer.h
+--- a/third_party/blink/renderer/platform/graphics/image_data_buffer.h
++++ b/third_party/blink/renderer/platform/graphics/image_data_buffer.h
+@@ -60,6 +60,7 @@
+   base::span<const uint8_t> PixelData() const;
++  const SkPixmap& GetPixmap() const { return pixmap_; }
+ 
+  private:
+   ImageDataBuffer(const SkPixmap&);
+   ImageDataBuffer(scoped_refptr<StaticBitmapImage>);
+ 

@@ -175,6 +175,11 @@ def test_all_callback_routes_preserve_native_control_flow(patched_source, name):
         assert actual.count(assignment) == 1
         assert actual.index(assignment) < actual.index("decode_history_service_->GetPerfInfo(")
         actual = actual.replace(assignment, "")
+        fallback_access = "    info->setKeySystemAccess(access);\n"
+        assert actual.count(fallback_access) == 2
+        fallback_start = actual.index("if (!EnsurePerfHistoryService(")
+        assert actual.index(fallback_access, fallback_start) < actual.index(call)
+        actual = actual[:fallback_start] + actual[fallback_start:].replace(fallback_access, "", 1)
     else:
         for setter in re.finditer(r"info->set(?:Supported|Smooth|PowerEfficient)\(", actual):
             assert setter.start() < actual.index(call)
@@ -187,6 +192,16 @@ def test_all_callback_routes_preserve_native_control_flow(patched_source, name):
             assert actual.index(assignment) < actual.index("if (!is_supported")
             assert "BindOnce(&MediaCapabilities::OnWebrtcPerfHistoryInfo," in actual
             actual = actual.replace(assignment, "")
+            lifecycle_guard = (
+                "  ExecutionContext* execution_context =\n"
+                "      pending_cb->resolver->GetExecutionContext();\n"
+                "  if (!execution_context || execution_context->IsContextDestroyed()) {\n"
+                "    pending_cb_map_.erase(callback_id);\n"
+                "    return;\n"
+                "  }\n")
+            assert actual.count(lifecycle_guard) == 1
+            assert actual.index(lifecycle_guard) < actual.index("if (!is_supported")
+            actual = actual.replace(lifecycle_guard, "")
         if name.startswith("OnWebrtc"):
             assert actual.index(call) < actual.index("if (type == OperationType::kEncoding)")
             assert "DowncastTo<MediaCapabilitiesInfo>()" in actual
@@ -427,6 +442,45 @@ bool WebrtcEncodeForceSmoothIfPowerEfficient() {
 bool UseGpuFactoriesForPowerEfficient(
     ExecutionContext* execution_context,
     const MediaKeySystemAccess* key_system_access) {
+'''),
+    (702, r'''void OnMediaCapabilitiesEncodingInfo(
+    ScriptPromiseResolver<MediaCapabilitiesInfo>* resolver,
+    std::unique_ptr<WebMediaCapabilitiesInfo> result) {
+  if (!resolver->GetExecutionContext() ||
+      resolver->GetExecutionContext()->IsContextDestroyed()) {
+    return;
+  }
+
+  auto* info = MediaCapabilitiesInfo::Create();
+  info->setSupported(result->supported);
+  info->setSmooth(result->smooth);
+  info->setPowerEfficient(result->power_efficient);
+
+  resolver->Resolve(std::move(info));
+}
+'''),
+    (1121, r'''  DCHECK_EQ(config->type(), V8MediaEncodingType::Enum::kRecord);
+  DCHECK(RuntimeEnabledFeatures::MediaCapabilitiesEncodingInfoEnabled());
+
+  auto task_runner = resolver->GetExecutionContext()->GetTaskRunner(
+      TaskType::kInternalMediaRealTime);
+  if (auto* handler = MakeGarbageCollected<MediaRecorderHandler>(
+          task_runner, KeyFrameRequestProcessor::Configuration())) {
+    task_runner->PostTask(
+        FROM_HERE, blink::BindOnce(&MediaRecorderHandler::EncodingInfo,
+                                   WrapPersistent(handler),
+                                   ToWebMediaConfiguration(config),
+                                   BindOnce(&OnMediaCapabilitiesEncodingInfo,
+                                            WrapPersistent(resolver))));
+
+    return promise;
+  }
+
+  DVLOG(2) << __func__ << " Could not get MediaRecorderHandler.";
+  MediaCapabilitiesInfo* info = CreateEncodingInfoWith(false);
+  resolver->Resolve(info);
+  return promise;
+}
 '''),
     (1335, r'''void MediaCapabilities::GetPerfInfo(
     media::VideoCodec video_codec,

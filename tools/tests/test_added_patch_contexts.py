@@ -249,10 +249,9 @@ def test_media_chain_preserves_browser_enumeration(patched_sources):
 
 def test_webgpu_native_fallback_and_single_declarations(patched_sources):
     source = patched_sources["0114"]
-    for include in ('#include <string>', '#include "base/uxr_config.h"'):
-        assert source.count(include) == 1
     assert "command_line" not in source
-    assert 'UxrConfig::GetInstance().Get("uxr-webgpu-canvas-format")' in source
+    assert "uxr-webgpu-canvas-format" not in source
+    assert "base::UxrConfig" not in source
     assert source[source.index("#if BUILDFLAG(IS_ANDROID)"):] == source_fixture("0114")[
         source_fixture("0114").index("#if BUILDFLAG(IS_ANDROID)"):]
 
@@ -521,14 +520,10 @@ int main(int argc, char** argv) {
   const std::string test = argv[1];
   if (test == "webgpu") {
     const auto native = IS_LINUX ? wgpu::TextureFormat::RGBA8Unorm : wgpu::TextureFormat::BGRA8Unorm;
-    for (const std::string value : {"", "invalid", "RGBA8Unorm"}) {
+    for (const std::string value : {"", "invalid", "RGBA8Unorm", "rgba8unorm", "bgra8unorm"}) {
       config.values["uxr-webgpu-canvas-format"] = value;
       assert(GPU::GetPreferredCanvasFormat() == native);
     }
-    config.values["uxr-webgpu-canvas-format"] = "rgba8unorm";
-    assert(GPU::GetPreferredCanvasFormat() == wgpu::TextureFormat::RGBA8Unorm);
-    config.values["uxr-webgpu-canvas-format"] = "bgra8unorm";
-    assert(GPU::GetPreferredCanvasFormat() == wgpu::TextureFormat::BGRA8Unorm);
   } else if (test == "audio") {
     config.values["uxr-audio-base-latency"] = "999";
     config.values["uxr-audio-output-latency"] = "999";

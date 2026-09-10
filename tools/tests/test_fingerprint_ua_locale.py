@@ -147,6 +147,71 @@ int main() {
 ''')
 
 
+def test_seed_normalization_preserves_uint64_and_off(tmp_path):
+    text = additions(36)
+    seed = block(text, '    if (command_line->HasSwitch("fingerprint"))')
+    off = block(text, '    if (command_line->HasSwitch("fingerprint") &&\n        command_line->GetSwitchValueASCII("fingerprint") == "off")')
+    compile_and_run(tmp_path, COMMAND_LINE_STUB + r'''
+#include <cstdint>
+namespace base {
+uint64_t random_value;
+uint64_t RandUint64() { return random_value; }
+std::string NumberToString(uint64_t value) { return std::to_string(value); }
+}
+void Normalize(base::CommandLine* command_line) {
+''' + seed + '\n' + off + r'''
+}
+int main() {
+  base::CommandLine cmd;
+  for (const uint64_t value : {UINT64_C(1), UINT64_C(4294967296), UINT64_MAX}) {
+    const auto expected = std::to_string(value);
+    cmd.values = {{"fingerprint", ""}};
+    base::random_value = value;
+    Normalize(&cmd);
+    for (const auto* key : {"uxr-fingerprint-seed", "uxr-canvas-seed", "uxr-audio-seed"})
+      assert(cmd.GetSwitchValueASCII(key) == expected);
+    cmd.values = {{"fingerprint", expected}};
+    base::random_value = 1;
+    Normalize(&cmd);
+    assert(cmd.GetSwitchValueASCII("uxr-fingerprint-seed") == expected);
+  }
+  cmd.values = {{"fingerprint", ""}};
+  base::random_value = 0;
+  Normalize(&cmd);
+  assert(cmd.GetSwitchValueASCII("uxr-canvas-seed") == "1");
+  cmd.values = {{"fingerprint", ""}, {"uxr-fingerprint-seed", "18446744073709551615"}};
+  Normalize(&cmd);
+  assert(cmd.GetSwitchValueASCII("uxr-canvas-seed") == "18446744073709551615");
+  cmd.values = {{"fingerprint", ""}, {"uxr-canvas-seed", "4294967296"}};
+  Normalize(&cmd);
+  assert(cmd.GetSwitchValueASCII("uxr-fingerprint-seed") == "4294967296");
+  cmd.values = {{"fingerprint", "42"}, {"uxr-canvas-seed", "7"}, {"uxr-audio-seed", "9"}};
+  Normalize(&cmd);
+  assert(cmd.GetSwitchValueASCII("uxr-fingerprint-seed") == "42");
+  assert(cmd.GetSwitchValueASCII("uxr-canvas-seed") == "7");
+  assert(cmd.GetSwitchValueASCII("uxr-audio-seed") == "9");
+  cmd.values["fingerprint"] = "off";
+  cmd.values["force-webrtc-ip-handling-policy"] = "disable_non_proxied_udp";
+  cmd.values["fingerprint-webrtc-ip"] = "203.0.113.20";
+  Normalize(&cmd);
+  assert(!cmd.HasSwitch("uxr-fingerprint-seed"));
+  assert(!cmd.HasSwitch("uxr-canvas-seed"));
+  assert(!cmd.HasSwitch("uxr-audio-seed"));
+  assert(!cmd.HasSwitch("uxr-webrtc-policy"));
+  assert(cmd.HasSwitch("uxr-webgl-real"));
+  assert(cmd.HasSwitch("uxr-disable-fingerprint-noise"));
+  assert(cmd.GetSwitchValueASCII("force-webrtc-ip-handling-policy") == "disable_non_proxied_udp");
+}
+''')
+
+
+def test_retired_candidate_flags_do_not_reconfigure_browser_routing():
+    text = additions(36)
+    for retired in ("fingerprint-webrtc-ip", "fingerprint-webrtc-fake-srflx",
+                    "uxr-webrtc-fake-srflx", "uxr-webrtc-policy"):
+        assert retired not in text
+
+
 def test_brand_override_replaces_optional_brand_without_growing_list(tmp_path):
     text = additions(4)
     brand_override = text.index('  if (command_line->HasSwitch("uxr-ua-brand"))')

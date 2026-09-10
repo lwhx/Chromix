@@ -33,6 +33,10 @@ from ._binary import (
 )
 from ._fonts import apply_font_env, font_dir_whitelist_arg
 from ._persona import ensure_persona_geometry
+from ._network import (
+    extract_proxy_url as _extract_proxy_url, geoip_http as _geoip_http,
+    network_args as _network_args, split_proxy as _split_proxy,
+)
 from .humanize import HumanConfig, HumanConfigOverrides, HumanPreset, resolve_human_config
 
 __all__ = [
@@ -214,6 +218,7 @@ def build_args(stealth_args: bool,
 
     Priority: stealth defaults < user args < dedicated timezone/locale params.
     """
+    extra_args = _network_args(extra_args)
     seen: dict[str, str] = {}
     if stealth_args:
         for arg in get_default_stealth_args():
@@ -241,38 +246,8 @@ def build_args(stealth_args: bool,
 
 
 # ---------------------------------------------------------------------------
-# GeoIP + WebRTC exit IP
+# GeoIP metadata (never used to synthesize WebRTC candidates)
 # ---------------------------------------------------------------------------
-
-def _geoip_http(proxy_url: str | None) -> tuple[str | None, str | None, str | None] | None:
-    timeout = float(os.environ.get("CLOAKBROWSER_GEOIP_TIMEOUT_SECONDS", 10))
-    url = "http://ip-api.com/json/?fields=status,timezone,countryCode,query"
-    try:
-        if proxy_url:
-            handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
-            opener = urllib.request.build_opener(handler)
-        else:
-            opener = urllib.request.build_opener()
-        with opener.open(url, timeout=timeout) as r:
-            data = json.load(r)
-        if data.get("status") == "success":
-            cc = (data.get("countryCode") or "").lower()
-            return data.get("timezone"), cc or None, data.get("query")
-    except Exception:
-        pass
-    return None
-
-
-def _extract_proxy_url(proxy: str | ProxySettings | None) -> str | None:
-    if not proxy:
-        return None
-    if isinstance(proxy, str):
-        return proxy
-    url = proxy["server"]
-    if proxy.get("username") and proxy.get("password"):
-        scheme, rest = url.split("://", 1) if "://" in url else ("http", url)
-        url = f"{scheme}://{proxy['username']}:{proxy['password']}@{rest}"
-    return url
 
 
 def maybe_resolve_geoip(geoip: bool,
@@ -283,21 +258,22 @@ def maybe_resolve_geoip(geoip: bool,
     """Auto-fill timezone/locale from the egress IP; returns (tz, locale, exit_ip).
 
     Explicit params (or raw flags in ``args``) always win over geoip results.
+    Explicit proxy ignores environment/bypass settings; absent proxy means direct.
+    Lookup errors raise ValueError; the returned IP does not control routing.
     """
     if not geoip:
         return timezone, locale, None
     if timezone is None and args:
         for a in args:
-            if a.startswith("--fingerprint-timezone="):
+            if a.startswith(("--fingerprint-timezone=", "--uxr-timezone=")):
                 timezone = a.split("=", 1)[1]
     if locale is None and args:
         for a in args:
-            if a.startswith(("--lang=", "--fingerprint-locale=")):
+            if a.startswith(("--lang=", "--fingerprint-locale=", "--uxr-locale=")):
                 locale = a.split("=", 1)[1]
     res = _geoip_http(_extract_proxy_url(proxy))
     if not res:
-        sys.stderr.write("[chromix] geoip lookup failed; timezone/locale unchanged\n")
-        return timezone, locale, None
+        raise ValueError("GeoIP lookup failed; no direct fallback")
     geo_tz, geo_locale, exit_ip = res
     if timezone is None:
         timezone = geo_tz
@@ -306,52 +282,10 @@ def maybe_resolve_geoip(geoip: bool,
     return timezone, locale, exit_ip
 
 
-def _resolve_webrtc_args(args: list[str] | None,
-                         proxy: str | ProxySettings | None) -> list[str] | None:
-    """Replace --fingerprint-webrtc-ip=auto with the resolved proxy exit IP."""
-    if not args or "--fingerprint-webrtc-ip=auto" not in args:
-        return args
-    args = list(args)
-    proxy_url = _extract_proxy_url(proxy)
-    if not proxy_url:
-        sys.stderr.write("[chromix] --fingerprint-webrtc-ip=auto requires a proxy; removing flag\n")
-        args.remove("--fingerprint-webrtc-ip=auto")
-        return args
-    res = _geoip_http(proxy_url)
-    exit_ip = res[2] if res else None
-    if exit_ip:
-        args[args.index("--fingerprint-webrtc-ip=auto")] = f"--fingerprint-webrtc-ip={exit_ip}"
-    else:
-        args.remove("--fingerprint-webrtc-ip=auto")
-    return args
-
-
-def _append_webrtc_exit_ip(args: list[str] | None, exit_ip: str | None) -> list[str] | None:
-    if exit_ip and not (args and any(a.startswith("--fingerprint-webrtc-ip") for a in args)):
-        args = list(args or [])
-        args.append(f"--fingerprint-webrtc-ip={exit_ip}")
-    return args
-
-
 def _resolve_proxy_config(proxy: str | ProxySettings | None) -> tuple[dict, list[str]]:
-    """Split a proxy into Playwright kwargs + extra CLI args."""
-    if not proxy:
-        return {}, []
-    if isinstance(proxy, str):
-        scheme, rest = (proxy.split("://", 1) + [""])[:2] if "://" in proxy else ("http", proxy)
-        if "@" in rest:
-            creds, host = rest.rsplit("@", 1)
-            username, _, password = creds.partition(":")
-            pw = {"server": f"{scheme}://{host}", "username": username}
-            if password:
-                pw["password"] = password
-            return {"proxy": pw}, []
-        return {"proxy": {"server": proxy}}, []
-    pw = {"server": proxy["server"]}
-    for k in ("bypass", "username", "password"):
-        if proxy.get(k):
-            pw[k] = proxy[k]
-    return {"proxy": pw}, []
+    """Normalize URL credentials into Playwright's separate auth fields."""
+    config = _split_proxy(proxy)
+    return ({"proxy": config} if config else {}), []
 
 
 # ---------------------------------------------------------------------------
@@ -365,12 +299,11 @@ _ua_warned = False
 def _prepare(headless, proxy, args, stealth_args, timezone, locale, geoip,
              extension_paths, start_maximized, browser_version=None,
              release_channel=None, fonts_dir=None):
+    args = _network_args(args, proxy)
+    proxy_kwargs, proxy_extra = _resolve_proxy_config(proxy)
+    timezone, locale, _ = maybe_resolve_geoip(geoip, proxy, timezone, locale, args)
     binary = ensure_binary(browser_version=browser_version,
                            release_channel=release_channel)
-    timezone, locale, exit_ip = maybe_resolve_geoip(geoip, proxy, timezone, locale, args)
-    proxy_kwargs, proxy_extra = _resolve_proxy_config(proxy)
-    args = _resolve_webrtc_args(args, proxy)
-    args = _append_webrtc_exit_ip(args, exit_ip)
     # Widevine / DRM: enabled automatically when a CDM is present (same policy
     # as CloakBrowser). Opt out with CLOAKBROWSER_WIDEVINE=0.
     if os.environ.get("CLOAKBROWSER_WIDEVINE", "1") not in ("0", "false", "False") and \

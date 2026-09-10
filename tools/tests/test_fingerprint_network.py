@@ -92,9 +92,9 @@ def test_retirement_is_one_comment_and_preserves_120_slots():
     assert not re.search(r"uxr|persona|StringToDouble", patch, re.I)
     series = [line for line in (ROOT / "patches/series").read_text().splitlines()
               if line.strip() and not line.startswith("#")]
-    assert [Path(line).name[:4] for line in series] == [f"{i:04d}" for i in range(1, 121)]
+    assert [Path(line).name[:4] for line in series] == [f"{i:04d}" for i in range(1, 125)]
     assert series[22] == PATCH.relative_to(ROOT).as_posix()
-    assert len(list((ROOT / "patches").glob("[0-9][0-9][0-9][0-9]-*.patch"))) == 120
+    assert len(list((ROOT / "patches").glob("[0-9][0-9][0-9][0-9]-*.patch"))) == 124
 
 
 @pytest.mark.parametrize("context", [

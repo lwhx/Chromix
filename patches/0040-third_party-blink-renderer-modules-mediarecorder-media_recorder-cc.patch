@@ -1,80 +1,21 @@
 diff --git a/third_party/blink/renderer/modules/mediarecorder/media_recorder.cc b/third_party/blink/renderer/modules/mediarecorder/media_recorder.cc
-index c84e540318..f9f9964cec 100644
 --- a/third_party/blink/renderer/modules/mediarecorder/media_recorder.cc
 +++ b/third_party/blink/renderer/modules/mediarecorder/media_recorder.cc
-@@ -7,7 +7,10 @@
- #include <algorithm>
- #include <limits>
- 
-+#include "base/strings/string_split.h"  // UXR
-+#include "base/strings/string_util.h"  // UXR
- #include "base/time/time.h"
-+#include "base/uxr_config.h"  // UXR
- #include "third_party/blink/public/platform/platform.h"
- #include "third_party/blink/public/platform/task_type.h"
- #include "third_party/blink/renderer/bindings/core/v8/dictionary.h"
-@@ -389,6 +391,64 @@ void MediaRecorder::requestData(ExceptionState& exception_state) {
+@@ -305,6 +305,9 @@
+   if (!recorder_handler_->Start(time_slice, content_type.GetType(),
+                                 audio_bits_per_second_,
+                                 video_bits_per_second_)) {
++    // Start may have registered observers before rejecting the tracks.
++    state_ = State::kInactive;
++    recorder_handler_->Stop();
+     exception_state.ThrowDOMException(
+         DOMExceptionCode::kNotSupportedError,
+         "There was an error starting the MediaRecorder.");
+@@ -389,6 +392,7 @@
  
  bool MediaRecorder::isTypeSupported(ExecutionContext* context,
                                      const String& type) {
-+  // UXR: opt-in declaration matrix for common desktop-Chrome containers.
-+  // Parse every codec token exactly; accepting a request because one token
-+  // contains a known codec name makes isTypeSupported disagree with start().
-+  {
-+    const std::string ph_matrix =
-+        base::UxrConfig::GetInstance().Get("uxr-codec-matrix");
-+    if (!ph_matrix.empty()) {
-+      const std::string ph_type = type.ToAsciiLower().Utf8();
-+      const std::string ph_container = ph_type.substr(0, ph_type.find(';'));
-+      const size_t ph_codecs_at = ph_type.find("codecs=");
-+      std::string ph_codecs =
-+          ph_codecs_at == std::string::npos ? "" : ph_type.substr(ph_codecs_at + 7);
-+      if (ph_codecs.size() >= 2u && ph_codecs.front() == '"' &&
-+          ph_codecs.back() == '"') {
-+        ph_codecs = ph_codecs.substr(1, ph_codecs.size() - 2u);
-+      }
-+      const std::vector<std::string> ph_tokens = base::SplitString(
-+          ph_codecs, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_NONEMPTY);
-+      const auto ph_matches = [](const std::string& ph_token,
-+                                 const char* ph_prefix) {
-+        return base::StartsWith(ph_token, ph_prefix,
-+                                base::CompareCase::INSENSITIVE_ASCII);
-+      };
-+      bool ph_known_container = true;
-+      bool ph_supported = true;
-+      for (const auto& ph_token : ph_tokens) {
-+        bool ph_codec_supported = false;
-+        if (ph_container == "video/webm") {
-+          ph_codec_supported = ph_matches(ph_token, "vp8") ||
-+                               ph_matches(ph_token, "vp9") ||
-+                               ph_matches(ph_token, "vp09") ||
-+                               ph_matches(ph_token, "av01") ||
-+                               ph_matches(ph_token, "opus");
-+        } else if (ph_container == "audio/webm") {
-+          ph_codec_supported = ph_matches(ph_token, "opus");
-+        } else if (ph_container == "video/mp4") {
-+          ph_codec_supported = ph_matches(ph_token, "avc1") ||
-+                               ph_matches(ph_token, "avc3") ||
-+                               ph_matches(ph_token, "vp09") ||
-+                               ph_matches(ph_token, "av01") ||
-+                               ph_matches(ph_token, "mp4a.40");
-+        } else if (ph_container == "audio/mp4") {
-+          ph_codec_supported = ph_matches(ph_token, "mp4a.40");
-+        } else if (ph_container == "video/x-matroska") {
-+          ph_codec_supported = ph_matches(ph_token, "avc1") ||
-+                               ph_matches(ph_token, "avc3");
-+        } else {
-+          ph_known_container = false;
-+          break;
-+        }
-+        ph_supported = ph_supported && ph_codec_supported;
-+      }
-+      if (ph_known_container) {
-+        return ph_supported;
-+      }
-+    }
-+  }
-+
++  // Use the same MIME parser and encoder checks as native initialization.
    MediaRecorderHandler* handler = MakeGarbageCollected<MediaRecorderHandler>(
        context->GetTaskRunner(TaskType::kInternalMediaRealTime),
        KeyFrameRequestProcessor::Configuration());

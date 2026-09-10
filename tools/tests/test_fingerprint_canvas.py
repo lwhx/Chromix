@@ -113,7 +113,7 @@ def test_includes_and_bounded_scope(patched_sources):
     assert patched_sources["0031"].count("UxrCopyAndNoiseEncodeBuffer(pixmap_, retained_image_)") == 2
     series = [line.strip() for line in (ROOT / "patches/series").read_text().splitlines()
               if line.strip() and not line.lstrip().startswith("#")]
-    assert [Path(line).name[:4] for line in series] == [f"{i:04d}" for i in range(1, 121)]
+    assert [Path(line).name[:4] for line in series] == [f"{i:04d}" for i in range(1, 125)]
     for number in ("0020", "0031"):
         assert series[int(number) - 1] == patch_path(number).relative_to(ROOT).as_posix()
 
@@ -177,7 +177,8 @@ def runtime_binary(tmp_path_factory, patched_sources):
 
 
 @pytest.mark.parametrize("case", ["transparent-oob", "coordinates", "channels", "native", "padding",
-                                  "constructors", "lifetime", "failures", "repeat"])
+                                  "constructors", "lifetime", "failures", "repeat", "uint64-seeds",
+                                  "uint64-high-bits", "legacy-seeds"])
 def test_extracted_noise_and_copy(runtime_binary, case):
     result = subprocess.run([str(runtime_binary), case], text=True, capture_output=True, timeout=15)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -261,8 +262,10 @@ struct UxrConfig {
   bool Has(const char* key) const { assert(std::string(key) == "uxr-disable-fingerprint-noise"); return disabled; }
   std::string Get(const char* key) const { assert(std::string(key) == "uxr-canvas-seed"); return seed; }
 };
-bool StringToUint(const std::string& text, uint32_t* value) {
-  auto result = std::from_chars(text.data(), text.data() + text.size(), *value);
+bool StringToUint64(const std::string& text, uint64_t* value) {
+  const char* start = text.data();
+  if (!text.empty() && text.front() == '+') ++start;
+  auto result = std::from_chars(start, text.data() + text.size(), *value);
   return result.ec == std::errc() && result.ptr == text.data() + text.size();
 }
 template<class T> std::unique_ptr<T> WrapUnique(T* ptr) { return std::unique_ptr<T>(ptr); }
@@ -281,6 +284,11 @@ struct SkImageInfo {
   SkAlphaType alphaType() const { return at; }
   int refColorSpace() const { return 0; }
   bool isEmpty() const { return w <= 0 || h <= 0; }
+  SkImageInfo makeAlphaType(SkAlphaType alpha) const { auto info = *this; info.at = alpha; return info; }
+  bool validRowBytes(size_t rb) const {
+    const size_t bpp = ct == kRGBA_F16_SkColorType ? 8 : 4;
+    return rb >= minRowBytes() && rb % bpp == 0;
+  }
   size_t minRowBytes() const { return size_t(w) * (ct == kRGBA_F16_SkColorType ? 8 : 4); }
   size_t computeByteSize(size_t rb) const {
     if (isEmpty()) return 0;
@@ -305,6 +313,13 @@ struct SkPixmap {
   const void* addr() const { return address; }
   void* writable_addr() const { return const_cast<void*>(address); }
   void reset() { *this = {}; }
+  bool readPixels(const SkImageInfo& info, void* dst, size_t row) const {
+    for (int y = 0; y < info.h; ++y)
+      std::memcpy(static_cast<uint8_t*>(dst) + size_t(y) * row,
+                  static_cast<const uint8_t*>(addr()) + size_t(y) * rowBytes(),
+                  info.minRowBytes());
+    return true;
+  }
 };
 int allocation_count = 0, fail_allocation = 0, raster_count = 0, fail_raster = 0;
 struct SkData {
@@ -425,7 +440,8 @@ uint8_t Expected(uint8_t v, uint32_t seed, uint32_t x, uint32_t y, uint32_t ch) 
   z ^= z >> 16;
   return uint8_t(std::clamp(int(v) + ((z & 1) ? 1 : -1), 0, 255));
 }
-void CheckPixels(Fixture& f, const SkPixmap& result, uint32_t sx = 0, uint32_t sy = 0) {
+void CheckPixels(Fixture& f, const SkPixmap& result, uint32_t sx = 0, uint32_t sy = 0,
+                 uint32_t seed = 12345) {
   auto actual = gfx::SkPixmapToSpan(result);
   for (int y = 0; y < f.info.h; ++y) for (int x = 0; x < f.info.w; ++x) {
     size_t a = size_t(y) * result.rowBytes() + size_t(x) * 4;
@@ -433,7 +449,7 @@ void CheckPixels(Fixture& f, const SkPixmap& result, uint32_t sx = 0, uint32_t s
     assert(actual[a + 3] == f.bytes[b + 3]);
     for (uint32_t c = 0; c < 3; ++c) {
       size_t i = f.info.ct == kBGRA_8888_SkColorType ? 2 - c : c;
-      uint8_t expected = f.bytes[b + 3] == 0 ? f.bytes[b + i] : Expected(f.bytes[b + i], 12345, sx + uint32_t(x), sy + uint32_t(y), c);
+      uint8_t expected = f.bytes[b + 3] == 0 ? f.bytes[b + i] : Expected(f.bytes[b + i], seed, sx + uint32_t(x), sy + uint32_t(y), c);
       assert(actual[a + i] == expected);
     }
   }
@@ -478,9 +494,92 @@ int main(int argc, char** argv) {
       size_t p = size_t(y) * rgba.rb + size_t(x) * 4;
       assert(rgba.bytes[p] == bgra.bytes[p + 2]); assert(rgba.bytes[p + 2] == bgra.bytes[p]);
     }
+  } else if (test == "uint64-seeds") {
+    const std::pair<uint64_t, uint32_t> vectors[] = {
+        {1, 1}, {12345, 12345}, {UINT32_MAX, UINT32_MAX},
+        {uint64_t{1} << 32, 0x469913f8u}, {uint64_t{1} << 63, 0x6448276au},
+        {UINT64_MAX, 0x9c0ff28bu}};
+    for (auto [seed64, folded] : vectors) {
+      auto& config = base::UxrConfig::GetInstance(); config.seed = std::to_string(seed64);
+      for (auto ct : {kRGBA_8888_SkColorType, kBGRA_8888_SkColorType}) {
+        Fixture original(ct, 12, 8), output = original;
+        auto before = original.bytes;
+        ImageData data{output.pm()}; ReadNoise(&data, 0, 0);
+        CheckPixels(original, output.pm(), 0, 0, folded);
+        assert(output.bytes != before);
+        for (int mode = -1; mode < 4; ++mode) {
+          auto encoded = mode < 0 ? ImageDataBuffer::Create(original.pm()) : ImageDataBuffer::Create(original.image(mode));
+          assert(encoded); CheckPixels(original, encoded->pixmap_, 0, 0, folded);
+          assert(original.bytes == before);
+        }
+        for (int sx : {INT_MIN, -3, 0, INT_MAX}) for (int sy : {INT_MIN, -2, 0, INT_MAX}) {
+          Fixture shifted = original; ImageData read{shifted.pm()}; ReadNoise(&read, sx, sy);
+          CheckPixels(original, shifted.pm(), uint32_t(sx), uint32_t(sy), folded);
+        }
+        Fixture crop(ct, 4, 3);
+        for (int y = 0; y < 3; ++y)
+          std::copy_n(original.bytes.begin() + size_t(y + 2) * original.rb + 12, 16, crop.bytes.begin() + size_t(y) * crop.rb);
+        ImageData read_crop{crop.pm()}; ReadNoise(&read_crop, 3, 2);
+        auto encoded = ImageDataBuffer::Create(original.pm()); assert(encoded);
+        auto pixels = gfx::SkPixmapToSpan(encoded->pixmap_);
+        for (int y = 0; y < 3; ++y)
+          assert(std::equal(crop.bytes.begin() + size_t(y) * crop.rb, crop.bytes.begin() + size_t(y) * crop.rb + 16,
+                            pixels.begin() + size_t(y + 2) * encoded->pixmap_.rowBytes() + 12));
+      }
+      Fixture rgba, bgra(kBGRA_8888_SkColorType);
+      for (int y = 0; y < rgba.info.h; ++y) for (int x = 0; x < rgba.info.w; ++x) {
+        size_t p = size_t(y) * bgra.rb + size_t(x) * 4;
+        std::copy_n(rgba.bytes.begin() + p, 4, bgra.bytes.begin() + p);
+        std::swap(bgra.bytes[p], bgra.bytes[p + 2]);
+      }
+      auto a = ImageDataBuffer::Create(rgba.pm()), b = ImageDataBuffer::Create(bgra.pm()); assert(a && b);
+      auto av = Bytes(a->pixmap_), bv = Bytes(b->pixmap_);
+      for (int y = 0; y < rgba.info.h; ++y) for (int x = 0; x < rgba.info.w; ++x) {
+        size_t p = size_t(y) * rgba.rb + size_t(x) * 4;
+        assert(av[p] == bv[p + 2] && av[p + 1] == bv[p + 1] && av[p + 2] == bv[p] && av[p + 3] == bv[p + 3]);
+      }
+      config.seed = "000" + std::to_string(seed64);
+      auto leading_zero = ImageDataBuffer::Create(rgba.pm()); assert(leading_zero);
+      assert(Bytes(leading_zero->pixmap_) == av);
+      config.disabled = true;
+      ImageData native{rgba.pm()}; auto before = rgba.bytes; ReadNoise(&native, 0, 0);
+      auto disabled = ImageDataBuffer::Create(rgba.pm()); assert(disabled);
+      assert(Bytes(disabled->pixmap_) == Bytes(rgba.pm()) && rgba.bytes == before);
+      config.disabled = false;
+    }
+  } else if (test == "uint64-high-bits") {
+    Fixture f(kRGBA_8888_SkColorType, 12, 8); auto before = f.bytes;
+    auto& config = base::UxrConfig::GetInstance(); config.seed = "12345";
+    auto old = ImageDataBuffer::Create(f.pm()); assert(old);
+    std::vector<std::vector<uint8_t>> signatures{Bytes(old->pixmap_)};
+    for (int bit = 32; bit < 64; ++bit) {
+      for (uint64_t low : {uint64_t{0}, uint64_t{12345}}) {
+        config.seed = std::to_string((uint64_t{1} << bit) | low);
+        auto encoded = ImageDataBuffer::Create(f.pm()); assert(encoded);
+        auto current = Bytes(encoded->pixmap_);
+        assert(current != Bytes(f.pm()));
+        for (const auto& prior : signatures) assert(current != prior);
+        signatures.push_back(current);
+        Fixture read = f; ImageData data{read.pm()}; ReadNoise(&data, 0, 0);
+        assert(Bytes(read.pm()) == current && f.bytes == before);
+      }
+    }
+  } else if (test == "legacy-seeds") {
+    std::vector<uint32_t> seeds{1u, 12345u, 0x7fffffffu, 0x80000000u, UINT32_MAX};
+    for (uint32_t i = 1; i <= 256; ++i) seeds.push_back(i * 2654435761u);
+    for (auto seed : seeds) for (auto ct : {kRGBA_8888_SkColorType, kBGRA_8888_SkColorType}) {
+      base::UxrConfig::GetInstance().seed = std::to_string(seed);
+      Fixture original(ct), read = original;
+      ImageData data{read.pm()}; ReadNoise(&data, 0, 0);
+      CheckPixels(original, read.pm(), 0, 0, seed);
+      auto encoded = ImageDataBuffer::Create(original.pm()); assert(encoded);
+      CheckPixels(original, encoded->pixmap_, 0, 0, seed);
+      assert(Bytes(read.pm()) == Bytes(encoded->pixmap_));
+    }
   } else if (test == "native") {
     auto& config = base::UxrConfig::GetInstance();
-    for (const std::string seed : {"", "0", "invalid", "-1", "4294967296", "12345"}) {
+    for (const std::string seed : {"", "0", "000", "invalid", "-1", "+1", " 1", "1 ",
+                                    "1\n", "1x", "0x1", "18446744073709551616", "12345"}) {
       config.seed = seed; config.disabled = seed == "12345";
       Fixture f; auto before = f.bytes; ImageData data{f.pm()}; ReadNoise(&data, 0, 0); assert(f.bytes == before);
       for (int mode = -1; mode < 4; ++mode) {
@@ -490,7 +589,7 @@ int main(int argc, char** argv) {
       }
     }
     config.seed = "12345"; config.disabled = false;
-    Fixture f(kRGBA_F16_SkColorType); auto before = f.bytes; ImageData data{f.pm()}; ReadNoise(&data, 0, 0);
+    Fixture f(kRGBA_F16_SkColorType, 7, 4, 16); auto before = f.bytes; ImageData data{f.pm()}; ReadNoise(&data, 0, 0);
     auto encoded = ImageDataBuffer::Create(f.pm()); assert(encoded->pixmap_.addr() == f.bytes.data()); assert(f.bytes == before);
   } else if (test == "padding") {
     Fixture f; auto before = f.bytes; auto encoded = ImageDataBuffer::Create(f.pm());

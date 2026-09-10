@@ -21,7 +21,7 @@ index f3c06b9e10..b5bc89bcf7 100644
  #include "base/functional/callback_helpers.h"
  #include "base/no_destructor.h"
  #include "base/sampling_heap_profiler/poisson_allocation_sampler.h"
-@@ -196,6 +202,206 @@
+@@ -196,6 +202,197 @@
  
    base::CommandLine* command_line(base::CommandLine::ForCurrentProcess());
  
@@ -55,9 +55,6 @@ index f3c06b9e10..b5bc89bcf7 100644
 +                                             "uxr-devtools-runtime-suppression"},
 +      {"fingerprint-canvas-bridge",        "uxr-canvas-bridge"},
 +      {"fingerprint-canvas-bridge-unsafe", "uxr-canvas-bridge-unsafe"},
-+      {"fingerprint-webrtc-fake-srflx",    "uxr-webrtc-fake-srflx"},
-+      {"fingerprint-webrtc-fake-srflx-allow-udp",
-+                                             "uxr-webrtc-fake-srflx-allow-udp"},
 +    };
 +    for (const auto& a : kAliases) {
 +      if (command_line->HasSwitch(a.fp) &&
@@ -140,8 +137,7 @@ index f3c06b9e10..b5bc89bcf7 100644
 +        if (seed.empty())
 +          seed = command_line->GetSwitchValueASCII("uxr-canvas-seed");
 +        if (seed.empty()) {
-+          // Canvas readback accepts a nonzero 32-bit seed.
-+          uint32_t random_seed = static_cast<uint32_t>(base::RandUint64());
++          uint64_t random_seed = base::RandUint64();
 +          if (random_seed == 0)
 +            random_seed = 1;
 +          seed = base::NumberToString(random_seed);
@@ -217,11 +213,6 @@ index f3c06b9e10..b5bc89bcf7 100644
 +    if (command_line->HasSwitch("fingerprint-allow-3p-cookies")) {
 +      command_line->AppendSwitchASCII(
 +          "test-third-party-cookie-phaseout", "false");
-+    }
-+
-+    if (command_line->HasSwitch("fingerprint-webrtc-ip")) {
-+      command_line->AppendSwitchASCII("uxr-webrtc-policy",
-+          "disable_non_proxied_udp");
 +    }
 +  }
 +

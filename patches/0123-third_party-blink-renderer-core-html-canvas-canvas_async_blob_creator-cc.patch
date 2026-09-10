@@ -1,0 +1,90 @@
+diff --git a/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc b/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc
+--- a/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc
++++ b/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.cc
+@@ -196,8 +196,6 @@
+     }
+ 
+     if (skia_image_->peekPixels(&src_data_)) {
+-      static_bitmap_image_loaded_ = true;
+-
+       // Ensure that the size of the to-be-encoded-image does not pass the
+       // maximum size supported by the encoders.
+       int max_dimension = ImageEncoder::MaxDimension(mime_type_);
+@@ -207,6 +205,14 @@
+                            std::min(info.height(), max_dimension));
+         src_data_.reset(info, src_data_.addr(), src_data_.rowBytes());
+       }
++      // All scheduling paths consume the same once-prepared pixels.
++      image_data_buffer_ = ImageDataBuffer::Create(src_data_);
++      if (image_data_buffer_) {
++        src_data_ = image_data_buffer_->GetPixmap();
++        static_bitmap_image_loaded_ = true;
++      } else {
++        src_data_.reset();
++      }
+     }
+   }
+ 
+@@ -226,6 +232,9 @@
+   context_.Clear();
+   callback_.Clear();
+   script_promise_resolver_.Clear();
++  encoder_.reset();
++  src_data_.reset();
++  image_data_buffer_.reset();
+   image_ = nullptr;
+   skia_image_ = nullptr;
+   encoded_image_.clear();
+@@ -301,7 +310,7 @@
+       // we do not need to use background task runner to reduce load on main.
+       // So we just directly encode images on the worker thread.
+       Vector<unsigned char> encoded_image;
+-      if (!EncodeImage(ImageDataBuffer::Create(src_data_), mime_type_, quality,
++      if (!EncodeImage(std::move(image_data_buffer_), mime_type_, quality,
+                        &encoded_image)) {
+         context_->GetTaskRunner(TaskType::kCanvasBlobSerialization)
+             ->PostTask(
+@@ -324,7 +333,7 @@
+           FROM_HERE, CrossThreadBindOnce(
+                          &CanvasAsyncBlobCreator::EncodeImageOnEncoderThread,
+                          MakeCrossThreadHandle(this), parent_frame_task_runner_,
+-                         skia_image_, ImageDataBuffer::Create(src_data_),
++                         skia_image_, std::move(image_data_buffer_),
+                          mime_type_, quality));
+     }
+   } else {
+@@ -352,7 +361,7 @@
+ void CanvasAsyncBlobCreator::InitiateEncoding(double quality,
+                                               base::TimeTicks deadline) {
+-  if (idle_task_status_ == kIdleTaskSwitchedToImmediateTask) {
++  if (idle_task_status_ != kIdleTaskNotStarted) {
+     return;
+   }
+   RecordInitiateEncodingTimeHistogram(
+       mime_type_, base::TimeTicks::Now() - schedule_idle_task_start_time_);
+@@ -362,6 +371,7 @@
+ 
+   if (!InitializeEncoder(quality)) {
+     idle_task_status_ = kIdleTaskFailed;
++    CreateNullAndReturnResult();
+     return;
+   }
+ 
+@@ -373,7 +383,7 @@
+ void CanvasAsyncBlobCreator::IdleEncodeRows(base::TimeTicks deadline) {
+-  if (idle_task_status_ == kIdleTaskSwitchedToImmediateTask) {
++  if (idle_task_status_ != kIdleTaskStarted) {
+     return;
+   }
+ 
+   for (int y = num_rows_completed_; y < src_data_.height(); ++y) {
+     if (IsEncodeRowDeadlineNearOrPassed(deadline, src_data_.width())) {
+@@ -557,6 +567,8 @@
+                               WrapPersistent(this)));
+     } else {
+       // Failing in initialization of encoder
++      idle_task_status_ = kIdleTaskFailed;
++      CreateNullAndReturnResult();
+       SignalAlternativeCodePathFinishedForTesting();
+     }
+   } else {

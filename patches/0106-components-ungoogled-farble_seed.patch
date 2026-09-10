@@ -1,7 +1,7 @@
 diff --git a/components/ungoogled/farble_seed.h b/components/ungoogled/farble_seed.h
 --- /dev/null
 +++ b/components/ungoogled/farble_seed.h
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,34 @@
 +#ifndef COMPONENTS_UNGOOGLED_FARBLE_SEED_H_
 +#define COMPONENTS_UNGOOGLED_FARBLE_SEED_H_
 +
@@ -13,11 +13,12 @@ diff --git a/components/ungoogled/farble_seed.h b/components/ungoogled/farble_se
 +
 +namespace ungoogled {
 +
-+// Returns a deterministic 64-bit per-site farbling seed derived from the global
-+// --fingerprint command-line seed mixed with |registrable_domain| (eTLD+1).
-+// Same (global_seed, registrable_domain) -> same value across runs/processes
-+// (uses base::PersistentHash, stable cross-run/platform). Distinct domains
-+// decorrelate. Empty |registrable_domain| hashes to a stable fallback.
++// Returns a deterministic per-site seed using the full unsigned 64-bit
++// uxr-fingerprint-seed, with an empty/missing key falling back to uxr-canvas-seed.
++// Invalid decimal values map to zero, as in persona selection. Legacy uint32
++// seeds retain their little-endian mapping; upper seed bits are also mixed.
++// Configuration is read per call so renderer initialization cannot cache a
++// pre-configuration seed. Registrable domains use stable base::PersistentHash.
 +COMPONENT_EXPORT(UNGOOGLED)
 +uint64_t GetFarbleSeed64(std::string_view registrable_domain);
 +
@@ -26,9 +27,9 @@ diff --git a/components/ungoogled/farble_seed.h b/components/ungoogled/farble_se
 +COMPONENT_EXPORT(UNGOOGLED)
 +std::string GetFarbleSeedString(std::string_view registrable_domain);
 +
-+// Whether per-eTLD+1 fingerprint NOISE (canvas/WebGL/audio/client-rect farbling) is active.
-+// True by default; --disable-fingerprint-noise turns it OFF so those surfaces return their
-+// natural unperturbed values. Identity spoofs (UA/screen/GPU strings) are unaffected.
++// Noise policy for consumers; it does not implement a rendering mechanism.
++// Presence of uxr-disable-fingerprint-noise disables noise, independent of
++// identity selection. Read per call to honor renderer configuration delivery.
 +COMPONENT_EXPORT(UNGOOGLED)
 +bool FingerprintNoiseEnabled();
 +

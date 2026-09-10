@@ -42,8 +42,8 @@ LIMITATIONS = [
     "A smoke pass is behavioral evidence, not a signed attestation of a Chromix build.",
     "No real media permission is requested or granted; device counts are observations only.",
     "No GPU/physical audio device is required; unsupported optional probes are reported.",
-    "Canvas/audio checks cover selected paths, not all P0-P2 backlog items.",
-    "Network and storage probes check value contracts in window/iframe/worker, not real traffic, change events, disk enforcement or storage-bucket isolation. Their dynamic values are not restart-stability fingerprints.",
+    "Surface probes cover bounded Canvas/GPU/offline audio/codec paths, not all P0-P2 backlog items; optional skips are not coverage passes.",
+    "Loopback fetch/ResourceTiming and context offline/online events are tested; network/storage dynamic values are not restart-stability fingerprints. Disk enforcement and storage-bucket isolation are not tested.",
     "No TLS/HTTP2/HTTP3, external service, WebRTC/STUN, or host-isolation proof is tested.",
     "Routing and browser network flags are defense in depth, not an OS network sandbox.",
     "Executable names, hashes and CDP identity cannot automatically authenticate Chromix provenance; verify the release independently.",
@@ -160,7 +160,11 @@ SIGNAL_PROBE = r"""async () => {
 MEDIA_PROBE = r"""async (denied) => {
   const permissions = {};
   for (const name of ['camera', 'microphone', 'notifications']) {
-    try { permissions[name] = {state:(await navigator.permissions.query({name})).state}; }
+    if (!navigator.permissions || typeof navigator.permissions.query !== 'function') {
+      permissions[name] = {available:false, reason:'Permissions.query unavailable'};
+      continue;
+    }
+    try { permissions[name] = {available:true, state:(await navigator.permissions.query({name})).state}; }
     catch (e) { permissions[name] = {error:{name:e.name, message:e.message}}; }
   }
   const policy = document.permissionsPolicy || document.featurePolicy;
@@ -191,9 +195,51 @@ MEDIA_PROBE = r"""async (denied) => {
       } finally { clearTimeout(timer); }
     }
   }
-  return {permissions, policyAllows, devices, devicesError, capture,
+  return {permissions, policyAllows, devices, devicesError,
+    deviceProbe:navigator.mediaDevices ? (devicesError ? {error:devicesError} : {available:true}) :
+      {available:false, reason:'mediaDevices unavailable'}, capture,
     notificationPermission:typeof Notification === 'undefined' ? null : Notification.permission,
     permissionGrantsByRunner:0, deniedDocument:denied};
+}"""
+
+
+SURFACE_ASSET = Path(__file__).with_name("fingerprint_surface_probe.js")
+SURFACE_WORKER_SCRIPT = r"""importScripts('/surface.js');
+fingerprintSurfaceProbe('canvas').then(value => postMessage({value}),
+  e => postMessage({error:{name:e.name,message:e.message}}));
+"""
+SURFACE_PROBE = r"""async mode => {
+  if (mode === 'worker') {
+    const worker = new Worker('/surface-worker.js');
+    let timer;
+    try {
+      return await new Promise((resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('surface worker timeout')), 10000);
+        worker.onmessage = e => e.data.error ? reject(new Error(JSON.stringify(e.data.error))) : resolve(e.data.value);
+        worker.onerror = e => reject(new Error(e.message));
+      });
+    } finally { clearTimeout(timer); worker.terminate(); }
+  }
+  if (typeof globalThis.fingerprintSurfaceProbe !== 'function') {
+    await new Promise((resolve, reject) => {
+      const script = document.createElement('script'); script.src = '/surface.js';
+      script.onload = resolve; script.onerror = () => reject(new Error('surface asset load failed'));
+      document.head.appendChild(script);
+    });
+  }
+  return await globalThis.fingerprintSurfaceProbe(mode);
+}"""
+NETWORK_EVENT_SETUP = r"""async () => {
+  globalThis.smokeNetworkEvents = [];
+  for (const type of ['offline', 'online'])
+    addEventListener(type, () => smokeNetworkEvents.push({type, online:navigator.onLine}));
+  return {online:navigator.onLine};
+}"""
+NETWORK_EVENT_READ = r"""async expected => {
+  const deadline = performance.now() + 2000;
+  while (!smokeNetworkEvents.some(e => e.type === expected) && performance.now() < deadline)
+    await new Promise(resolve => setTimeout(resolve, 10));
+  return {online:navigator.onLine, events:smokeNetworkEvents.slice()};
 }"""
 
 
@@ -270,7 +316,13 @@ class LocalHandler(BaseHTTPRequestHandler):
         with self.server.lock:
             self.server.requests.append(record)
         path = urlsplit(self.path).path
-        if path == "/worker.js":
+        if path == "/surface.js":
+            content, mime = SURFACE_ASSET.read_text(encoding="utf-8"), "text/javascript"
+        elif path == "/surface-worker.js":
+            content, mime = SURFACE_WORKER_SCRIPT, "text/javascript"
+        elif path == "/timing":
+            content, mime = "chromix-loopback-timing", "text/plain"
+        elif path == "/worker.js":
             content, mime = WORKER_SCRIPT, "text/javascript"
         elif path == "/echo":
             content, mime = json.dumps(record), "application/json"
@@ -474,9 +526,29 @@ def signal_identity(observation: dict) -> dict:
     return result
 
 
+def surface_identity(observation: dict) -> dict:
+    surfaces = observation.get("surfaces") or {}
+    result = {}
+    for scope in SCOPES:
+        values = surfaces.get(scope) or {}
+        canvas = values.get("canvas") or {}
+        if canvas.get("available") is True:
+            result[scope] = {"pixelHash": canvas.get("pixelHash"),
+                             "pngHash": (canvas.get("exports") or {}).get("hash")}
+        if scope == "window":
+            for key in ("webgl1", "webgl2"):
+                value = values.get(key) or {}
+                if value.get("available") is True:
+                    result[key] = value.get("pixelHash")
+            audio = values.get("audio") or {}
+            if audio.get("available") is True:
+                result["audioGraph"] = (audio.get("first") or {}).get("hash")
+    return result
+
+
 def stable_identity(observation: dict) -> dict:
     return {"scopes": {name: canonical_identity(observation.get(name, {})) for name in SCOPES},
-            "signals": signal_identity(observation)}
+            "signals": signal_identity(observation), "surfaces": surface_identity(observation)}
 
 
 def finite_nonnegative(value) -> bool:
@@ -495,12 +567,7 @@ def evaluate_environment(environment, name: str) -> list:
         if not isinstance(value, dict):
             add_check(checks, label + ".completed", False, "probe result", value)
             continue
-        if value.get("available") is False and value.get("reason") and not value.get("error"):
-            skip(checks, label, value["reason"])
-            continue
-        completed = value.get("available") is True and not value.get("error")
-        add_check(checks, label + ".completed", completed, "successful probe", value)
-        if not completed:
+        if not probe_available(checks, label, value):
             continue
         if category == "network":
             add_check(checks, label + ".type",
@@ -536,15 +603,288 @@ def evaluate_environment(environment, name: str) -> list:
     return checks
 
 
+def probe_available(checks: list, name: str, value) -> bool:
+    if (isinstance(value, dict) and value.get("available") is False
+            and isinstance(value.get("reason"), str) and value["reason"].strip()
+            and "error" not in value):
+        skip(checks, name, value["reason"])
+        return False
+    completed = isinstance(value, dict) and value.get("available") is True and "error" not in value
+    add_check(checks, name + ".completed", completed, "successful probe or explicit absence with reason", value)
+    return completed
+
+
+def valid_hash(value) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def require_true(checks: list, name: str, value: dict, fields):
+    for field in fields:
+        add_check(checks, name + "." + field, value.get(field) is True, True, value.get(field))
+
+
+def evaluate_canvas_surface(value, name: str) -> list:
+    checks = []
+    if not probe_available(checks, name, value):
+        return checks
+    require_true(checks, name, value, ("repeat", "cropMatches", "paddedMatches", "outsideZero",
+                                      "transparentZero", "sourceStable"))
+    add_check(checks, name + ".pixelHash", valid_hash(value.get("pixelHash")), "SHA-256", value.get("pixelHash"))
+    add_check(checks, name + ".invalid", value.get("invalid") == "IndexSizeError", "IndexSizeError", value.get("invalid"))
+    exports = value.get("exports")
+    if probe_available(checks, name + ".exports", exports):
+        require_true(checks, name + ".exports", exports, ("png", "repeat"))
+        add_check(checks, name + ".exports.mime", exports.get("mime") == "image/png", "image/png", exports.get("mime"))
+        add_check(checks, name + ".exports.hash", valid_hash(exports.get("hash")), "binary PNG SHA-256", exports.get("hash"))
+        url = exports.get("dataURL")
+        if probe_available(checks, name + ".dataURL", url):
+            require_true(checks, name + ".dataURL", url, ("png", "matchesBlob", "repeat"))
+            add_check(checks, name + ".dataURL.hash", valid_hash(url.get("hash"))
+                      and url.get("hash") == exports.get("hash"), exports.get("hash"), url.get("hash"))
+    bitmap = value.get("bitmap")
+    if probe_available(checks, name + ".bitmap", bitmap):
+        require_true(checks, name + ".bitmap", bitmap, ("matchesDirect", "repeat", "decodedRepeat"))
+        add_check(checks, name + ".bitmap.decodedHash", valid_hash(bitmap.get("decodedReadbackHash")),
+                  "readback hash, not raw decoded PNG pixels", bitmap.get("decodedReadbackHash"))
+        transfer = bitmap.get("transfer")
+        if probe_available(checks, name + ".bitmap.transfer", transfer):
+            require_true(checks, name + ".bitmap.transfer", transfer, ("matchesDirect", "repeat", "sourceCleared"))
+    float16 = value.get("float16")
+    if probe_available(checks, name + ".float16", float16):
+        require_true(checks, name + ".float16", float16, ("finite", "repeat", "typed"))
+        add_check(checks, name + ".float16.length", type(float16.get("length")) is int
+                  and float16["length"] == 16 * 12 * 4, 768, float16.get("length"))
+    return checks
+
+
+def evaluate_gl_surface(value, name: str, version: int) -> list:
+    checks = []
+    if not probe_available(checks, name, value):
+        return checks
+    require_true(checks, name, value, ("requestable", "repeat", "shaderPixels", "pendingReadStable",
+                                      "alignedMatches", "alignedGuards", "sourceStable"))
+    add_check(checks, name + ".pixelHash", valid_hash(value.get("pixelHash")), "SHA-256", value.get("pixelHash"))
+    for key, expected in {"initialError": 0, "drawError": 0, "readError": 0, "pendingError": 0x500,
+                          "trailingError": 0, "alignedError": 0, "finalError": 0}.items():
+        add_check(checks, name + "." + key, type(value.get(key)) is int and value[key] == expected, expected, value.get(key))
+    extensions = value.get("extensions")
+    add_check(checks, name + ".extensions", isinstance(extensions, list) and len(extensions) <= 128
+              and all(isinstance(item, str) and item for item in extensions)
+              and len(set(extensions)) == len(extensions), "unique extension names", extensions)
+    invalid = value.get("invalid")
+    cases = isinstance(invalid, list) and len(invalid) == 2 and all(isinstance(case, dict) for case in invalid)
+    add_check(checks, name + ".invalid_cases", cases, "negative width and invalid format", invalid)
+    if cases:
+        for i, expected in enumerate((0x501, 0x500)):
+            case = invalid[i]
+            add_check(checks, name + f".invalid_{i}", type(case.get("error")) is int and case["error"] == expected
+                      and case.get("unchanged") is True, {"error": expected, "unchanged": True}, case)
+    pack = value.get("pack")
+    if probe_available(checks, name + ".pack", pack):
+        require_true(checks, name + ".pack", pack, ("matches", "guards", "shortUnchanged"))
+        for key, expected in (("glError", 0), ("shortError", 0x502)):
+            add_check(checks, name + ".pack." + key, type(pack.get(key)) is int and pack[key] == expected, expected, pack.get(key))
+    elif version == 2 and isinstance(pack, dict) and pack.get("available") is False:
+        add_check(checks, name + ".pack.required", False, "WebGL2 pack probe required", pack)
+    return checks
+
+
+CODEC_TYPES = ['not-a-mime', 'audio/x-chromix-invalid; codecs="missing"', 'audio/wav; codecs="1"',
+               'audio/webm; codecs="opus"', 'video/webm; codecs="vp8"', 'video/mp4; codecs="avc1.42E01E"']
+
+
+def evaluate_codec_surface(value, name: str) -> list:
+    checks = []
+    if not probe_available(checks, name, value):
+        return checks
+    for field in ("canPlay", "mse", "recorder"):
+        rows = value.get(field)
+        if field != "canPlay":
+            if not probe_available(checks, name + "." + field, rows):
+                continue
+            rows = rows.get("values")
+        well_formed = (isinstance(rows, list) and len(rows) == len(CODEC_TYPES)
+                       and all(isinstance(row, dict) for row in rows)
+                       and [row.get("mime") for row in rows] == CODEC_TYPES)
+        add_check(checks, name + "." + field + ".cases", well_formed, CODEC_TYPES, rows)
+        if well_formed:
+            allowed = all(row.get("value") in ("", "maybe", "probably") if field == "canPlay"
+                          else type(row.get("value")) is bool for row in rows)
+            add_check(checks, name + "." + field + ".types", allowed, "native support observations", rows)
+            unsupported = "" if field == "canPlay" else False
+            add_check(checks, name + "." + field + ".invalid", all(row.get("value") == unsupported
+                      and type(row.get("value")) is type(unsupported) for row in rows[:2]), unsupported, rows[:2])
+    capabilities = value.get("capabilities")
+    if probe_available(checks, name + ".capabilities", capabilities):
+        # Encoding and decoding have different native support contracts.
+        for field in ("decoding", "encoding"):
+            rows = capabilities.get(field)
+            valid = isinstance(rows, list) and len(rows) == 2 and all(isinstance(row, dict) for row in rows)
+            add_check(checks, name + "." + field + ".cases", valid, "invalid codec and Opus observations", rows)
+            if valid:
+                add_check(checks, name + "." + field + ".types", all(type(row.get(key)) is bool
+                          for row in rows for key in ("supported", "smooth", "powerEfficient")), "boolean capability fields", rows)
+                add_check(checks, name + "." + field + ".invalid", rows[0].get("supported") is False, False, rows[0])
+    return checks
+
+
+def evaluate_audio_surface(value, name: str) -> list:
+    checks = []
+    if not probe_available(checks, name, value):
+        return checks
+    for field in ("first", "second", "silence"):
+        row = value.get(field)
+        if not isinstance(row, dict):
+            add_check(checks, name + "." + field, False, "render evidence", row)
+            continue
+        require_true(checks, name + "." + field, row, ("repeat", "finite", "zero" if field == "silence" else "nonzero"))
+        add_check(checks, name + "." + field + ".hash", valid_hash(row.get("hash")), "SHA-256", row.get("hash"))
+        add_check(checks, name + "." + field + ".shape", row.get("rate") == 44100 and row.get("length") == 4096,
+                  [44100, 4096], [row.get("rate"), row.get("length")])
+    first, second = value.get("first"), value.get("second")
+    add_check(checks, name + ".graph_repeat", isinstance(first, dict) and isinstance(second, dict)
+              and valid_hash(first.get("hash")) and first.get("hash") == second.get("hash"), first, second)
+    boundary = value.get("boundary")
+    if not isinstance(boundary, dict):
+        add_check(checks, name + ".boundary", False, "mutable buffer evidence", boundary)
+    else:
+        require_true(checks, name + ".boundary", boundary,
+                     ("mutable", "truncated", "beyondUnchanged", "sourceStable", "otherChannelSilent"))
+        add_check(checks, name + ".boundary.rates", boundary.get("rates") == [48000, 48000], [48000, 48000], boundary.get("rates"))
+        rows = boundary.get("invalid")
+        valid = isinstance(rows, list) and len(rows) == 2 and all(isinstance(row, dict) for row in rows)
+        add_check(checks, name + ".boundary.invalid", valid and [row.get("index") for row in rows] == [2, -1], [2, -1], rows)
+        if valid:
+            for i, row in enumerate(rows):
+                add_check(checks, name + f".boundary.invalid_{i}", row.get("unchanged") is True
+                          and all(row.get(key) == "IndexSizeError" for key in ("from", "to", "get")), "IndexSizeError; unchanged", row)
+    wav = value.get("wav")
+    if not isinstance(wav, dict):
+        add_check(checks, name + ".wav", False, "decoded PCM WAV evidence", wav)
+    else:
+        samples = wav.get("samples")
+        expected = [v / 32768 for v in (0, 8192, -8192, 16384, -16384, 32767, -32768, 0)]
+        valid = isinstance(samples, list) and len(samples) == len(expected)
+        add_check(checks, name + ".wav.samples", valid and all(type(v) in (int, float) and math.isfinite(v)
+                  and abs(v - ref) <= 1 / 32768 for v, ref in zip(samples, expected)), expected, samples)
+        require_true(checks, name + ".wav", wav, ("repeat",))
+        add_check(checks, name + ".wav.shape", [wav.get(key) for key in ("rate", "length", "channels", "sourceBytes")]
+                  == [48000, 8, 1, 60], [48000, 8, 1, 60], wav)
+    return checks
+
+
+def evaluate_webgpu_surface(value, name: str) -> list:
+    checks = []
+    if not probe_available(checks, name, value):
+        return checks
+    require_true(checks, name, value, ("copyMatches", "canvasMatches"))
+    add_check(checks, name + ".format", value.get("format") in ("bgra8unorm", "rgba8unorm"), "preferred 8-bit canvas format", value.get("format"))
+    for field in ("advertised", "enabled"):
+        rows = value.get(field)
+        add_check(checks, name + "." + field, isinstance(rows, list) and len(rows) <= 128
+                  and all(isinstance(row, str) and row for row in rows) and len(rows) == len(set(rows)), "unique feature names", rows)
+    add_check(checks, name + ".requestable", isinstance(value.get("advertised"), list)
+              and value.get("advertised") == value.get("enabled"), value.get("advertised"), value.get("enabled"))
+    add_check(checks, name + ".copied", value.get("copied") == [0x12345678, 0, 0xFFFFFFFF, 0xABCDEF01],
+              [0x12345678, 0, 0xFFFFFFFF, 0xABCDEF01], value.get("copied"))
+    rgba = value.get("rgba")
+    expected = [191, 128, 64, 255] if value.get("format") == "bgra8unorm" else [64, 128, 191, 255]
+    add_check(checks, name + ".rgba", isinstance(rgba, list) and len(rgba) == 4
+              and all(type(v) is int and abs(v - ref) <= 1 for v, ref in zip(rgba, expected)), expected, rgba)
+    add_check(checks, name + ".validation", "validationError" in value and value["validationError"] is None
+              and value.get("uncapturedErrors") == [], "no validation/uncaptured errors", value)
+    return checks
+
+
+def evaluate_network_surface(value, name: str) -> list:
+    checks = []
+    if not probe_available(checks, name, value):
+        return checks
+    add_check(checks, name + ".fetch", value.get("ok") is True and value.get("status") == 200
+              and value.get("body") == "chromix-loopback-timing", "loopback payload and HTTP 200", value)
+    entries = value.get("entries")
+    if not isinstance(entries, list) or len(entries) != 1 or not isinstance(entries[0], dict):
+        add_check(checks, name + ".entry", False, "one ResourceTiming entry", entries)
+        return checks
+    entry = entries[0]
+    try:
+        url = urlsplit(entry.get("name", ""))
+        local = allowed_url(entry["name"], f"http://127.0.0.1:{url.port}") and url.path == "/timing"
+    except (ValueError, KeyError, TypeError):
+        local = False
+    add_check(checks, name + ".entry", local and entry.get("initiatorType") == "fetch", "loopback fetch ResourceTiming", entry)
+    times = [entry.get(key) for key in ("startTime", "responseStart", "responseEnd")]
+    add_check(checks, name + ".ordering", all(finite_nonnegative(v) for v in times) and times == sorted(times),
+              "nondecreasing finite native timestamps", times)
+    duration = entry.get("duration")
+    add_check(checks, name + ".duration", finite_nonnegative(duration) and all(finite_nonnegative(v) for v in times)
+              and abs(duration - (times[2] - times[0])) <= 1, "responseEnd minus startTime", duration)
+    for field in ("transferSize", "encodedBodySize", "decodedBodySize"):
+        size = entry.get(field)
+        add_check(checks, name + "." + field, finite_nonnegative(size) and size == int(size), "nonnegative native byte size", size)
+    return checks
+
+
+def evaluate_surfaces(surfaces) -> list:
+    checks = []
+    if not isinstance(surfaces, dict):
+        add_check(checks, "surfaces.completed", False, "window/iframe/worker probe results", surfaces)
+        return checks
+    for scope in SCOPES:
+        value = surfaces.get(scope)
+        if not isinstance(value, dict) or "error" in value:
+            add_check(checks, f"surfaces.{scope}.completed", False, "scope probe result", value)
+            continue
+        checks.extend(evaluate_canvas_surface(value.get("canvas"), f"surfaces.{scope}.canvas"))
+    window = surfaces.get("window")
+    if not isinstance(window, dict):
+        return checks
+    for scope in ("iframe", "worker"):
+        other = surfaces.get(scope)
+        a, b = window.get("canvas"), other.get("canvas") if isinstance(other, dict) else None
+        if isinstance(a, dict) and isinstance(b, dict) and a.get("available") is True and b.get("available") is True:
+            add_check(checks, f"surfaces.{scope}.canvas.matches_window", valid_hash(a.get("pixelHash"))
+                      and a.get("pixelHash") == b.get("pixelHash"), a.get("pixelHash"), b.get("pixelHash"))
+            x, y = a.get("exports"), b.get("exports")
+            if isinstance(x, dict) and isinstance(y, dict) and x.get("available") is True and y.get("available") is True:
+                add_check(checks, f"surfaces.{scope}.png.matches_window", valid_hash(x.get("hash"))
+                          and x.get("hash") == y.get("hash"), x.get("hash"), y.get("hash"))
+    for key, evaluator in (("webgl1", lambda v, n: evaluate_gl_surface(v, n, 1)),
+                           ("webgl2", lambda v, n: evaluate_gl_surface(v, n, 2)),
+                           ("webgpu", evaluate_webgpu_surface), ("audio", evaluate_audio_surface),
+                           ("codecs", evaluate_codec_surface), ("network", evaluate_network_surface)):
+        checks.extend(evaluator(window.get(key), "surfaces.window." + key))
+    return checks
+
+
+def evaluate_network_events(value) -> list:
+    checks = []
+    if not isinstance(value, dict):
+        add_check(checks, "network.events.completed", False, "offline/online transition evidence", value)
+        return checks
+    for scope in ("window", "iframe"):
+        rows = value.get(scope)
+        if not isinstance(rows, dict):
+            add_check(checks, f"network.events.{scope}", False, "scope transition evidence", rows)
+            continue
+        for phase, online, events in (("initial", True, None), ("offline", False, [{"type": "offline", "online": False}]),
+                                       ("restored", True, [{"type": "offline", "online": False}, {"type": "online", "online": True}])):
+            row = rows.get(phase)
+            passed = isinstance(row, dict) and row.get("online") is online and (events is None or row.get("events") == events)
+            add_check(checks, f"network.events.{scope}.{phase}", passed, {"online": online, "events": events}, row)
+    return checks
+
+
 def evaluate_signals(signals: dict) -> list:
     checks = []
+    if not isinstance(signals, dict):
+        add_check(checks, "signals.completed", False, "signal probe result", signals)
+        return checks
     for name in ("canvas", "audio"):
-        value = signals.get(name, {})
-        if value.get("available") is False:
-            skip(checks, name, value.get("reason", "API unavailable"))
+        value = signals.get(name)
+        if not probe_available(checks, name, value):
             continue
-        add_check(checks, f"{name}.completed", value.get("available") is True and not value.get("error"), True, value.get("error"))
-        if name == "canvas" and value.get("available"):
+        if name == "canvas":
             hashes = {key: value.get(key) for key in ("pixelHash", "repeatHash", "dataUrlHash", "blobHash")}
             add_check(checks, "canvas.hashes", all(isinstance(h, str) and re.fullmatch(r"[0-9a-f]{64}", h)
                       for h in hashes.values()), "SHA-256 for pixels, data URL and blob", hashes)
@@ -575,12 +915,18 @@ def evaluate_signals(signals: dict) -> list:
 def evaluate_media(media: dict, denied: bool) -> list:
     checks = []
     label = "media.denied" if denied else "media.pristine"
-    permissions = media.get("permissions", {})
+    if not isinstance(media, dict):
+        add_check(checks, label + ".completed", False, "media probe result", media)
+        return checks
+    add_check(checks, label + ".permission_grants", type(media.get("permissionGrantsByRunner")) is int
+              and media["permissionGrantsByRunner"] == 0, 0, media.get("permissionGrantsByRunner"))
+    add_check(checks, label + ".document_policy", media.get("deniedDocument") is denied, denied, media.get("deniedDocument"))
+    permissions = media.get("permissions")
+    if not isinstance(permissions, dict):
+        permissions = {}
     for name in ("camera", "microphone", "notifications"):
-        value = permissions.get(name, {})
-        if value.get("error"):
-            skip(checks, f"{label}.{name}.query", str(value["error"]))
-        else:
+        value = permissions.get(name)
+        if probe_available(checks, f"{label}.{name}.query", value):
             add_check(checks, f"{label}.{name}.not_granted", value.get("state") in ("prompt", "denied"),
                       "no authorization was granted", value)
     notification = media.get("notificationPermission")
@@ -588,16 +934,20 @@ def evaluate_media(media: dict, denied: bool) -> list:
         state = permissions.get("notifications", {}).get("state")
         add_check(checks, label + ".notification", notification != "granted" and
                   (state is None or state == {"default": "prompt"}.get(notification, notification)), state, notification)
-    if media.get("devices") is None:
-        skip(checks, label + ".devices", str(media.get("devicesError") or "mediaDevices unavailable"))
-    else:
-        exposed = [device for device in media["devices"] if device.get("label")]
-        add_check(checks, label + ".labels_hidden", not exposed, [], exposed)
-    if denied and media.get("devices") is not None:
+    devices_available = probe_available(checks, label + ".devices", media.get("deviceProbe"))
+    if devices_available:
+        devices = media.get("devices")
+        valid = isinstance(devices, list) and all(isinstance(device, dict) for device in devices)
+        add_check(checks, label + ".devices_result", valid and media.get("devicesError") is None,
+                  "successful device enumeration", devices)
+        if valid:
+            exposed = [device for device in devices if device.get("label")]
+            add_check(checks, label + ".labels_hidden", not exposed, [], exposed)
+    if denied and devices_available:
         for name in ("camera", "microphone"):
             result = media.get("capture", {}).get(name, {})
             if media.get("policyAllows", {}).get(name) is not False:
-                skip(checks, f"{label}.{name}.capture", "No capture attempted: policy denial not confirmed")
+                add_check(checks, f"{label}.{name}.capture", False, "policy denial must be confirmed; no capture attempted", result)
             else:
                 add_check(checks, f"{label}.{name}.capture_rejected",
                           (result.get("exception") or {}).get("name") in ("NotAllowedError", "SecurityError"),
@@ -614,6 +964,8 @@ def evaluate_observation(observation: dict, spec: dict) -> list:
         identity = canonical_identity(observation.get(name, {}))
         add_check(checks, f"{name}.matches_window", identity == window, window, identity)
     checks.extend(evaluate_signals(observation.get("signals", {})))
+    checks.extend(evaluate_surfaces(observation.get("surfaces")))
+    checks.extend(evaluate_network_events(observation.get("network_events")))
     checks.extend(evaluate_media(observation.get("media", {}), False))
     checks.extend(evaluate_media(observation.get("media_denied", {}), True))
     return checks
@@ -704,7 +1056,28 @@ def collect_page(page, origin: str, timeout_ms: int, spec: dict, phase: str) -> 
             "iframe": evaluate(frame, NAV_PROBE, {**request, "scope": "iframe"}, timeout_ms),
             "worker": evaluate(page, WORKER_PROBE, request, timeout_ms),
             "signals": evaluate(page, SIGNAL_PROBE, None, timeout_ms),
+            "surfaces": {"window": evaluate(page, SURFACE_PROBE, "all", timeout_ms),
+                         "iframe": evaluate(frame, SURFACE_PROBE, "canvas", timeout_ms),
+                         "worker": evaluate(page, SURFACE_PROBE, "worker", timeout_ms)},
             "media": evaluate(page, MEDIA_PROBE, False, timeout_ms)}
+
+
+def collect_network_events(context, page, origin: str, timeout_ms: int) -> dict:
+    frame = page.frame(url=origin + "/frame")
+    if frame is None:
+        raise SmokeError("network event iframe missing")
+    targets = {"window": page, "iframe": frame}
+    result = {name: {"initial": evaluate(target, NETWORK_EVENT_SETUP, None, timeout_ms)}
+              for name, target in targets.items()}
+    try:
+        context.set_offline(True)
+        for name, target in targets.items():
+            result[name]["offline"] = evaluate(target, NETWORK_EVENT_READ, "offline", timeout_ms)
+    finally:
+        context.set_offline(False)
+    for name, target in targets.items():
+        result[name]["restored"] = evaluate(target, NETWORK_EVENT_READ, "online", timeout_ms)
+    return result
 
 
 def run_scenario(playwright, spec: dict, identity: dict, server: LocalServer, args, profile: Path) -> dict:
@@ -763,6 +1136,7 @@ def run_scenario(playwright, spec: dict, identity: dict, server: LocalServer, ar
         result["execution"] = verify_execution(context.new_cdp_session(page), identity, not args.no_sandbox)
         observation = collect_page(page, server.origin, args.timeout_ms, spec, "initial")
         result["observation"] = observation
+        observation["network_events"] = collect_network_events(context, page, server.origin, args.timeout_ms)
         reload_observation = collect_page(page, server.origin, args.timeout_ms, spec, "reload")
         result["reload_observation"] = reload_observation
         add_check(result["checks"], "reload.stable", stable_identity(observation) == stable_identity(reload_observation),
@@ -770,6 +1144,7 @@ def run_scenario(playwright, spec: dict, identity: dict, server: LocalServer, ar
         for name in SCOPES:
             result["checks"].extend(evaluate_scope(reload_observation[name], spec, name, "reload"))
         result["checks"].extend(evaluate_signals(reload_observation["signals"]))
+        result["checks"].extend(evaluate_surfaces(reload_observation.get("surfaces")))
         denied = context.new_page()
         denied.goto(server.origin + "/denied", wait_until="load")
         observation["media_denied"] = evaluate(denied, MEDIA_PROBE, True, args.timeout_ms)
@@ -799,6 +1174,10 @@ def load_playwright():
 
 
 def finalize_report(report: dict) -> dict:
+    all_checks = [*report["checks"], *(check for scenario in report["scenarios"] for check in scenario.get("checks", []))]
+    skipped = sorted({check["name"] for check in all_checks if check["status"] == "not_supported"})
+    report["coverage"] = {"scope": "bounded smoke probes, not exhaustive platform coverage",
+                          "not_supported": skipped, "has_optional_skips": bool(skipped)}
     for scenario in report["scenarios"]:
         for failure in scenario.get("failures", []):
             report["failures"].append({"scenario": scenario["name"], "failure": failure})
@@ -858,9 +1237,12 @@ def run(args) -> dict:
 
 
 def seed_value(value):
-    seed = int(value, 0)
-    if not 1 <= seed <= 0xFFFFFFFF:
-        raise argparse.ArgumentTypeError("seed must be in [1, 4294967295]")
+    try:
+        seed = int(value, 0)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("seed must be a nonzero uint64 integer") from error
+    if not 1 <= seed <= 0xFFFFFFFFFFFFFFFF:
+        raise argparse.ArgumentTypeError("seed must be in [1, 18446744073709551615]")
     return seed
 
 

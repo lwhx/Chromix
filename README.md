@@ -33,8 +33,9 @@ a source commit or wait for other platforms.
   switches allow reproducible test personas.
 - **CloakBrowser-compatible SDK surface:** existing Playwright-based Python and
   Node scripts can usually migrate by changing the import.
-- **Proxy-aware setup:** optional GeoIP resolution can align locale, timezone,
-  and the declared WebRTC address with the proxy exit.
+- **Proxy-aware setup:** optional GeoIP resolution aligns locale and timezone
+  using the effective proxy. Proxied launches default to Chromium's native
+  non-proxied-UDP restriction; ICE addresses remain native.
 - **Portable packages:** Windows, Linux, and macOS bundles are ZIP archives with
   runtime files, locales, fonts, and Chromium/Chromix license files. macOS
   bundles are unsigned and not notarized.
@@ -279,11 +280,11 @@ options and the browser's `--fingerprint-*` command-line aliases.
 Useful explicit arguments include:
 
 ```text
---fingerprint=<32-bit-seed>
---fingerprint-platform=windows|macos
+--fingerprint=<nonzero-uint64-seed>
+--fingerprint-platform=linux|windows|macos
 --fingerprint-timezone=<IANA-timezone>
 --fingerprint-locale=<locale>
---fingerprint-webrtc-ip=<address|auto>
+--force-webrtc-ip-handling-policy=disable_non_proxied_udp
 ```
 
 Explicit caller settings take priority over GeoIP-derived values. Keep one
@@ -301,9 +302,11 @@ break automation assumptions or weaken browser isolation:
   `--fingerprint-canvas-bridge-unsafe` forwards canvas/WebGL operations to a
   configured endpoint and removes the sandbox from participating renderer
   processes.
-- `--fingerprint-webrtc-fake-srflx=<IPv4>` fabricates a server-reflexive WebRTC
-  candidate. Non-proxied UDP remains disabled unless
-  `--fingerprint-webrtc-fake-srflx-allow-udp` is also supplied.
+
+The retired `--fingerprint-webrtc-ip`, `--fingerprint-webrtc-fake-srflx`
+and `--fingerprint-webrtc-fake-srflx-allow-udp` options (and their `uxr`
+counterparts) are rejected by the SDKs. Use a real proxy and the native
+WebRTC IP handling policy; changing candidate text does not route traffic.
 
 Use these only in controlled environments. More implementation detail is in
 [`patches/README.md`](patches/README.md).
@@ -319,7 +322,7 @@ Chromix packages Windows x64, Linux x64/arm64, and macOS x64/arm64. The pinned l
 | ungoogled-chromium-windows | `152.0.7977.82-1.1` |
 | ungoogled-chromium-portablelinux | `152.0.7977.82-1` |
 | ungoogled-chromium-macos | `152.0.7977.82-1.1` |
-| Chromix | 110 patches listed in `patches/series` |
+| Chromix | 124 patches listed in `patches/series` |
 
 Requirements include Visual Studio 2022 with Desktop development with C++, the
 Windows 11 SDK 10.0.26100 Debugging Tools, Python 3, Git, PowerShell 7, 7-Zip,

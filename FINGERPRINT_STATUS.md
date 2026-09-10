@@ -21,12 +21,12 @@ A standalone C++ test with stubs checks the extracted algorithm or getter contra
 | Category | Existing coverage and this round's focus | Remaining acceptance work |
 |---|---|---|
 | UA / Client Hints | Browser-level UA/version/brand configuration; remove the renderer-only second rewrite and preserve UA suffix tokens. Normalize SDK `windows`/`macos`/`linux` aliases and provide desktop CH defaults without falling back to another host platform. | Verify JS and negotiated HTTP hints in window, iframe, and workers; explicit custom UA overrides and Android/mobile cases. |
-| WebRTC | ICE policy, candidate/SDP presentation, explicit default-off fake candidate support. | Real connection through the configured proxy; IPv4/IPv6/mDNS/ports, related addresses, codec capabilities, and stats. Rewriting an address does not route traffic through it. |
+| WebRTC | Preserve native candidate/SDP/STUN success data; retire address substitution. Persona policies only restrict existing routes, and `obfuscate` requests native mDNS without re-enabling UDP. Validate unusable STUN mapped addresses as failures and keep per-server success/failure sets disjoint, so a keepalive error cannot finish gathering while another server is pending. | Real connection through the configured proxy/TURN server; IPv4/IPv6/mDNS/ports, related addresses, codec capabilities, and stats. SDK proxy/GeoIP loopback tests are not ICE connectivity acceptance. |
 | MediaDevices | Preserve browser-provided permission filtering, salted IDs, ordering, and empty enumerations instead of inventing unusable devices. | Real permission transitions, device constraints, origin separation, and profile-restart stability. No virtual media backend is implemented. |
 | Intl / ICU | Move locale initialization before JS use rather than changing process-global ICU state from a language getter. | Default and explicit locale/calendar/numbering/hour-cycle cases across all contexts; ICU fallback, timezone initialization, and restart tests. |
-| Canvas | Fix RGBA/BGRA channel ordering, transparent pixels, coordinate arithmetic, and private-copy encoding in both ImageDataBuffer constructors; preserve source pixels and padding. | Async idle encoding, F16, ImageBitmap, premultiplication/color-space agreement, common WebGL/WebGPU seed isolation, and browser readback/encode tests remain open. |
+| Canvas | Coordinate-correct RGBA/BGRA readback, transparent-pixel preservation and private-copy encoding; suppress duplicate upstream noise. Async idle/worker/thread-pool encoding prepares and owns one buffer, with failure completion and late-task guards. | Native browser PNG/JPEG/WebP and ImageBitmap results, F16 privacy, transformed color-space/premultiplication agreement, and common WebGL/WebGPU origin/profile seed isolation remain open. |
 | WebAudio | Preserve mutable AudioBuffer data, silence, native analyser projections, and the actual rendering sample rate. | A coherent graph-level privacy mechanism; OfflineAudioContext, compressor/oscillator output, channel counts, and base/output latency. Getter-only noise is not a graph-level solution. |
-| WebGPU | Explicit empty feature allowlists return no features; nonempty lists intersect real support. Adapter/device limits retain Dawn values; reject invalid requested alignment. GPU identity uses one complete vendor/architecture tuple; software fallback status remains native and native device/driver fields are not mixed into a synthetic tuple. | Subgroup data, default format and buffer readback; validate advertised/requestable capabilities on real hardware. The synthetic Windows GPU templates are declared test templates, not measured-device samples or market-share weights. |
+| WebGPU | Feature allowlists intersect real support; explicit empty sets deny features, and embedded NUL tokens cannot alias valid names. Adapter/device limits and requested alignment validation retain Dawn semantics. Native preferred format preserves backend interoperability restrictions. Synthetic GPU identity remains one complete tuple with native software fallback status. | Subgroup data and real canvas configure/copy/map/request tests remain unverified on hardware. The synthetic Windows GPU templates are declared test templates, not measured-device samples or market-share weights. |
 | Screen / Window / Viewport | Existing screen, outer-window, DPR and detailed-screen getters. | Actual layout, inner dimensions, visualViewport, CSS device size/DPR, zoom, and multi-screen agreement. |
 | Performance Timing | Remove the recursive synthetic network-phase fallback and preserve native ordering/zero rules. | Navigation/resource/paint/event/longtask/worker/RAF precision and background lifecycle tests. |
 
@@ -35,14 +35,14 @@ A standalone C++ test with stubs checks the extracted algorithm or getter contra
 | Category | Status and next verification |
 |---|---|
 | Permissions | Notification getters/query results must use the browser authority also used by requests and observers. Clipboard, USB, Bluetooth, serial, sensors, and geolocation need end-to-end verification. Never bypass a permission check to make a reported status appear consistent. |
-| Codecs / MSE / EME | MediaCapabilities filters now intersect native supported, smooth and power-efficient results; they cannot promote false results. This is not a shared codec policy: compare playback, MSE, EME, WebRTC and actual decoding. |
+| Codecs / MSE / EME | MediaCapabilities filters intersect native results, including WebRTC callbacks and missing-history fallback; EME fallback retains key-system access. Mixed recording configs also check their audio codec. MediaRecorder MIME queries remain native, and synchronous encoder-start failure restores inactive state. A shared codec policy across playback, MSE, EME, WebRTC and actual decoding remains open. Queries and standalone callback tests do not verify a real encoder/decoder. |
 | Storage | Removed seed-derived and explicit renderer-only quota replacement. StorageManager and buckets retain browser accounting, individual limits and error paths. Backend quota enforcement, persistence and IndexedDB/Cache partitioning still require real browser tests. |
 | Network Information | Removed RTT/downlink-only overrides so getters, cached state, effectiveType, saveData and native change events share the notifier again. Real network transitions and any future notifier-level test policy remain unverified. |
 | Font provenance | Family-name filtering does not prove the selected font is bundled. Check generic, local, last-resort, emoji/CJK/math fallback and Font Loading API. |
 | Plugins / MIME / PDF | A reported PDF plugin cannot create a missing/disabled viewer. Verify actual PDF display and extension exposure. |
 | Input / device capabilities | Keyboard map overrides do not change actual key/code input. Touch/pointer CSS, gamepad, orientation, motion, and sensors remain open. |
 | CSS media features | Existing overrides cover selected preferences, not full gamut/HDR rendering, print media, scrollbars, and layout. |
-| WebGL | Remove discarded native renderer/vendor queries in persona identity branches. Actual capability clamps remain necessary; extensions, shader precision/compilation, antialiasing, and readbacks need real GPU tests. |
+| WebGL | Native readback bytes/errors/pack layout are retained across CPU/PBO/float paths; removed CPU-only postprocessing and unsafe bridge replacement. Extension enumeration and requests share one native support filter; shader precision stays native and limit clamps preserve zero capability. A common backend-level readback privacy mechanism is not implemented; real GPU acceptance remains open. |
 | Wasm / SIMD / threads / SharedArrayBuffer | No unified capability policy established; hardwareConcurrency/deviceMemory getters do not control these execution capabilities. |
 
 ## P2 coverage
@@ -54,7 +54,7 @@ A standalone C++ test with stubs checks the extracted algorithm or getter contra
 | HTTP/2 | SETTINGS, priority, initial windows and pseudo-header ordering require wire-level tests. |
 | HTTP/3 / QUIC | Transport parameters and connection retry behavior require packet-level verification. |
 | HTTP headers | UA and Accept-Language need joint JS/server checks. Accept-Encoding must match real decoder support. |
-| DNS / proxy / connection reuse | WebRTC policy is not an HTTP/QUIC/DNS routing policy. Verify actual routes, IPv4/IPv6 priority and connection reuse. |
+| DNS / proxy / connection reuse | SDK GeoIP metadata requests use the effective HTTP/HTTPS proxy without environment bypass or direct fallback; proxied launches default to the native non-proxied-UDP restriction. WebRTC policy is not an HTTP/QUIC/DNS routing policy. Verify actual routes, IPv4/IPv6 priority and connection reuse; TLS/HTTP personas remain unimplemented. |
 | Date / timezone / DST / Temporal | Existing timezone substitution does not complete initialization, DST boundary, host timezone change, and Temporal testing. |
 | Timer quantization | No unified persona quantization for Date.now, performance.now, RAF and IdleCallback. |
 | Page lifecycle | Preserve native visibility, throttling, freeze/resume behavior until a specified, tested policy exists. |
@@ -80,7 +80,11 @@ Renderer-only overrides that contradicted actual browser behavior are retired; c
 
 - `--uxr-storage-quota` / `--fingerprint-storage-quota` no longer changes only reported storage capacity, and Canvas seeds no longer generate fictitious quotas. Origin estimates and individual bucket limits remain browser-owned.
 - `--uxr-net-rtt` and `--uxr-net-downlink` no longer override isolated getters. Network Information values and change events remain notifier-owned; zero RTT/downlink is a valid observation.
-- `--uxr-codec-*` / `--fingerprint-codec-*` filters only restrict native supported/smooth/power-efficient results. They cannot enable a decoder, smooth playback or hardware acceleration.
+- `--uxr-codec-*` / `--fingerprint-codec-*` filters only restrict native supported/smooth/power-efficient results. They cannot enable a decoder, smooth playback or hardware acceleration. `--uxr-codec-matrix` no longer bypasses MediaRecorder's native MIME/encoder checks.
+- Canvas export no longer applies the legacy random transform inside `ImageEncoder`. Valid persona seeds use the prepared Canvas buffer once; `--uxr-disable-fingerprint-noise` keeps that path unmodified. Without a valid persona seed, the optional legacy Canvas readback feature can still affect `getImageData`; legacy readback/export privacy is not a unified implementation.
+- `--uxr-webgpu-canvas-format` no longer replaces the backend's preferred format; an application can explicitly request a supported format through normal WebGPU configuration.
+- WebGL readback no longer applies CPU-only noise or replaces packed pixels from Canvas Bridge. PBO, floating-point, error and native pack semantics remain intact; unified GPU privacy is still open.
+- The SDKs reject `--fingerprint-webrtc-ip`, `--fingerprint-webrtc-fake-srflx`, `--fingerprint-webrtc-fake-srflx-allow-udp` and their `uxr` counterparts. Direct engine `uxr` retirement flags produce a WebRTC configuration error. Use real proxy/TURN routes and native IP handling policy; synthetic addresses are not routing.
 - `--uxr-webgpu-limit-*` no longer overrides the adapter/device getters. Actual limits and request validation remain owned by Dawn; a persona-aware backend limit policy is still open.
 - `--uxr-media-devices` no longer inserts nonexistent devices into an empty enumeration. Use a real or explicitly configured Chromium test device backend when testing media capture.
 - `--uxr-notification-permission` no longer rewrites permission getters or query results. Configure real browser permissions instead.
@@ -100,7 +104,7 @@ python3 tools/fingerprint_smoke.py \
   --browser /path/to/verified/chromix/chrome \
   --platform linux windows \
   --locale de-DE fr-FR ja-JP \
-  --seed 0x13579BDF --other-seed 0x2468ACE0 \
+  --seed 0x100000001 --other-seed 0x8000000000000001 \
   --output /tmp/chromix-fingerprint-smoke.json
 ```
 
@@ -108,9 +112,46 @@ Use `--expected-sha256` with an independently obtained **executable** hash when 
 
 The runner serves only its own loopback HTTP origin, rejects external proxy requests, restricts page/worker requests and WebSockets, and disables selected browser background networking. These controls are not an operating-system network sandbox. It grants no media permissions and invokes capture only inside a document whose policy denies camera/microphone access.
 
-Checks cover negotiated HTTP hints versus JS in window/iframe/dedicated worker, requested platform/default Intl locale, repeated Canvas reads, selected offline audio invariants, denied media behavior, reload stability, and persistent-profile restart stability. Network Information and StorageManager estimates are also collected in all three contexts and checked for types/ranges and explicit API failures. Dynamic network estimates and quotas are excluded from identity/restart comparisons; existing usage above a reduced quota is allowed. These probes do not test connection events, real throughput, disk enforcement or storage buckets. Each persona/seed family gets a fresh temporary profile; restarts reuse that profile. The control uses `--fingerprint=off` without locale/platform overrides, not a separate stock Chromium binary. Missing evidence, crashes, mismatches and unexpected external requests produce a failed JSON report and nonzero exit. Unsupported optional probes are reported separately and do not complete their backlog category.
+Checks cover negotiated HTTP hints versus JS in window/iframe/dedicated worker, requested platform/default Intl locale, Canvas crops/transparent borders/PNG export/ImageBitmap/F16 stability, WebGL shader/readback/error/pack behavior, WebGPU request/configure/copy/map, offline oscillator/compressor/silence/mutable PCM and PCM16 WAV decode, negative codec queries, denied media behavior, reload and profile restart. The runner also exercises offline/online events in window and iframe and checks a loopback fetch's ResourceTiming.
 
-## Merge integration (2026-09-10)
+Network Information and StorageManager estimates are collected in all three contexts and checked for types/ranges and explicit API failures. Dynamic estimates and quotas are excluded from identity/restart comparisons; existing usage above a reduced quota is allowed. Offline emulation is not real throughput, proxy/TURN routing, DNS, disk enforcement or storage-bucket acceptance. Each persona/seed family gets a fresh temporary profile; restarts reuse that profile. The control uses the same executable with `--fingerprint=off` and no locale/platform overrides, not a stock Chromium binary. Missing evidence, crashes, mismatches and unexpected external requests fail the report and exit code. Explicitly unsupported optional APIs are reported separately; they do not complete a backlog category. Node mocks and validator fixtures are never marked as browser runtime evidence.
+
+## Canvas / GPU / media / network integration (2026-09-10)
+
+This local work adds Canvas async and encoder patches `0121`–`0124` to the active series. The constructor prepares one encoding buffer after dimension limiting and makes a private copy before noise or alpha conversion; idle tasks keep ownership and worker/encoder tasks receive it without reapplying noise. The shared ImageEncoder no longer randomly mutates its input, so synchronous, worker and thread-pool encoding do not add a second transform or bypass the noise-disable switch. Conversion/allocation failure completes the callback or promise, and late idle tasks do not reinitialize released state. F16 pixels retain native representation without an invented privacy transform.
+
+Canvas parses strict decimal nonzero uint64 seeds and mixes their upper bits into the existing 32-bit pixel hash; legacy uint32 output is retained. This is a many-to-one noise hash, not a collision-free 64-bit mapping. The GPU seed helper also consumes high seed bits and no longer caches configuration before renderer initialization. A bare browser `--fingerprint` generates a nonzero uint64 seed; SDK saved/default seeds remain the compatible uint32 format.
+
+GPU changes preserve native shader precision, readback errors and packing, backend-preferred WebGPU format, and zero hardware limits. WebGL extension filtering now applies to both enumeration and requests. Restoring native readback avoids the inconsistent CPU-only transform; it does not implement common Canvas/WebGL/WebGPU rendering privacy.
+
+Media fixes preserve real MIME/encoder checks, restore MediaRecorder state and clean up partial backend initialization after failed start, check audio support in mixed recording queries, retain EME key-system access on history-service fallback, and discard WebRTC capability callbacks after context destruction. Shared playback/MSE/EME/WebRTC codec policy and graph-level audio privacy remain open.
+
+WebRTC now retains native candidates and SDP and rejects unusable STUN mapped addresses. Success and failure sets remain disjoint: a failed keepalive cannot double-count an already successful server, and a late success replaces its earlier failure. Malformed responses from an established allocation still schedule the next native keepalive while within its lifetime; a first invalid response completes as a failure without starting a retry chain. Completion still waits for outstanding servers and native mDNS readiness; errors retain their native notification path. Extracted allocator tests check that another server's candidate arrives before completion, not just the set sizes.
+
+The SDKs use the effective proxy for GeoIP, reject failed or invalid metadata and retired candidate flags, and default proxied launches to Chromium's native non-proxied-UDP restriction. Explicit native policy still wins. Tests use only local proxy/metadata servers. GeoIP's existing HTTP service is unauthenticated; Python synchronous DNS/connect can overrun its nominal timeout, but a late connection is rejected before sending the metadata request. A later context with another proxy does not recompute browser-level locale/timezone. Real routing, DNS, TLS and HTTP protocol acceptance remain separate work.
+
+## Current domain validation results (2026-09-10)
+
+These results cover the uncommitted Canvas/GPU/audio/media/network changes on top of `167c468`, including patches `0121`–`0124` and the final STUN keepalive correction. Validation finished at **09:48:47 UTC**; no tests were deselected.
+
+| Validation | Result | Scope |
+|---|---|---|
+| Patch linter | 124 patches; all 8 checks passed | Contiguous `0001`–`0124`, syntax, naming and patch conventions |
+| Full Python suite | 3,182 passed, 31 skipped, 1 existing warning | Includes source provenance, compiled extracted C++ contracts, SDK loopback tests and browser-probe validators |
+| Node SDK suite | 137 passed, no skips | Node v24.8.0; proxy precedence/authentication, GeoIP failure handling, launch/context options and packaging |
+| Three-platform full patch chain | 3 passed; included in full suite | Linux/macOS/Windows sparse copies, zero-fuzz application, normal/restored equivalence and repeat/check mode; not native builds |
+| Canvas targeted tests | 53 passed, no skips | ASan/UBSan, uint64 boundaries, async ownership, read-only encoder input, original-mutation control and real-header syntax checks; codecs remain stubbed |
+| WebRTC targeted tests | 258 passed, no skips | Native extracted success/failure/completion and allocator methods, plus owned pending-request queue and lifetime cases |
+| Keepalive mutation control | Passed | Reintroducing the early return in a temporary harness makes the pending-request assertion fail; no live STUN server or timer |
+| Input integrity | 4,937 source/fixture inputs unchanged | SHA-256 and mtime comparisons; 230 implementation/test files also unchanged throughout the final run |
+| Whitespace / merge state | Passed | `git diff --check`; no unresolved entries; build/CI implementation unchanged |
+| Matching Chromium build / browser | Not run | No matching verified executable, Python Playwright or browser MCP tool; no build or download initiated |
+
+Thirty skipped tests require PowerShell; one requires a native Windows junction. The warning is the existing intentional duplicate-ZIP-entry fixture. Browser probes were expanded but only their validators/mocks were executed. The suite does not verify native GPU rendering, codecs, ICE/TURN connectivity, DNS/proxy routing, GC/thread behavior or packet-level TLS/HTTP fingerprints.
+
+Local evidence is retained under `/tmp/chromix-fingerprint-domains-20260910T082739Z/`: `final-keepalive/` contains final logs, JUnit XML, file-integrity checks and `acceptance-summary.json`; earlier failed runs remain preserved. Two obsolete assertions were corrected during integration. Independent source review found the downstream Canvas mutation, STUN double terminal counting and truncated keepalive chain; each received a targeted fix and regression coverage.
+
+## Historical merge integration (2026-09-10)
 
 The local merge of `origin/main` at `a727c817` retains the earlier Canvas copy/bounds fixes, notifier-owned network state, mutable AudioBuffer data, native WebGPU capabilities, and shared persistent SDK seeds. It also preserves the correct Windows restored-source patch paths and `fingerprint_data.h` build input. The duplicate trailing time-clamper patch is removed rather than applied twice.
 
@@ -118,9 +159,9 @@ Incoming CPU/memory and display templates are synthetic, not a measured device c
 
 The new planning documents under `docs/` describe future work, not completed cross-process integration. Font mappings do not prove glyph-file provenance; `0112` only adds includes and does not implement layout-theme system fonts. Speech voice-list configuration changes reported entries, not the installed speech backend. Added battery, shader, font and timing hooks likewise require matching-build and browser validation before their categories can be accepted. Native audio latency and maximum-channel reporting are retained rather than enabling getter-only replacements. The CSS pointer/hover patch is rebased to the actual Chromium 152 method locations and uses its declared Mojo enum names.
 
-## Merge validation results
+## Historical merge validation results
 
-Final validation was run on the merged working tree with local pre-Chromix source fixtures supplied; no tests were deselected.
+These results apply to merge commit `167c468`, before the Canvas/GPU/media/network work described above. Validation used local pre-Chromix source fixtures; no tests were deselected.
 
 | Validation | Result | Scope |
 |---|---|---|

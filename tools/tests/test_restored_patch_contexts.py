@@ -31,7 +31,7 @@ PATCHES = {
 # Expected functional additions, excluding empty lines only; indentation is hashed.
 ADDITION_HASHES = {
     "0018": "938125a87df94a17835e9efe3c344f813688ed5f6cdaf6657845a8953c105e1c",
-    "0031": "9f2c6d746caf9289e97c04a6136ea5295076713ef92ea800b3caade0e15284d1",
+    "0031": "2a63477f7307d64ccdba20f174e4e25aac4a7d19df89fb002266d4c970a0dacd",
     "0033": "61b5b3ae456468cdf8ee6a901a1014d77dfef2880c9d64588bdd1f0a59980fce",
     "0047": "1d453ce398caed30c76bff4f7878fad8c21017435d981c39ff7d838647769bd9",
 }

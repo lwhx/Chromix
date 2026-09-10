@@ -29,7 +29,7 @@ index 44527d0a7b26..feceb3004db2 100644
 +    for (const auto& ph_token : base::SplitString(
 +             ph_allow_raw, ",", base::TRIM_WHITESPACE,
 +             base::SPLIT_WANT_NONEMPTY)) {
-+      ph_allowed.insert(String(ph_token.c_str()).ToAsciiLower().Utf8());
++      ph_allowed.insert(base::ToLowerASCII(ph_token));
 +    }
 +    if (ph_allowed.empty()) {
 +      return features;

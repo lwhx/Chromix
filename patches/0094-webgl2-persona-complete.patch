@@ -35,7 +35,7 @@ index bb56bec111..2de48e0cba 100644
 +  GLint real = 0;
 +  gl->GetIntegerv(pname, &real);
 +  const GLint value = std::max(0, persona_value);
-+  return real > 0 && value > real ? real : value;
++  return std::min(real, value);
  }
  
 -GLint WebGL2PersonaVaryingVectors(gpu::gles2::GLES2Interface* gl) {
@@ -46,7 +46,7 @@ index bb56bec111..2de48e0cba 100644
 +  GLfloat real = 0.0f;
 +  gl->GetFloatv(pname, &real);
 +  const GLfloat value = std::max(0.0f, persona_value);
-+  return real > 0.0f && value > real ? real : value;
++  return std::min(real, value);
 +}
 +
 +GLint PersonaMaxVaryingVectors(gpu::gles2::GLES2Interface* gl) {

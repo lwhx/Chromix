@@ -10,31 +10,50 @@ diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc b
  #include "third_party/blink/renderer/platform/image-encoders/image_encoder_utils.h"
  #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
  #include "third_party/blink/renderer/platform/wtf/text/base64.h"
-@@ -43,6 +45,60 @@
+@@ -43,6 +45,79 @@
  #include "ui/gfx/skia_span_util.h"
  
  namespace blink {
 +
 +namespace {
 +bool UxrCopyAndNoiseEncodeBuffer(SkPixmap& pm, sk_sp<SkImage>& retained_image) {
-+  const auto& config = base::UxrConfig::GetInstance();
-+  uint32_t seed = 0u;
-+  const SkColorType ct = pm.colorType();
-+  if (config.Has("uxr-disable-fingerprint-noise") ||
-+      !base::StringToUint(config.Get("uxr-canvas-seed"), &seed) || seed == 0u ||
-+      (ct != kRGBA_8888_SkColorType && ct != kBGRA_8888_SkColorType)) {
-+    return true;
-+  }
 +  if (!pm.addr() || pm.info().isEmpty() ||
++      !pm.info().validRowBytes(pm.rowBytes()) ||
 +      SkImageInfo::ByteSizeOverflowed(pm.computeByteSize())) {
 +    return false;
 +  }
++  const auto& config = base::UxrConfig::GetInstance();
++  const auto seed_text = config.Get("uxr-canvas-seed");
++  uint64_t seed64 = 0u;
++  const SkColorType ct = pm.colorType();
++  const bool apply_noise =
++      !config.Has("uxr-disable-fingerprint-noise") && !seed_text.empty() &&
++      seed_text.find_first_not_of("0123456789") == std::string::npos &&
++      base::StringToUint64(seed_text, &seed64) && seed64 != 0u &&
++      (ct == kRGBA_8888_SkColorType || ct == kBGRA_8888_SkColorType);
++  // SplitMix64's finalizer folds high bits without changing legacy 32-bit seeds.
++  uint64_t high = seed64 >> 32;
++  high = (high ^ (high >> 30)) * 0xbf58476d1ce4e5b9ULL;
++  high = (high ^ (high >> 27)) * 0x94d049bb133111ebULL;
++  high ^= high >> 31;
++  const uint32_t seed = static_cast<uint32_t>(seed64) ^
++                        static_cast<uint32_t>(high) ^
++                        static_cast<uint32_t>(high >> 32);
++  const bool normalize_alpha = pm.info().alphaType() != kUnpremul_SkAlphaType;
++  if (!apply_noise && !normalize_alpha)
++    return true;
 +  auto data = gfx::MakeSkDataFromSpanWithCopy(gfx::SkPixmapToSpan(pm));
 +  if (!data)
 +    return false;
-+  SkPixmap copy(pm.info(), data->writable_data(), pm.rowBytes());
++  const SkImageInfo info =
++      normalize_alpha ? pm.info().makeAlphaType(kUnpremul_SkAlphaType) : pm.info();
++  SkPixmap copy(info, data->writable_data(), pm.rowBytes());
++  if (normalize_alpha &&
++      !pm.readPixels(info, copy.writable_addr(), copy.rowBytes())) {
++    return false;
++  }
 +  auto pixels = gfx::SkPixmapToWritableSpan(copy);
-+  for (int y = 0; y < copy.height(); ++y) {
++  for (int y = 0; apply_noise && y < copy.height(); ++y) {
 +    auto row = pixels.subspan(static_cast<size_t>(y) * copy.rowBytes(),
 +                              copy.info().minRowBytes());
 +    for (int x = 0; x < copy.width(); ++x) {
@@ -71,7 +90,7 @@ diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc b
  
  ImageDataBuffer::ImageDataBuffer(scoped_refptr<StaticBitmapImage> image) {
    if (!image)
-@@ -83,6 +139,8 @@
+@@ -83,6 +158,8 @@
        return;
  
      sk_sp<SkData> data = SkData::MakeUninitialized(size);
@@ -80,7 +99,7 @@ diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc b
      pixmap_ = {info, data->writable_data(), info.minRowBytes()};
      if (!paint_image.readPixels(info, pixmap_.writable_addr(), rowBytes, 0,
                                  0)) {
-@@ -97,13 +155,23 @@
+@@ -97,13 +174,23 @@
        return;
      MSAN_CHECK_MEM_IS_INITIALIZED(pixmap_.addr(), pixmap_.computeByteSize());
    }

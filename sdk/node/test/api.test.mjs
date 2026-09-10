@@ -8,7 +8,10 @@ import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import http from "node:http";
+import https from "node:https";
+import { splitProxy, extractProxyUrl, geoipHttp } from "../_network.js";
 import {
   buildArgs, buildContextOptions, getDefaultStealthArgs, binaryInfo,
   resolveHumanConfig,
@@ -514,7 +517,228 @@ test("font directory reaches launch args and isolated Fontconfig paths", async (
   }
 });
 
-test("published Node package includes its persona import", () => {
+test("published Node package includes its persona and network imports", () => {
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
   assert.ok(pkg.files.includes("_persona.js"));
+  assert.ok(pkg.files.includes("_network.js"));
+});
+
+const geoData = { status: "success", timezone: "Asia/Tokyo", countryCode: "JP", query: "203.0.113.9" };
+
+function envFor(t, key, value) {
+  const previous = process.env[key];
+  if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  t.after(() => { if (previous === undefined) delete process.env[key]; else process.env[key] = previous; });
+}
+
+async function localServer(t, handler, tls) {
+  const server = tls ? https.createServer(tls, handler) : http.createServer(handler);
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => { server.closeAllConnections(); server.close(resolve); }));
+  return `${tls ? "https" : "http"}://127.0.0.1:${server.address().port}`;
+}
+
+function loopbackOnly(t) {
+  for (const transport of [http, https]) {
+    const original = transport.request;
+    t.mock.method(transport, "request", function (options, ...rest) {
+      assert.equal(options.hostname, "127.0.0.1", "no external network connection allowed");
+      return original.call(this, options, ...rest);
+    });
+  }
+}
+
+for (const flag of ["--fingerprint-webrtc-ip=auto", "--fingerprint-webrtc-ip=198.51.100.7",
+  "--uxr-webrtc-ip=198.51.100.7", "--uxr-webrtc-ip", "--fingerprint-webrtc-fake-srflx=198.51.100.7",
+  "--uxr-webrtc-fake-srflx-allow-udp"]) {
+  test(`retired ICE flag rejects before network: ${flag}`, async (t) => {
+    offline(t);
+    t.mock.method(http, "request", () => assert.fail("network attempted"));
+    assert.throws(() => buildArgs({ extraArgs: [flag] }), /retired.*real proxy.*force-webrtc-ip-handling-policy/);
+    await assert.rejects(fixtureApi.buildLaunchOptions({ geoip: true, stealthArgs: false,
+      launchOptions: { args: [flag] } }), /retired/);
+    assert.equal(calls.length, 0);
+  });
+}
+
+test("proxy credentials normalize once and preserve empty passwords, IPv6 and bypass", () => {
+  const proxy = { server: "http://[::1]:8080", username: "u@ +é", password: "p:@/%+", bypass: "*" };
+  const url = extractProxyUrl(proxy);
+  assert.match(url, /u%40%20%2B%C3%A9:p%3A%40%2F%25%2B@/);
+  assert.deepEqual(splitProxy(url), { server: proxy.server, username: proxy.username, password: proxy.password });
+  assert.deepEqual(splitProxy({ ...proxy, username: "", password: "" }), { ...proxy, username: "", password: "" });
+  assert.deepEqual(splitProxy("http://u:p:a@proxy:8080"), { server: "http://proxy:8080", username: "u", password: "p:a" });
+  assert.equal(splitProxy("proxy:8080").server, "http://proxy:8080");
+  assert.deepEqual(splitProxy("http://:@proxy:8080"), { server: "http://proxy:8080", username: "", password: "" });
+  for (const bad of ["http://u:%zz@proxy:80", "http://proxy:bad", "http://proxy/path", "http://u:%0a@proxy"])
+    assert.throws(() => splitProxy(bad), /Invalid proxy/);
+});
+
+test("GeoIP uses the final launchOptions proxy and does not generate ICE IP flags", async (t) => {
+  offline(t); loopbackOnly(t);
+  const requests = [], wrong = [];
+  const server = await localServer(t, (req, res) => { requests.push({ path: req.url, headers: req.headers }); res.end(JSON.stringify(geoData)); });
+  const decoy = await localServer(t, (req, res) => { wrong.push(req.url); res.end("{}"); });
+  for (const key of ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]) envFor(t, key, decoy);
+  for (const key of ["NO_PROXY", "no_proxy"]) envFor(t, key, "*");
+  const credentials = { server, username: "u@ +é", password: "p:@/%+", bypass: "*" };
+  const options = { geoip: true, proxy: decoy, launchOptions: { proxy: credentials }, args: ["--fingerprint=42"] };
+  const snapshot = structuredClone(options);
+  const launch = await fixtureApi.buildLaunchOptions(options);
+  assert.deepEqual(launch.proxy, credentials);
+  assert.equal(requests.length, 1); assert.equal(wrong.length, 0);
+  assert.equal(requests[0].path, "http://ip-api.com/json/?fields=status,timezone,countryCode,query");
+  assert.equal(requests[0].headers.host, "ip-api.com");
+  assert.equal(requests[0].headers["proxy-authorization"], `Basic ${Buffer.from("u@ +é:p:@/%+", "utf8").toString("base64")}`);
+  assert.ok(launch.args.includes("--fingerprint-timezone=Asia/Tokyo"));
+  assert.ok(launch.args.includes("--lang=ja-JP"));
+  assert.ok(launch.args.includes("--force-webrtc-ip-handling-policy=disable_non_proxied_udp"));
+  assert.ok(!launch.args.some((arg) => /^--(?:fingerprint|uxr)-webrtc-(ip|fake)/.test(arg)));
+  assert.equal(fingerprint(launch.args), "42");
+  assert.deepEqual(options, snapshot);
+});
+
+test("context and persistent proxy overrides drive GeoIP without losing auth", async (t) => {
+  const root = offline(t); loopbackOnly(t);
+  let hits = 0;
+  const server = await localServer(t, (req, res) => { hits++; res.end(JSON.stringify(geoData)); });
+  const credentials = `${server.replace("://", "://u:p%3Aa@")}`;
+  const options = { geoip: true, proxy: "socks5://unused.invalid:1080",
+    contextOptions: { proxy: credentials }, args: ["--fingerprint=42"] };
+  const ctx = await fixtureApi.launchContext(options);
+  assert.deepEqual(ctx.contextOptions.proxy, { server, username: "u", password: "p:a" });
+  await ctx.close();
+  await persistent(root, options);
+  assert.deepEqual(calls.at(-1).options.proxy, { server, username: "u", password: "p:a" });
+  assert.equal(hits, 2);
+});
+
+test("GeoIP flags survive explicit launch args without enabling stealth defaults", async (t) => {
+  offline(t); loopbackOnly(t);
+  const server = await localServer(t, (req, res) => res.end(JSON.stringify(geoData)));
+  const options = { stealthArgs: false, geoip: true, proxy: server,
+    launchOptions: { args: ["--custom-argument"] } };
+  const launch = await fixtureApi.buildLaunchOptions(options);
+  assert.ok(launch.args.includes("--custom-argument"));
+  assert.ok(launch.args.includes("--fingerprint-timezone=Asia/Tokyo"));
+  assert.ok(launch.args.includes("--fingerprint-locale=ja-JP"));
+  assert.ok(launch.args.includes("--lang=ja-JP"));
+  assert.ok(!launch.args.some(arg => arg.startsWith("--fingerprint=")));
+  assert.ok(!launch.args.includes("--start-maximized"));
+});
+
+for (const mode of [{ stealthArgs: false }, { args: ["--fingerprint=off"] }]) {
+  test(`browser context proxy remains applied without geometry: ${JSON.stringify(mode)}`, async (t) => {
+    offline(t); loopbackOnly(t);
+    let hits = 0;
+    const server = await localServer(t, (req, res) => { hits++; res.end(JSON.stringify(geoData)); });
+    const browser = await fixtureApi.launch({ ...mode, geoip: true,
+      contextOptions: { proxy: server.replace("://", "://u:p@") } });
+    for (const method of ["newPage", "newContext"]) {
+      const context = await browser[method]();
+      assert.deepEqual(context.contextOptions.proxy, { server, username: "u", password: "p" });
+      assert.equal(context.contextOptions.viewport, undefined);
+      const explicit = await browser[method]({ proxy: { server: "http://other.invalid:80" } });
+      assert.equal(explicit.contextOptions.proxy.server, "http://other.invalid:80");
+    }
+    assert.equal(hits, 1);
+    await browser.close();
+  });
+}
+
+test("native WebRTC policy overrides and explicit proxy removal remain effective", async (t) => {
+  offline(t);
+  for (const policy of ["default", "default_public_interface_only", "default_public_and_private_interfaces", "disable_non_proxied_udp"]) {
+    const flag = `--force-webrtc-ip-handling-policy=${policy}`;
+    const launch = await fixtureApi.buildLaunchOptions({ proxy: "socks5://proxy:1080", stealthArgs: false, launchOptions: { args: [flag] } });
+    assert.deepEqual(launch.args, [flag]);
+  }
+  const socks = await fixtureApi.buildLaunchOptions({ proxy: "socks5://proxy:1080", stealthArgs: false });
+  assert.ok(socks.args.includes("--force-webrtc-ip-handling-policy=disable_non_proxied_udp"));
+  const removed = await fixtureApi.buildLaunchOptions({ proxy: "http://unused:1", launchOptions: { proxy: null } });
+  assert.equal(removed.proxy, null);
+  assert.ok(!removed.args.some((a) => a.startsWith("--force-webrtc")));
+});
+
+test("direct GeoIP ignores environment proxies and keeps explicit timezone/locale", async (t) => {
+  offline(t); loopbackOnly(t);
+  const requests = [];
+  const endpoint = await localServer(t, (req, res) => { requests.push(req); res.end(JSON.stringify(geoData)); });
+  for (const key of ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "ALL_PROXY"]) envFor(t, key, "http://unused.invalid:1");
+  assert.deepEqual(await geoipHttp(null, `${endpoint}/json`), { timezone: "Asia/Tokyo", locale: "ja-JP", exitIp: "203.0.113.9" });
+  assert.equal(requests[0].url, "/json");
+  assert.equal(requests[0].headers["proxy-authorization"], undefined);
+  const explicit = await fixtureApi.maybeResolveGeoip(true, endpoint, "UTC", "en-US", []);
+  assert.deepEqual(explicit, { timezone: "UTC", locale: "en-US", exitIp: "203.0.113.9" });
+  const flags = await fixtureApi.maybeResolveGeoip(true, endpoint, undefined, undefined,
+    ["--fingerprint-timezone=Europe/Berlin", "--lang=de-DE"]);
+  assert.equal(flags.timezone, "Europe/Berlin"); assert.equal(flags.locale, "de-DE");
+});
+
+for (const [name, status, body, headers] of [
+  ["redirect", 302, "", { Location: "http://external.invalid/leak" }],
+  ["proxy auth rejection", 407, "{}", {}], ["malformed JSON", 200, "{", {}],
+  ["invalid IP", 200, JSON.stringify({ ...geoData, query: "1.2.3.999" }), {}],
+  ["scoped IP", 200, JSON.stringify({ ...geoData, query: "fe80::1%lo" }), {}],
+  ["invalid timezone", 200, JSON.stringify({ ...geoData, timezone: "Earth/Unknown" }), {}],
+  ["timezone injection", 200, JSON.stringify({ ...geoData, timezone: "UTC\n--flag" }), {}],
+  ["invalid country", 200, JSON.stringify({ ...geoData, countryCode: "ZZ" }), {}],
+  ["failed status", 200, JSON.stringify({ ...geoData, status: "fail" }), {}],
+  ["array", 200, "[]", {}], ["oversize", 200, "x".repeat(65537), {}],
+  ["oversize declared", 200, "", { "Content-Length": "65537" }],
+]) {
+  test(`GeoIP safely rejects ${name} without fallback`, async (t) => {
+    offline(t); loopbackOnly(t);
+    let hits = 0;
+    const proxy = await localServer(t, (req, res) => { hits++; res.writeHead(status, headers); res.end(body); });
+    await assert.rejects(fixtureApi.maybeResolveGeoip(true, proxy), /GeoIP/);
+    assert.equal(hits, 1);
+  });
+}
+
+test("SOCKS GeoIP and invalid timeout fail before any connection", async (t) => {
+  offline(t);
+  t.mock.method(http, "request", () => assert.fail("network attempted"));
+  for (const proxy of ["socks4://proxy:1080", "socks5://proxy:1080", "socks5h://proxy:1080"])
+    await assert.rejects(fixtureApi.maybeResolveGeoip(true, proxy), /not SOCKS.*No direct fallback/);
+  envFor(t, "CLOAKBROWSER_GEOIP_TIMEOUT_SECONDS", undefined);
+  for (const value of ["0", "-1", "NaN", "Infinity", "61", ""]) {
+    process.env.CLOAKBROWSER_GEOIP_TIMEOUT_SECONDS = value;
+    await assert.rejects(geoipHttp("http://127.0.0.1:1"), /TIMEOUT_SECONDS/);
+  }
+});
+
+test("GeoIP has a total deadline even for a trickling response", async (t) => {
+  offline(t); loopbackOnly(t);
+  envFor(t, "CLOAKBROWSER_GEOIP_TIMEOUT_SECONDS", "0.1");
+  const proxy = await localServer(t, (req, res) => {
+    res.writeHead(200); res.write(" ");
+    const timer = setInterval(() => res.write(" "), 10);
+    res.on("close", () => clearInterval(timer));
+  });
+  const start = Date.now();
+  await assert.rejects(geoipHttp(proxy), /timed out/);
+  assert.ok(Date.now() - start < 1500);
+});
+
+test("HTTPS proxy uses TLS, validates its certificate and never falls back", async (t) => {
+  const root = offline(t); loopbackOnly(t);
+  const cert = join(root, "cert.pem"), key = join(root, "key.pem");
+  const generated = spawnSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+    "-subj", "/CN=localhost", "-addext", "subjectAltName=IP:127.0.0.1", "-keyout", key, "-out", cert]);
+  assert.equal(generated.status, 0, generated.stderr?.toString());
+  let hits = 0;
+  const proxy = await localServer(t, (req, res) => {
+    hits++; assert.ok(req.socket.encrypted);
+    assert.equal(req.headers["proxy-authorization"], "Basic dTpw");
+    res.end(JSON.stringify(geoData));
+  }, { cert: readFileSync(cert), key: readFileSync(key) });
+  await assert.rejects(geoipHttp(proxy), /connection failed/);
+  assert.equal(hits, 0);
+  const original = https.request;
+  t.mock.method(https, "request", function (options, ...rest) {
+    return original.call(this, { ...options, ca: readFileSync(cert) }, ...rest);
+  });
+  const result = await geoipHttp(proxy.replace("://", "://u:p@"));
+  assert.equal(result.locale, "ja-JP"); assert.equal(hits, 1);
 });

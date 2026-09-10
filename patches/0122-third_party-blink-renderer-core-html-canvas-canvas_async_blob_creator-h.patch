@@ -1,0 +1,13 @@
+diff --git a/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.h b/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.h
+--- a/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.h
++++ b/third_party/blink/renderer/core/html/canvas/canvas_async_blob_creator.h
+@@ -101,7 +101,8 @@
+   // see comment above the implementation of ScheduleAsyncBlobCreation.
+   sk_sp<SkImage> skia_image_;
+-  SkPixmap src_data_;  // Holds a raw pointer owned by `skia_ìmage`.
++  std::unique_ptr<ImageDataBuffer> image_data_buffer_;
++  SkPixmap src_data_;  // Backed by image_data_buffer_ or skia_image_.
+   std::unique_ptr<ImageEncoder> encoder_;
+   Vector<unsigned char> encoded_image_;
+   int num_rows_completed_;
+ 

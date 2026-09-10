@@ -102,13 +102,42 @@ def test_patch_applies_without_fuzz_or_offset_and_reverses(patched_sources, numb
 
 
 @pytest.mark.parametrize("number", SOURCE_PATCHES)
-def test_fixture_matches_recovered_local_chromium(number):
+def test_fixture_matches_recovered_local_chromium(tmp_path, number):
     baseline = os.environ.get("CHROMIX_GPU_BASELINE_ROOT")
     if not baseline:
         pytest.skip("set CHROMIX_GPU_BASELINE_ROOT to verify full-source provenance")
-    lines = (Path(baseline) / target_path(number)).read_text().splitlines(keepends=True)
-    for first, text in SOURCE_SECTIONS[number]:
-        assert "".join(lines[first - 1:first - 1 + len(text.splitlines())]) == text
+    original_path = Path(baseline) / target_path(number)
+    original, timestamp = original_path.read_bytes(), original_path.stat().st_mtime_ns
+    source = original.decode()
+    if number == "0110":
+        if PATCH_BIN is None:
+            pytest.skip("GNU patch is required for the WebGL predecessor chain")
+        target = tmp_path / target_path(number)
+        target.parent.mkdir(parents=True)
+        target.write_bytes(original)
+        for name in (ROOT / "patches/series").read_text().splitlines():
+            if not name or name.startswith("#"):
+                continue
+            if Path(name).name.startswith("0110-"):
+                break
+            predecessor = ROOT / name
+            if re.search(r"^\+\+\+ b/(.*)$", predecessor.read_text(), re.M)[1] != target_path(number):
+                continue
+            result = subprocess.run(
+                [PATCH_BIN, "-p1", "--fuzz=0", "--batch", "--forward", "--get=0",
+                 "--no-backup-if-mismatch", "--reject-file=-", "-i", str(predecessor)],
+                cwd=tmp_path, text=True, capture_output=True, timeout=15,
+                env={**os.environ, "LC_ALL": "C", "PATCH_GET": "0"})
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert "fuzz" not in result.stdout
+        source = target.read_text()
+        for _, text in SOURCE_SECTIONS[number]:
+            assert source.count(text) == 1
+    else:
+        lines = source.splitlines(keepends=True)
+        for first, text in SOURCE_SECTIONS[number]:
+            assert "".join(lines[first - 1:first - 1 + len(text.splitlines())]) == text
+    assert (original_path.read_bytes(), original_path.stat().st_mtime_ns) == (original, timestamp)
 
 
 def excerpt(source, start, end):
@@ -203,6 +232,7 @@ def runtime_binary(tmp_path_factory, patched_sources):
 
 @pytest.mark.parametrize("case", ["features-unset", "features-empty", "features-whitespace",
                                   "features-intersection", "features-unknown", "features-no-adapter-features",
+                                  "features-embedded-nul", "features-token-suffix",
                                   "request-features", "request-empty-features", "limits-native", "limits-u32", "limits-u64",
                                   "limits-alignment", "limits-undefined", "limits-direction",
                                   "webgl-persona", "webgl-real", "webgl-context-lost", "webgl-extension-disabled"])
@@ -1000,6 +1030,12 @@ int main(int argc, char** argv) {
     } else if (mode == "features-unknown") {
       config.values["uxr-webgpu-features"] = "internal,unknown,depth-clip";
       expected.clear();
+    } else if (mode == "features-embedded-nul") {
+      config.values["uxr-webgpu-features"] = std::string("depth-clip-control\0suffix", 25);
+      expected.clear();
+    } else if (mode == "features-token-suffix") {
+      config.values["uxr-webgpu-features"] = "depth-clip-control-suffix";
+      expected.clear();
     } else if (mode == "features-no-adapter-features") {
       native.clear(); expected.clear();
       config.values["uxr-webgpu-features"] = "texture-compression-bc";
@@ -1007,8 +1043,8 @@ int main(int argc, char** argv) {
     int calls = 0;
     std::unique_ptr<GPUSupportedFeatures> features(MakeFeatureNameSet({native, &calls}));
     assert(features->names == expected && calls == expected_calls);
-    if (mode == "request-features" || mode == "request-empty-features") {
-      for (Feature f : {Feature::DepthClipControl, Feature::TextureCompressionBC}) {
+    {
+      for (Feature f : {Feature::DepthClipControl, Feature::TextureCompressionBC, Feature::Internal}) {
         Descriptor descriptor{{V8GPUFeatureName(f)}};
         ScriptPromiseResolverBase resolver;
         bool accepted = ValidateFeatures(features.get(), &descriptor, &resolver);

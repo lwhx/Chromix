@@ -26,6 +26,7 @@ import {
 } from "./_binary.js";
 import { fontLaunchEnv, fontDirWhitelistArg } from "./_fonts.js";
 import { ensurePersonaGeometry } from "./_persona.js";
+import { extractProxyUrl, geoipHttp, networkArgs, splitProxy } from "./_network.js";
 
 // One geometry pick per options object, shared by buildLaunchOptions and
 // buildContextOptions (launchPersistentContext calls them separately).
@@ -155,6 +156,7 @@ async function profileSeed(userDataDir) {
 
 export function buildArgs({ stealthArgs = true, extraArgs = [], timezone, locale,
                             headless = true, extensionPaths, startMaximized = false } = {}) {
+  extraArgs = networkArgs(extraArgs);
   const seen = new Map();
   const put = (arg) => seen.set(arg.split("=", 1)[0], arg);
   if (stealthArgs) for (const a of getDefaultStealthArgs()) put(a);
@@ -179,68 +181,24 @@ function resolveAbs(p) {
 }
 
 // ---------------------------------------------------------------------------
-// GeoIP + WebRTC exit IP
+// GeoIP metadata (never used to synthesize WebRTC candidates)
 // ---------------------------------------------------------------------------
 
-function extractProxyUrl(proxy) {
-  if (!proxy) return null;
-  if (typeof proxy === "string") return proxy;
-  let url = proxy.server;
-  if (proxy.username && proxy.password) {
-    const i = url.indexOf("://");
-    const scheme = i > 0 ? url.slice(0, i) : "http";
-    const rest = i > 0 ? url.slice(i + 3) : url;
-    url = `${scheme}://${proxy.username}:${proxy.password}@${rest}`;
-  }
-  return url;
-}
-
-async function geoipHttp(proxyUrl) {
-  const timeoutMs = Number(process.env.CLOAKBROWSER_GEOIP_TIMEOUT_SECONDS || 10) * 1000;
-  try {
-    const url = "http://ip-api.com/json/?fields=status,timezone,countryCode,query";
-    const r = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
-    const d = await r.json();
-    if (d.status === "success")
-      return { timezone: d.timezone || null, locale: (d.countryCode || "").toLowerCase() || null, exitIp: d.query || null };
-  } catch { /* fail open */ }
-  return null;
-}
-
+// Explicit proxy always wins over environment/bypass settings; no proxy means direct.
+// Lookup failures reject. The returned IP is metadata, not a routing guarantee.
 export async function maybeResolveGeoip(geoip, proxy, timezone, locale, args) {
   if (!geoip) return { timezone, locale, exitIp: null };
-  if (!timezone && args) {
-    const f = args.find((a) => a.startsWith("--fingerprint-timezone="));
+  if (timezone == null && args) {
+    const f = args.filter((a) => a.startsWith("--fingerprint-timezone=") || a.startsWith("--uxr-timezone=")).at(-1);
     if (f) timezone = f.split("=").slice(1).join("=");
   }
-  if (!locale && args) {
-    const f = args.find((a) => a.startsWith("--lang=") || a.startsWith("--fingerprint-locale="));
+  if (locale == null && args) {
+    const f = args.filter((a) => a.startsWith("--lang=") || a.startsWith("--fingerprint-locale=") || a.startsWith("--uxr-locale=")).at(-1);
     if (f) locale = f.split("=").slice(1).join("=");
   }
   const geo = await geoipHttp(extractProxyUrl(proxy));
-  if (!geo) {
-    process.stderr.write("[chromix] geoip lookup failed; timezone/locale unchanged\n");
-    return { timezone, locale, exitIp: null };
-  }
+  if (!geo) throw new Error("GeoIP lookup failed; no direct fallback");
   return { timezone: timezone ?? geo.timezone, locale: locale ?? geo.locale, exitIp: geo.exitIp };
-}
-
-async function resolveWebrtcArgs(args, proxy) {
-  if (!args || !args.includes("--fingerprint-webrtc-ip=auto")) return args;
-  args = [...args];
-  const i = args.indexOf("--fingerprint-webrtc-ip=auto");
-  const proxyUrl = extractProxyUrl(proxy);
-  if (!proxyUrl) { args.splice(i, 1); return args; }
-  const geo = await geoipHttp(proxyUrl);
-  if (geo?.exitIp) args[i] = `--fingerprint-webrtc-ip=${geo.exitIp}`;
-  else args.splice(i, 1);
-  return args;
-}
-
-function appendWebrtcExitIp(args, exitIp) {
-  if (exitIp && !(args || []).some((a) => a.startsWith("--fingerprint-webrtc-ip")))
-    return [...(args || []), `--fingerprint-webrtc-ip=${exitIp}`];
-  return args;
 }
 
 // ---------------------------------------------------------------------------
@@ -293,24 +251,12 @@ export function findWidevineCdm() {
 // Launch options assembly
 // ---------------------------------------------------------------------------
 
-function splitProxy(proxy) {
-  if (!proxy) return undefined;
-  if (typeof proxy === "string") {
-    const i = proxy.indexOf("://");
-    const scheme = i > 0 ? proxy.slice(0, i) : "http";
-    const rest = i > 0 ? proxy.slice(i + 3) : proxy;
-    const at = rest.lastIndexOf("@");
-    if (at > 0) {
-      const [username, password] = rest.slice(0, at).split(":");
-      const out = { server: `${scheme}://${rest.slice(at + 1)}`, username };
-      if (password) out.password = password;
-      return out;
-    }
-    return { server: proxy };
-  }
-  const out = { server: proxy.server };
-  for (const k of ["bypass", "username", "password"]) if (proxy[k]) out[k] = proxy[k];
-  return out;
+function launchProxy(options) {
+  return Object.hasOwn(options.launchOptions || {}, "proxy") ? options.launchOptions.proxy : options.proxy;
+}
+
+function geoipProxy(options) {
+  return Object.hasOwn(options.contextOptions || {}, "proxy") ? options.contextOptions.proxy : launchProxy(options);
 }
 
 function effectiveHeadless(options) {
@@ -335,6 +281,7 @@ export function buildContextOptions(options = {}) {
     : ctx.viewport !== undefined ? ctx.viewport : headless ? personaViewport : null;
   return {
     ...ctx,
+    ...(ctx.proxy ? { proxy: splitProxy(ctx.proxy) } : {}),
     ...(options.userAgent ? { userAgent: options.userAgent } : {}),
     viewport,
     ...(viewport && persona && persona.dpr !== 1 && ctx.deviceScaleFactor === undefined
@@ -345,12 +292,13 @@ export function buildContextOptions(options = {}) {
 
 export async function buildLaunchOptions(options = {}) {
   const headless = effectiveHeadless(options);
-  const binary = await ensureBinary(options);
+  const proxy = splitProxy(launchProxy(options));
+  const lookupProxy = splitProxy(geoipProxy(options));
   const persona = personaGeometryFor(options);
-  const { timezone, locale, exitIp } = await maybeResolveGeoip(
-    options.geoip, options.proxy, options.timezone ?? options.timezoneId, options.locale, persona.args);
-  let args = await resolveWebrtcArgs(persona.args, options.proxy);
-  args = appendWebrtcExitIp(args, exitIp);
+  let args = networkArgs(persona.args, proxy || lookupProxy);
+  const { timezone, locale } = await maybeResolveGeoip(
+    options.geoip, lookupProxy, options.timezone ?? options.timezoneId, options.locale, args);
+  const binary = await ensureBinary(options);
   // Widevine / DRM: auto-enable when a CDM is present; CLOAKBROWSER_WIDEVINE=0 opts out.
   if (process.env.CLOAKBROWSER_WIDEVINE !== "0" && !(args || []).some((a) => a.startsWith("--uxr-widevine-cdm"))) {
     const cdm = findWidevineCdm();
@@ -367,22 +315,31 @@ export async function buildLaunchOptions(options = {}) {
   if (!headless && persona.geometry && !(args || []).some((a) => a.startsWith("--window-size"))) {
     args = [`--window-size=${persona.geometry.outerWidth},${persona.geometry.outerHeight}`, ...(args || [])];
   }
-  const chromeArgs = options.stealthArgs === false && options.launchOptions?.args !== undefined
-    ? args : buildArgs({
-    stealthArgs: options.stealthArgs ?? true,
-    extraArgs: args,
-    timezone, locale, headless,
-    extensionPaths: options.extensionPaths,
-    startMaximized: options.startMaximized ?? true,
-  });
-  const proxy = splitProxy(options.proxy);
+  let chromeArgs;
+  if (options.stealthArgs === false && options.launchOptions?.args !== undefined) {
+    const explicit = new Map(args.map(arg => [arg.split("=", 1)[0], arg]));
+    if (timezone) explicit.set("--fingerprint-timezone", `--fingerprint-timezone=${timezone}`);
+    if (locale) {
+      explicit.set("--lang", `--lang=${locale}`);
+      explicit.set("--fingerprint-locale", `--fingerprint-locale=${locale}`);
+    }
+    chromeArgs = [...explicit.values()];
+  } else {
+    chromeArgs = buildArgs({
+      stealthArgs: options.stealthArgs ?? true,
+      extraArgs: args,
+      timezone, locale, headless,
+      extensionPaths: options.extensionPaths,
+      startMaximized: options.startMaximized ?? true,
+    });
+  }
   const env = fontLaunchEnv(binary, options.launchOptions?.env, options.fontsDir);
   return {
     executablePath: binary,
     headless,
     ignoreDefaultArgs: ["--enable-automation"],
-    ...(proxy ? { proxy } : {}),
     ...options.launchOptions,
+    ...(proxy ? { proxy } : {}),
     args: chromeArgs,
     ...(env ? { env } : {}),
   };
@@ -543,10 +500,13 @@ export async function launch(options = {}) {
   const launchOpts = await buildLaunchOptions(options);
   const browser = await chromium.launch(launchOpts);
   for (const method of ["newPage", "newContext"]) {
-    if (!browser[method] || !personaGeometryFor(options).geometry) continue;
+    const geometry = personaGeometryFor(options).geometry;
+    if (!browser[method] || (!geometry && !options.contextOptions)) continue;
     const original = browser[method].bind(browser);
     browser[method] = (contextOptions = {}) => {
       const defaults = buildContextOptions(options);
+      if (!geometry && options.viewport === undefined && options.contextOptions?.viewport === undefined)
+        delete defaults.viewport;
       if (contextOptions.viewport === null) delete defaults.deviceScaleFactor;
       return original({ ...defaults, ...contextOptions });
     };

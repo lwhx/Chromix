@@ -1,6 +1,12 @@
 """API tests for the CloakBrowser-compatible chromix surface (no browser launch needed)."""
 import asyncio
+import base64
 import errno
+import json
+import socket
+import ssl
+import subprocess
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 import sys
 import threading
@@ -133,20 +139,20 @@ def test_geoip_flag_promotion(monkeypatch):
     assert calls["proxy"] == "http://p:1"
 
 
-def test_webrtc_auto_resolution(monkeypatch):
-    monkeypatch.setattr(api, "_geoip_http", lambda p: (None, None, "198.51.100.7"))
-    out = api._resolve_webrtc_args(["--fingerprint-webrtc-ip=auto"], "http://p:1")
-    assert out == ["--fingerprint-webrtc-ip=198.51.100.7"]
-    out = api._resolve_webrtc_args(["--fingerprint-webrtc-ip=auto"], None)
-    assert out == []
-
-
-def test_webrtc_exit_ip_append():
-    out = api._append_webrtc_exit_ip(["--headless=new"], "198.51.100.7")
-    assert out[-1] == "--fingerprint-webrtc-ip=198.51.100.7"
-    out = api._append_webrtc_exit_ip(["--fingerprint-webrtc-ip=x"], "198.51.100.7")
-    assert out == ["--fingerprint-webrtc-ip=x"]
-    assert api._append_webrtc_exit_ip(None, None) is None
+@pytest.mark.parametrize("flag", [
+    "--fingerprint-webrtc-ip=auto", "--fingerprint-webrtc-ip=198.51.100.7",
+    "--uxr-webrtc-ip=198.51.100.7", "--uxr-webrtc-ip",
+    "--fingerprint-webrtc-fake-srflx=198.51.100.7", "--uxr-webrtc-fake-srflx-allow-udp",
+])
+def test_retired_webrtc_flags_fail_before_network(monkeypatch, flag):
+    def forbidden(*args, **kwargs):
+        pytest.fail("Network or binary resolution attempted")
+    monkeypatch.setattr(api, "_geoip_http", forbidden)
+    monkeypatch.setattr(api, "ensure_binary", forbidden)
+    with pytest.raises(ValueError, match="retired.*real proxy.*force-webrtc-ip-handling-policy"):
+        api.build_args(False, [flag])
+    with pytest.raises(ValueError, match="retired"):
+        api._prepare(True, "http://p:1", [flag], False, None, None, True, None, False)
 
 
 def test_human_config_presets_and_overrides():
@@ -606,3 +612,213 @@ def test_fontconfig_directories_do_not_overwrite_each_other(tmp_path, monkeypatc
     second = Path(_fonts.linux_font_env("unused", tmp_path / "other")["FONTCONFIG_FILE"])
     assert first != second and first.read_bytes() == before
     assert ET.fromstring(before).find("dir").text == str(tmp_path / "one & two")
+
+
+GEO_DATA = {"status": "success", "timezone": "Asia/Tokyo", "countryCode": "JP", "query": "203.0.113.9"}
+
+
+@pytest.fixture
+def local_network(monkeypatch):
+    from chromix import _network
+    servers = []
+    original_connect = socket.create_connection
+
+    def loopback_only(address, *args, **kwargs):
+        assert address[0] == "127.0.0.1", "external network connection forbidden"
+        return original_connect(address, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "create_connection", loopback_only)
+
+    def server(body=None, status=200, headers=None, trickle=False, tls=None):
+        calls = []
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                calls.append((self.path, dict(self.headers), isinstance(self.connection, ssl.SSLSocket)))
+                self.send_response(status)
+                for key, value in (headers or {}).items():
+                    self.send_header(key, value)
+                self.end_headers()
+                try:
+                    if trickle:
+                        for _ in range(200):
+                            self.wfile.write(b" ")
+                            self.wfile.flush()
+                            time.sleep(0.01)
+                    else:
+                        self.wfile.write(body if body is not None else json.dumps(GEO_DATA).encode())
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        if tls:
+            httpd.socket = tls.wrap_socket(httpd.socket, server_side=True)
+        thread = threading.Thread(target=lambda: httpd.serve_forever(poll_interval=0.01), daemon=True)
+        thread.start()
+        servers.append((httpd, thread))
+        return f"{'https' if tls else 'http'}://127.0.0.1:{httpd.server_port}", calls
+
+    yield SimpleNamespace(server=server, network=_network)
+    for httpd, thread in servers:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=2)
+
+
+def test_proxy_auth_encoding_and_empty_values():
+    config = {"server": "http://[::1]:8080", "username": "u@ +é", "password": "p:@/%+", "bypass": "*"}
+    url = api._extract_proxy_url(config)
+    assert "u%40%20%2B%C3%A9:p%3A%40%2F%25%2B@" in url
+    assert api._resolve_proxy_config(url)[0]["proxy"] == {k: v for k, v in config.items() if k != "bypass"}
+    assert api._resolve_proxy_config({**config, "username": "", "password": ""})[0]["proxy"] == {
+        **config, "username": "", "password": ""}
+    assert api._resolve_proxy_config("http://u:p:a@proxy:8080")[0]["proxy"]["password"] == "p:a"
+    for bad in ("http://u:%zz@proxy:80", "http://proxy:bad", "http://proxy/path", "http://u:%0a@proxy"):
+        with pytest.raises(ValueError, match="Invalid proxy"):
+            api._extract_proxy_url(bad)
+
+
+def test_geoip_explicit_proxy_ignores_env_and_bypass(monkeypatch, local_network):
+    proxy, requests = local_network.server()
+    decoy, unwanted = local_network.server(body=b"{}")
+    for key in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.setenv(key, decoy)
+    for key in ("NO_PROXY", "no_proxy"):
+        monkeypatch.setenv(key, "*")
+    credentials = {"server": proxy, "username": "u@ +é", "password": "p:@/%+", "bypass": "*"}
+    result = api.maybe_resolve_geoip(True, credentials, None, None)
+    assert result == ("Asia/Tokyo", "ja-JP", "203.0.113.9")
+    assert len(requests) == 1 and unwanted == []
+    path, headers, _ = requests[0]
+    assert path == "http://ip-api.com/json/?fields=status,timezone,countryCode,query"
+    assert headers["Host"] == "ip-api.com"
+    assert headers["Proxy-Authorization"] == "Basic " + base64.b64encode("u@ +é:p:@/%+".encode()).decode()
+
+
+def test_geoip_no_proxy_is_direct_and_metadata_only(monkeypatch, local_network):
+    endpoint, calls = local_network.server()
+    for key in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.setenv(key, "http://unused.invalid:1")
+    monkeypatch.setattr(local_network.network, "GEOIP_URL", endpoint + "/json")
+    assert api.maybe_resolve_geoip(True, None, "UTC", "en-US") == ("UTC", "en-US", "203.0.113.9")
+    assert calls[0][0] == "/json" and "Proxy-Authorization" not in calls[0][1]
+    assert api.maybe_resolve_geoip(True, None, None, None, [
+        "--fingerprint-timezone=Europe/Berlin", "--lang=de-DE"]) == ("Europe/Berlin", "de-DE", "203.0.113.9")
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("kind", ["browser", "context", "persistent"])
+def test_launch_network_policy_all_paths(tmp_path, offline_launch, local_network, asynchronous, kind):
+    proxy, calls = local_network.server()
+    options = {"geoip": True, "proxy": proxy, "args": ["--fingerprint=42"]}
+    if asynchronous:
+        async def run():
+            if kind == "persistent":
+                obj = await api.launch_persistent_context_async(user_data_dir=tmp_path, **options)
+            elif kind == "context":
+                obj = await api.launch_context_async(**options)
+            else:
+                obj = await api.launch_async(**options)
+            await obj.close()
+        asyncio.run(run())
+    else:
+        if kind == "persistent":
+            obj = api.launch_persistent_context(tmp_path, **options)
+        elif kind == "context":
+            obj = api.launch_context(**options)
+        else:
+            obj = api.launch(**options)
+        obj.close()
+    launch = offline_launch.launches[-1]
+    assert launch["proxy"] == {"server": proxy}
+    assert len(calls) == 1
+    args = launch["args"]
+    assert "--force-webrtc-ip-handling-policy=disable_non_proxied_udp" in args
+    assert "--fingerprint-timezone=Asia/Tokyo" in args and "--lang=ja-JP" in args
+    assert not any("webrtc-ip=" in arg or "webrtc-fake" in arg for arg in args)
+    assert fingerprint(args) == "42"
+    assert options["args"] == ["--fingerprint=42"]
+
+
+@pytest.mark.parametrize("policy", ["default", "default_public_interface_only",
+                                    "default_public_and_private_interfaces", "disable_non_proxied_udp"])
+def test_native_webrtc_policy_overrides_default(offline_launch, policy):
+    flag = "--force-webrtc-ip-handling-policy=" + policy
+    api.launch(proxy="socks5://proxy:1080", stealth_args=False, args=[flag]).close()
+    args = offline_launch.launches[-1]["args"]
+    assert [arg for arg in args if arg.startswith("--force-webrtc")] == [flag]
+    api.launch(proxy="socks5://proxy:1080", stealth_args=False).close()
+    assert "--force-webrtc-ip-handling-policy=disable_non_proxied_udp" in offline_launch.launches[-1]["args"]
+    api.launch(stealth_args=False).close()
+    assert not any(arg.startswith("--force-webrtc") for arg in offline_launch.launches[-1]["args"])
+
+
+@pytest.mark.parametrize("status,body,headers", [
+    (302, b"", {"Location": "http://external.invalid/leak"}), (407, b"{}", {}),
+    (200, b"{", {}), (200, b"[]", {}), (200, b"x" * 65537, {}),
+    (200, b"", {"Content-Length": "65537"}),
+    (200, json.dumps({**GEO_DATA, "query": "1.2.3.999"}).encode(), {}),
+    (200, json.dumps({**GEO_DATA, "query": "fe80::1%lo"}).encode(), {}),
+    (200, json.dumps({**GEO_DATA, "timezone": "Earth/Unknown"}).encode(), {}),
+    (200, json.dumps({**GEO_DATA, "timezone": "UTC\n--flag"}).encode(), {}),
+    (200, json.dumps({**GEO_DATA, "countryCode": "ZZ"}).encode(), {}),
+    (200, json.dumps({**GEO_DATA, "status": "fail"}).encode(), {}),
+])
+def test_geoip_invalid_response_fails_without_fallback(local_network, status, body, headers):
+    proxy, calls = local_network.server(body=body, status=status, headers=headers)
+    with pytest.raises(ValueError, match="GeoIP"):
+        api.maybe_resolve_geoip(True, proxy, None, None)
+    assert len(calls) == 1
+
+
+def test_socks_and_invalid_timeout_fail_before_connection(monkeypatch, local_network):
+    def forbidden(*args, **kwargs):
+        pytest.fail("Network attempted")
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    for proxy in ("socks4://proxy:1080", "socks5://proxy:1080", "socks5h://proxy:1080"):
+        with pytest.raises(ValueError, match="not SOCKS.*No direct fallback"):
+            api.maybe_resolve_geoip(True, proxy, None, None)
+    for value in ("0", "-1", "NaN", "Infinity", "61", ""):
+        monkeypatch.setenv("CLOAKBROWSER_GEOIP_TIMEOUT_SECONDS", value)
+        with pytest.raises(ValueError, match="TIMEOUT_SECONDS"):
+            api._geoip_http("http://127.0.0.1:1")
+
+
+def test_geoip_total_timeout_even_when_response_trickles(monkeypatch, local_network):
+    proxy, calls = local_network.server(trickle=True)
+    monkeypatch.setenv("CLOAKBROWSER_GEOIP_TIMEOUT_SECONDS", "0.1")
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="GeoIP"):
+        api._geoip_http(proxy)
+    assert time.monotonic() - started < 1.5 and len(calls) == 1
+
+
+def test_late_connect_fails_before_geoip_request(monkeypatch, local_network):
+    proxy, calls = local_network.server()
+    original = local_network.network.http.client.HTTPConnection.connect
+    def delayed_connect(conn):
+        time.sleep(0.04)
+        original(conn)
+    monkeypatch.setattr(local_network.network.http.client.HTTPConnection, "connect", delayed_connect)
+    monkeypatch.setenv("CLOAKBROWSER_GEOIP_TIMEOUT_SECONDS", "0.01")
+    with pytest.raises(ValueError, match="timed out.*no direct fallback"):
+        api._geoip_http(proxy)
+    assert calls == []
+
+
+def test_https_proxy_validates_certificate_and_uses_tls(tmp_path, monkeypatch, local_network):
+    cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                    "-subj", "/CN=localhost", "-addext", "subjectAltName=IP:127.0.0.1",
+                    "-keyout", str(key), "-out", str(cert)], check=True, capture_output=True)
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.load_cert_chain(cert, key)
+    proxy, calls = local_network.server(tls=tls)
+    with pytest.raises(ValueError, match="connection failed"):
+        api._geoip_http(proxy)
+    assert calls == []
+    monkeypatch.setenv("SSL_CERT_FILE", str(cert))
+    assert api._geoip_http(proxy.replace("://", "://u:p@")) == ("Asia/Tokyo", "ja-JP", "203.0.113.9")
+    assert len(calls) == 1 and calls[0][2]
+    assert calls[0][1]["Proxy-Authorization"] == "Basic dTpw"

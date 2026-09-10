@@ -1,8 +1,8 @@
 diff --git a/content/browser/devtools/protocol/network_handler.cc b/content/browser/devtools/protocol/network_handler.cc
-index 1b7f400..bd05787 100644
+index eeb03e41f1..705b4ad6eb 100644
 --- a/content/browser/devtools/protocol/network_handler.cc
 +++ b/content/browser/devtools/protocol/network_handler.cc
-@@ -200,20 +200,22 @@ std::unique_ptr<Network::CookiePartitionKey> BuildCookiePartitionKey(
+@@ -201,20 +201,22 @@ std::unique_ptr<Network::CookiePartitionKey> BuildCookiePartitionKey(
  
  std::unique_ptr<Network::Cookie> BuildCookie(
      const net::CanonicalCookie& cookie) {

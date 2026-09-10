@@ -119,3 +119,7 @@ patches/0117-realtime-persona.patch
 patches/0118-font-fallback-persona.patch
 patches/0119-time-clamper-persona.patch
 patches/0120-media-devices-persona.patch
+patches/0121-third_party-blink-renderer-platform-graphics-image_data_buffer-h.patch
+patches/0122-third_party-blink-renderer-core-html-canvas-canvas_async_blob_creator-h.patch
+patches/0123-third_party-blink-renderer-core-html-canvas-canvas_async_blob_creator-cc.patch
+patches/0124-third_party-blink-renderer-platform-image-encoders-image_encoder-cc.patch

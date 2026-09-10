@@ -126,12 +126,46 @@ def signals(marker="a"):
             "audio": {"available": False, "reason": "offline fixture"}}
 
 
+def surface_absent():
+    absent = {"available": False, "reason": "offline unit fixture; not browser evidence"}
+    return {name: {key: deepcopy(absent) for key in
+                  (("canvas", "webgl1", "webgl2", "webgpu", "audio", "codecs", "network")
+                   if name == "window" else ("canvas",))} for name in smoke.SCOPES}
+
+
 def observation(spec=None, phase="initial", marker="a"):
-    return {**{name: scope(spec, name, phase) for name in smoke.SCOPES}, "signals": signals(marker)}
+    return {**{name: scope(spec, name, phase) for name in smoke.SCOPES}, "signals": signals(marker),
+            "surfaces": surface_absent()}
 
 
 def failures(checks):
     return {check["name"] for check in checks if check["status"] == "failed"}
+
+
+@pytest.mark.parametrize("raw,expected", [("1", 1), ("4294967296", 2**32),
+                                            ("0x8000000000000001", 2**63 + 1),
+                                            ("18446744073709551615", 2**64 - 1)])
+def test_full_uint64_seed_preserved_in_matrix_profile_and_command(raw, expected):
+    args = options("--seed", raw)
+    spec = smoke.scenario_matrix(args)[2]
+    assert args.seed == spec["seed"] == expected
+    assert str(expected) in smoke.profile_group(spec)
+    assert f"--fingerprint={expected}" in smoke.browser_args(spec, "http://127.0.0.1:9876", False)
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "18446744073709551616", "0x10000000000000000", "1.5", "bad"])
+def test_seed_outside_nonzero_uint64_rejected(raw):
+    with pytest.raises(SystemExit):
+        options("--seed", raw)
+
+
+def test_uint64_seeds_differing_only_in_high_bits_remain_distinct():
+    args = options("--seed", "0x100000001", "--other-seed", "0x200000001")
+    specs = smoke.scenario_matrix(args)
+    first, other = specs[2], specs[4]
+    assert first["seed"] & 0xFFFFFFFF == other["seed"] & 0xFFFFFFFF
+    assert smoke.profile_group(first) != smoke.profile_group(other)
+    assert smoke.browser_args(first, "http://127.0.0.1:9876", False) != smoke.browser_args(other, "http://127.0.0.1:9876", False)
 
 
 def test_explicit_binary_required_and_cli_preserved():
@@ -254,7 +288,8 @@ def test_server_delivers_plain_js_nonrecursive_frame_and_echo():
     with smoke.local_server() as server:
         conn = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
         bodies = {}
-        for path in ["/", "/frame", "/worker.js", "/echo?scenario=one&restart=2&scope=worker&phase=reload"]:
+        for path in ["/", "/frame", "/worker.js", "/surface.js", "/surface-worker.js", "/timing",
+                     "/echo?scenario=one&restart=2&scope=worker&phase=reload"]:
             conn.request("GET", path)
             response = conn.getresponse()
             assert response.status == 200
@@ -264,6 +299,9 @@ def test_server_delivers_plain_js_nonrecursive_frame_and_echo():
         assert bodies["/"].count("<iframe") == 1
         assert "<iframe" not in bodies["/frame"]
         assert bodies["/worker.js"] == smoke.WORKER_SCRIPT
+        assert bodies["/surface.js"] == smoke.SURFACE_ASSET.read_text()
+        assert bodies["/surface-worker.js"] == smoke.SURFACE_WORKER_SCRIPT
+        assert bodies["/timing"] == "chromix-loopback-timing"
         echoed = json.loads(bodies[next(path for path in bodies if path.startswith("/echo"))])
         assert "scenario=one&restart=2" in echoed["path"]
         conn.request("GET", "http://external.invalid/", headers={"Host": "external.invalid"})
@@ -361,8 +399,23 @@ def test_launch_exception_is_failed_and_uses_persistent_profile(tmp_path):
 @pytest.mark.parametrize("fault", [None, "crash", "pageerror", "disconnect", "external", "close"])
 def test_persistent_context_without_browser_handle_and_runtime_failures(tmp_path, monkeypatch, fault):
     events, page_events, routes = {}, {}, {}
+    network_online, network_events, offline_calls = True, [], []
+    frame = SimpleNamespace()
     page = SimpleNamespace(on=lambda name, callback: page_events.update({name: callback}),
-                           goto=lambda *a, **kw: None)
+                           goto=lambda *a, **kw: None, frame=lambda **kw: frame)
+    def set_offline(offline):
+        nonlocal network_online
+        offline_calls.append(offline)
+        network_online = not offline
+        network_events.append({"type": "offline" if offline else "online", "online": network_online})
+    def mocked_evaluate(target, script, argument, timeout):
+        if script == smoke.NETWORK_EVENT_SETUP:
+            if target is page:
+                network_events.clear()
+            return {"online": network_online}
+        if script == smoke.NETWORK_EVENT_READ:
+            return {"online": network_online, "events": deepcopy(network_events)}
+        return {}
     detached = []
     identity = {"path": "/explicit/chrome", "sha256": "a" * 64, "size": 100}
     cdp = SimpleNamespace(send=lambda method: {"arguments": ["/explicit/chrome"]}
@@ -380,7 +433,8 @@ def test_persistent_context_without_browser_handle_and_runtime_failures(tmp_path
                               route=lambda pattern, callback: routes.update(http=callback),
                               route_web_socket=lambda pattern, callback: routes.update(ws=callback),
                               on=lambda name, callback: events.update({name: callback}),
-                              new_page=new_page, new_cdp_session=lambda target: cdp, close=close)
+                              new_page=new_page, new_cdp_session=lambda target: cdp, close=close,
+                              set_offline=set_offline)
     launches = []
     def launch(**kwargs):
         launches.append(kwargs)
@@ -403,8 +457,8 @@ def test_persistent_context_without_browser_handle_and_runtime_failures(tmp_path
         return observation(spec, phase)
     monkeypatch.setattr(smoke, "binary_identity", lambda path: identity)
     monkeypatch.setattr(smoke, "collect_page", collect)
-    monkeypatch.setattr(smoke, "evaluate", lambda *a: {})
-    monkeypatch.setattr(smoke, "evaluate_observation", lambda *a: [])
+    monkeypatch.setattr(smoke, "evaluate", mocked_evaluate)
+    monkeypatch.setattr(smoke, "evaluate_observation", lambda observation, *_: smoke.evaluate_network_events(observation["network_events"]))
     profile = tmp_path / "profile"
     first = smoke.run_scenario(playwright, scenario(), identity, server, options(), profile)
     second = smoke.run_scenario(playwright, {**scenario(), "restart": 2}, identity, server, options(), profile)
@@ -413,6 +467,8 @@ def test_persistent_context_without_browser_handle_and_runtime_failures(tmp_path
     assert first["profile_fresh"] is True and second["profile_fresh"] is False
     assert launches[0]["user_data_dir"] == launches[1]["user_data_dir"]
     assert detached == [True, True]
+    assert offline_calls == [True, False, True, False]
+    assert network_online is True
 
 
 def test_failed_json_and_exit_without_runtime(tmp_path, capsys, monkeypatch):
@@ -444,13 +500,14 @@ def test_output_cannot_overwrite_binary_hardlink(tmp_path, capsys):
 def test_node_js_syntax_and_mocked_worker_canvas_are_not_browser_evidence():
     if not NODE.is_file():
         pytest.skip("explicit Node executable unavailable; no browser verification")
-    scripts = {name: getattr(smoke, name) for name in ["NAV_PROBE", "WORKER_SCRIPT", "WORKER_PROBE", "SIGNAL_PROBE", "MEDIA_PROBE"]}
+    scripts = {name: getattr(smoke, name) for name in ["NAV_PROBE", "WORKER_SCRIPT", "WORKER_PROBE", "SIGNAL_PROBE", "MEDIA_PROBE",
+                                                      "SURFACE_PROBE", "SURFACE_WORKER_SCRIPT", "NETWORK_EVENT_SETUP", "NETWORK_EVENT_READ"]}
     source = "const scripts = " + json.dumps(scripts) + ";\n" + r'''
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
 (async () => {
   for (const [name, script] of Object.entries(scripts))
-    new vm.Script(name === 'WORKER_SCRIPT' ? script : '(' + script + ')');
+    new vm.Script(name.endsWith('WORKER_SCRIPT') ? script : '(' + script + ')');
   const low = {brands:[{brand:'Chromium',version:'153'}], mobile:false, platform:'Linux'};
   let posted, fetched;
   const context = {URLSearchParams, Intl, location:{search:'?scenario=one&restart=2&phase=reload'},

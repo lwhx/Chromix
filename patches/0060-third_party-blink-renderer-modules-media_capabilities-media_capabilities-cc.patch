@@ -89,15 +89,40 @@ index 8d900f2270..3872155493 100644
  // static
  bool UseGpuFactoriesForPowerEfficient(
      ExecutionContext* execution_context,
-@@ -1366,6 +1438,7 @@ void MediaCapabilities::GetPerfInfo(
+@@ -1125,10 +1197,22 @@ ScriptPromise<MediaCapabilitiesInfo> MediaCapabilities::encodingInfo(
+       TaskType::kInternalMediaRealTime);
+   if (auto* handler = MakeGarbageCollected<MediaRecorderHandler>(
+           task_runner, KeyFrameRequestProcessor::Configuration())) {
++    auto web_configuration = ToWebMediaConfiguration(config);
++    // EncodingInfo checks only video when both tracks are specified.
++    if (web_configuration.video_configuration &&
++        web_configuration.audio_configuration &&
++        !handler->CanSupportMimeType(
++            web_configuration.audio_configuration->mime_type,
++            web_configuration.audio_configuration->codec,
++            MediaRecorderHandler::CanSupportMimeTypeCaller::kEncodingInfo)) {
++      resolver->Resolve(CreateEncodingInfoWith(false));
++      return promise;
++    }
++
+     task_runner->PostTask(
+         FROM_HERE, blink::BindOnce(&MediaRecorderHandler::EncodingInfo,
+                                    WrapPersistent(handler),
+-                                   ToWebMediaConfiguration(config),
++                                   std::move(web_configuration),
+                                    BindOnce(&OnMediaCapabilitiesEncodingInfo,
+                                             WrapPersistent(resolver))));
+ 
+@@ -1366,6 +1450,8 @@ void MediaCapabilities::GetPerfInfo(
  
    if (!EnsurePerfHistoryService(execution_context)) {
      MediaCapabilitiesDecodingInfo* info = CreateDecodingInfoWith(true);
++    info->setKeySystemAccess(access);
 +    ApplyUxrCodecCapabilities(video_codec, info);
      resolver->Resolve(WrapPersistent(info));
      return;
    }
-@@ -1375,6 +1448,7 @@ void MediaCapabilities::GetPerfInfo(
+@@ -1375,6 +1461,7 @@ void MediaCapabilities::GetPerfInfo(
        callback_id,
        MakeGarbageCollected<MediaCapabilities::PendingCallbackState>(
            resolver, access, request_time));
@@ -105,7 +130,7 @@ index 8d900f2270..3872155493 100644
  
    media::mojom::blink::PredictionFeaturesPtr features =
        media::mojom::blink::PredictionFeatures::New(
-@@ -1509,6 +1583,7 @@ void MediaCapabilities::ResolveCallbackIfReady(int callback_id) {
+@@ -1509,6 +1596,7 @@ void MediaCapabilities::ResolveCallbackIfReady(int callback_id) {
    }
  
    info->setSmooth(*pending_cb->db_is_smooth);
@@ -113,16 +138,22 @@ index 8d900f2270..3872155493 100644
  
    const base::TimeDelta process_time =
        base::TimeTicks::Now() - pending_cb->request_time;
-@@ -1566,6 +1641,8 @@ void MediaCapabilities::OnWebrtcSupportInfo(
+@@ -1566,6 +1654,14 @@ void MediaCapabilities::OnWebrtcSupportInfo(
      bool is_power_efficient) {
    DCHECK(pending_cb_map_.Contains(callback_id));
    PendingCallbackState* pending_cb = pending_cb_map_.at(callback_id);
++  ExecutionContext* execution_context =
++      pending_cb->resolver->GetExecutionContext();
++  if (!execution_context || execution_context->IsContextDestroyed()) {
++    pending_cb_map_.erase(callback_id);
++    return;
++  }
 +  pending_cb->video_codec =
 +      media::VideoCodecProfileToVideoCodec(features->profile);
  
    // Special treatment if the config is not supported, or if only audio was
    // specified which is indicated by the fact that `video_pixels` equals 0,
-@@ -1584,6 +1661,7 @@ void MediaCapabilities::OnWebrtcSupportInfo(
+@@ -1584,6 +1680,7 @@ void MediaCapabilities::OnWebrtcSupportInfo(
      info->setSupported(is_supported);
      info->setSmooth(is_supported);
      info->setPowerEfficient(is_power_efficient);
@@ -130,7 +161,7 @@ index 8d900f2270..3872155493 100644
      if (type == OperationType::kEncoding) {
        pending_cb->resolver->DowncastTo<MediaCapabilitiesInfo>()->Resolve(info);
      } else {
-@@ -1627,6 +1705,7 @@ void MediaCapabilities::OnWebrtcPerfHistoryInfo(int callback_id,
+@@ -1627,6 +1724,7 @@ void MediaCapabilities::OnWebrtcPerfHistoryInfo(int callback_id,
    info->setSupported(*pending_cb->is_supported);
    info->setPowerEfficient(*pending_cb->is_gpu_factories_supported);
    info->setSmooth(is_smooth);

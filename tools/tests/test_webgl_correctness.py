@@ -86,13 +86,14 @@ class WebGLCorrectnessRegressionTest(unittest.TestCase):
         self.assertIn("String(configured_renderer)", self.integration)
         self.assertIn("String(configured_vendor)", self.integration)
 
-    def test_readback_noise_contract(self):
-        self.assertIn("bridge_substituted = true", self.readback_noise)
-        self.assertIn("!bridge_substituted", self.readback_noise)
-        self.assertIn("format == GL_RGBA", self.readback_noise)
-        self.assertIn("type == GL_UNSIGNED_BYTE", self.readback_noise)
-        self.assertIn("FingerprintNoiseEnabled()", self.readback_noise)
-        self.assertIn("for (int channel = 0; channel < 3; ++channel", self.readback_noise)
+    def test_readback_preserves_native_bytes_and_errors(self):
+        self.assertIn("Keep native errors, pack layout and readback bytes", self.readback_noise)
+        self.assertNotIn("ApplyWebGLReadbackNoise", self.readback_noise)
+        self.assertNotIn("GetImageDataCacheFirst", self.readback_noise)
+        self.assertNotIn("std::memcpy", self.readback_noise)
+        self.assertNotIn("GetError", self.readback_noise)
+        patch = READBACK_NOISE.read_text(encoding="utf-8")
+        self.assertIn("-          std::memcpy(data, remote->data(), remote->size());", patch)
 
     def test_farble_seed_and_gpu_table_are_present(self):
         self.assertIn("GlobalSeed()", self.farble_cc)
@@ -118,7 +119,7 @@ class WebGLCorrectnessRegressionTest(unittest.TestCase):
         self.assertIn("webgl_max_combined_texture_image_units", self.webgl1)
         self.assertIn("webgl_max_fragment_uniform_vectors", self.webgl1)
         self.assertIn("webgl_max_vertex_uniform_vectors", self.webgl1)
-        self.assertIn("real > 0 && value > real", self.webgl1)
+        self.assertIn("std::min(real, value)", self.webgl1)
 
     def test_webgl2_coherence_and_sample_filtering(self):
         self.assertIn("values", self.webgl2)
@@ -134,12 +135,13 @@ class WebGLCorrectnessRegressionTest(unittest.TestCase):
         self.assertIn("ContextGL()->GetString(GL_RENDERER)", self.webgl1)
         self.assertIn("ContextGL()->GetString(GL_VENDOR)", self.webgl1)
 
-    def test_precision_and_extension_override_are_persona_controlled(self):
-        self.assertIn("CurrentPersona().mobile", self.precision)
-        self.assertIn("GL_MEDIUM_FLOAT", self.precision)
-        self.assertIn("precision = 10", self.precision)
-        self.assertIn("filtered", self.precision)
+    def test_precision_is_native_and_extension_policy_is_shared(self):
+        self.assertNotIn("CurrentPersona().mobile", self.precision)
+        self.assertNotIn("precision = 10", self.precision)
+        self.assertIn("Report the precision implemented by the shader compiler", self.precision)
         self.assertIn("webgl_extensions", self.precision)
+        self.assertIn("tracker->MatchesName", self.precision)
+        self.assertIn('Has("uxr-webgl-extensions")', self.precision)
 
     def test_readback_policy_and_direct_read_pixels_bridge(self):
         self.assertIn("BridgeAllowedForThisContext", self.bridge_cc)

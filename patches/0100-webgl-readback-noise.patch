@@ -1,8 +1,7 @@
 diff --git a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-index 948d2c5a57..9ad328e586 100644
 --- a/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
 +++ b/third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
-@@ -49,6 +49,7 @@
+@@ -50,6 +50,7 @@
  #include "base/trace_event/memory_dump_manager.h"
  #include "base/trace_event/trace_event.h"
  #include "build/build_config.h"
@@ -10,69 +9,26 @@ index 948d2c5a57..9ad328e586 100644
  #include "components/ungoogled/persona_profile.h"
  #include "third_party/blink/renderer/platform/canvas_bridge/canvas_bridge_client.h"
  #include "third_party/blink/renderer/platform/canvas_bridge/canvas_bridge_codec.h"
-@@ -342,6 +343,35 @@
- }
- 
- 
-+// Only RGBA8 readbacks have a fixed four-byte pixel layout here.
-+void ApplyWebGLReadbackNoise(uint8_t* data, GLsizei width, GLsizei height,
-+                             uint64_t seed) {
-+  if (!data || width <= 0 || height <= 0)
-+    return;
-+  for (GLsizei y = 0; y < height; ++y) {
-+    for (GLsizei x = 0; x < width; ++x) {
-+      uint8_t* pixel = data +
-+          (static_cast<size_t>(y) * static_cast<size_t>(width) +
-+           static_cast<size_t>(x)) * 4;
-+      for (int channel = 0; channel < 3; ++channel) {
-+        uint32_t z = static_cast<uint32_t>(seed) ^
-+                     (static_cast<uint32_t>(x) * 374761393u) ^
-+                     (static_cast<uint32_t>(y) * 668265263u) ^
-+                     (static_cast<uint32_t>(channel) * 0x9e3779b9u) ^
-+                     (static_cast<uint32_t>(pixel[channel]) * 2654435761u);
-+        z ^= z >> 16;
-+        z *= 0x85ebca6bu;
-+        z ^= z >> 13;
-+        z *= 0xc2b2ae35u;
-+        z ^= z >> 16;
-+        const int value = static_cast<int>(pixel[channel]) +
-+                          ((z & 1u) ? 1 : -1);
-+        pixel[channel] = static_cast<uint8_t>(std::clamp(value, 0, 255));
-+      }
-+    }
-+  }
-+}
-+
- enum class WebGLANGLEImplementation {
-   // These values are persisted to logs. Entries should not be renumbered and
-   // numeric values should never be reused.
-@@ -5765,6 +5795,7 @@
+@@ -5766,20 +5767,8 @@
      }
      ContextGL()->ReadPixels(x, y, width, height, format, type, data);
  
-+    bool bridge_substituted = false;
-     if (format == GL_RGBA && type == GL_UNSIGNED_BYTE &&
-         bridge_canvas_id_ != 0 && !bridge_webgl_unsupported_ &&
-         BridgeAllowedForThisContext()) {
-@@ -5776,9 +5807,21 @@
-         if (remote &&
-             remote->size() == static_cast<size_t>(width) * height * 4) {
-           std::memcpy(data, remote->data(), remote->size());
-+          bridge_substituted = true;
-         }
-       }
-     }
-+
-+    if (!bridge_substituted && format == GL_RGBA &&
-+        type == GL_UNSIGNED_BYTE && !ungoogled::CurrentPersona().webgl_real &&
-+        ungoogled::FingerprintNoiseEnabled()) {
-+      const SecurityOrigin* origin =
-+          GetExecutionContext() ? GetExecutionContext()->GetSecurityOrigin()
-+                                : nullptr;
-+      const uint64_t seed = ungoogled::GetFarbleSeed64(
-+          origin ? origin->RegistrableDomain().Utf8() : std::string());
-+      ApplyWebGLReadbackNoise(data, width, height, seed);
-+    }
+-    if (format == GL_RGBA && type == GL_UNSIGNED_BYTE &&
+-        bridge_canvas_id_ != 0 && !bridge_webgl_unsupported_ &&
+-        BridgeAllowedForThisContext()) {
+-      if (auto* bridge = canvas_bridge::CanvasBridgeClient::Get();
+-          bridge && bridge->Connected()) {
+-        auto remote = bridge->GetImageDataCacheFirst(
+-            bridge_canvas_id_, x, y, static_cast<uint32_t>(width),
+-            static_cast<uint32_t>(height));
+-        if (remote &&
+-            remote->size() == static_cast<size_t>(width) * height * 4) {
+-          std::memcpy(data, remote->data(), remote->size());
+-        }
+-      }
+-    }
++    // Keep native errors, pack layout and readback bytes on every entry point.
++    // CPU-only rewriting disagrees with PBO, float and encoded readbacks.
    }
  }
  
