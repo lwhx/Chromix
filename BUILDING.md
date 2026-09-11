@@ -250,6 +250,44 @@ gh workflow run build-linux-x64.yml --ref main \
 
 The same inputs apply to `build-linux-arm64.yml`, `build-macos-x64.yml` and
 `build-macos-arm64.yml`. The Windows snapshot is not portable to those targets.
+
+### Resume a Mac checkpoint on current code
+
+Mac entrypoints additionally accept `resume_run_id`, `resume_tree_stage` (1–8),
+`resume_attempt`, and `resume_artifact_ids` (the complete recorded artifact ID
+set). Select the exact attempt that **uploaded** all parts, not
+necessarily the latest run attempt. For example:
+
+```bash
+gh workflow run build-macos-x64.yml --ref main \
+  -f resume_run_id=34329646617 -f resume_tree_stage=7 -f resume_attempt=1 \
+  -f resume_artifact_ids=10164699620 \
+  -f use_upstream_cache=true -f build_profile=fast -f build_mode=staged -f compile_jobs=auto
+
+gh workflow run build-macos-arm64.yml --ref main \
+  -f resume_run_id=34329648981 -f resume_tree_stage=7 -f resume_attempt=1 \
+  -f resume_artifact_ids=10162582694,10162583992 \
+  -f use_upstream_cache=true -f build_profile=fast -f build_mode=staged -f compile_jobs=auto
+```
+
+These historical snapshots expire; availability is checked before download. The
+validator requires the same repository, architecture-specific workflow, `main`,
+a terminal donor run, verified checkpoint and successful upload steps, and an
+unexpired, contiguous artifact set matching the complete recorded IDs from that
+exact attempt. Record every part ID when the snapshot is uploaded; listing only
+surviving artifacts cannot prove the original set is complete. A failure stops the
+build rather than falling back to a cold build.
+
+The selected checkpoint starts at stage 1 of the new run, leaving all eight jobs
+available. Current trusted tooling validates the old source-ready key and patch
+output manifest, checks unchanged upstream pins/tooling/lite payload, reverses the
+old patches in a temporary tree, and applies the current series there. Only net
+source changes are published; unchanged source timestamps and Ninja/object state
+are retained. Interrupted or incompatible migrations fail closed. Old repository
+scripts are not executed. Ninja still recompiles dependencies affected by changed
+headers, sources or build flags; a newer commit does not imply all old objects are
+reusable.
+
 No new Actions runs are dispatched by the optimization scripts or tests, and no
 wall-clock speedup is claimed until native builds are timed.
 
@@ -264,7 +302,7 @@ The four POSIX entrypoints accept `build_profile=fast|release` and
 | `fast` | Sets only `thin_lto_enable_optimizations=false`, reducing the main browser's expensive ThinLTO link optimizations. |
 | `release` | Sets `thin_lto_enable_optimizations=true` for the original optimized release behavior. |
 | `staged` | Allows up to eight jobs, handing off a snapshot when the current budget is exhausted. |
-| `single` | Allows one compile job, reserves 15 rather than 45 minutes, and fails without a snapshot if it cannot finish. Linux ARM64 still requires the separate native verification job. |
+| `single` | Allows one compile job, reserves 15 rather than 45 minutes, and saves an unfinished checkpoint before failing if it cannot finish. Linux ARM64 still requires the separate native verification job. |
 
 ThinLTO itself, its incremental cache, official non-component builds, sandboxing,
 and browser features are unchanged. Symbols and PGO remain disabled as before.
@@ -301,10 +339,27 @@ runtime checks before replacing the current builders. A two-hour Camoufox build
 is not evidence that Chromium can finish in the same time.
 
 Two fixes reduce unnecessary work during staged recovery: POSIX pax snapshots
-preserve nanosecond timestamps, and environment compatibility ignores only
-`RUNNER_NAME`, `GITHUB_JOB`, `GITHUB_RUN_ID`, and `GITHUB_RUN_ATTEMPT`. These fields
-remain in diagnostic reports. Actual runner image, SDK, compiler, generator,
-sysroot, and dependency changes still invalidate affected outputs. Node.js
+preserve nanosecond timestamps, and environment compatibility ignores scheduling
+fields `RUNNER_NAME`, `GITHUB_JOB`, `GITHUB_RUN_ID`, and `GITHUB_RUN_ATTEMPT`.
+These fields remain in diagnostic reports. Mac SDKs additionally record a full
+content fingerprint, including files, modes and internal symbolic links. Only
+matching complete fingerprints on both sides allow `ImageVersion` and SDK-root
+size/mtime changes to be ignored; SDK path/version/settings and all other build
+inputs remain checked. Image/root metadata drift still rechecks dependencies
+outside the verified SDK roots; the SDK proof never exempts arbitrary external
+headers or Xcode toolchain paths. SDK aliases require matching recorded root
+bindings, and unresolved inputs remain unproven. Missing legacy fingerprints,
+unreadable trees, external or broken links, and actual content changes
+conservatively recheck dependencies.
+An old ARM64 checkpoint can therefore require a one-time SDK-dependent rebuild;
+matching Xcode version strings alone are not evidence of identical headers.
+Cached Mac jobs preflight the actual SDK on every runner before downloading a
+large checkpoint, record scan time/counts/digest, and stop if the fingerprint is
+incomplete rather than repeatedly rebuilding with an unverifiable SDK. Untracked
+compiler environment overrides such as `C_INCLUDE_PATH`, `OBJC_INCLUDE_PATH`,
+and `CCC_OVERRIDE_OPTIONS` are rejected in this cached CI path before compilation.
+Actual compiler, generator, sysroot, and dependency changes still invalidate
+affected outputs. Node.js
 `24.20.0` and Go `1.27.1` are pinned across POSIX jobs to avoid moving host tools
 between stages; changing to these versions may require initial regeneration.
 Checksum, native smoke, and object-retention evidence checks remain mandatory.
@@ -364,7 +419,7 @@ uploads. Setup and snapshot download time therefore reduce the remaining budget:
 2. run `build/posix/ci-stage.sh --platform --arch --stage-index ...`;
 3. prepare the pinned ungoogled source (or resume it) under the deadline;
 4. continue Ninja through `build/build.sh` / `build/macos/build.sh`;
-5. on deadline exit 124, when another stage is available, pack `${workdir}` with
+5. on deadline exit 124, pack `${workdir}` with
    `build/posix/ci-parts.sh` into multi-volume `tree.tar.zst.*` files via
    `tar --format=pax | zstd`, preserving nanosecond mtimes, modes, and symlinks
    so incremental Ninja state survives; the packer
@@ -376,8 +431,12 @@ uploads. Setup and snapshot download time therefore reduce the remaining budget:
    and resumes.
 
 Compile failures fail the job immediately. Insufficient preparation/compile
-budget and timeout exit 124 hand off only when another stage is available;
-otherwise they fail without packing an unusable snapshot or reporting completion.
+budget and timeout exit 124 save an unfinished checkpoint. Earlier stages hand
+off successfully; the final allowed stage fails **after** packing and setting the
+upload marker. Snapshot verification/upload steps run after this failure unless
+the job is cancelled, while final bundle upload still requires completion. Failed
+packing emits no upload marker. A saved terminal checkpoint can be selected in a
+new Mac run without throwing away that last stage's compilation progress.
 The POSIX stage scripts stay compatible with the system `/bin/bash` 3.2 that
 runs GitHub's macOS workflow steps (no nested quoted command substitution
 inside `$(( ))`, no bare GNU `timeout`/`split` - both resolve through a

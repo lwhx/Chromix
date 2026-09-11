@@ -32,6 +32,197 @@ class PosixStageSyntaxTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class PosixStageHandoffExecutionTest(unittest.TestCase):
+    """Run the real stage script with isolated build, timeout, and snapshot stubs."""
+
+    SHELL = shutil.which("bash")
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="chromix handoff ")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.repo = self.root / "repo"
+        self.work = self.root / "work"
+        self.output = self.root / "outputs"
+        self.calls = self.root / "calls"
+        self.bindir = self.root / "bin"
+        self.bindir.mkdir()
+        self.stage = self.repo / "build/posix/ci-stage.sh"
+        self.put(self.stage, CI_STAGE.read_text())
+        for name in ("mkdir", "cp", "cat", "env", "dirname"):
+            (self.bindir / name).symlink_to(shutil.which(name))
+        (self.bindir / "bash").symlink_to(self.SHELL)
+        self.put(self.bindir / "date",
+                 '#!/bin/sh\n'
+                 'if [ -f "$CALL_LOG.expired" ]; then\n'
+                 '  printf "1700099999\\n"\n'
+                 'else\n'
+                 '  printf "1700000000\\n"\n'
+                 'fi\n')
+        for platform, builder in (("linux", "build/build.sh"),
+                                  ("macos", "build/macos/build.sh")):
+            self.put(self.repo / builder,
+                     '#!/bin/sh\n'
+                     f'printf "build {platform} %s %s\\n" "$2" "$CHROMIX_BUILD_PROFILE" >> "$CALL_LOG"\n'
+                     'printf "compile progress\\n" > "$1/checkpoint"\n'
+                     ': > "$CALL_LOG.expired"\n'
+                     'exit "$BUILD_RC"\n')
+        self.put(self.repo / "build/prepare-ungoogled.sh", "#!/bin/sh\nexit 99\n")
+        self.put(self.repo / "build/posix/ci-parts.sh",
+                 '#!/bin/sh\nset -eu\n'
+                 'printf "snapshot\\n" >> "$CALL_LOG"\n'
+                 'cat "$GITHUB_OUTPUT" > "$CALL_LOG.snapshot-outputs"\n'
+                 'printf "%s\\n" "$1" "$2" > "$CALL_LOG.snapshot-args"\n'
+                 '[ -d "$2" ]\n'
+                 'mkdir -p "$2/p1"\n'
+                 'cp "$1/checkpoint" "$2/p1/tree.tar.zst.001"\n'
+                 'exit "$SNAPSHOT_RC"\n')
+
+    def put(self, path, source):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source)
+        path.chmod(0o755)
+
+    def configurations(self):
+        for platform in ("linux", "macos"):
+            for arch in ("x64", "arm64"):
+                for profile in ("fast", "release"):
+                    yield {"platform": platform, "arch": arch, "profile": profile}
+
+    def run_stage(self, platform, arch, profile, stage, maximum=8,
+                  phase="timeout", build_rc=0, snapshot_rc=0):
+        if self.work.exists():
+            shutil.rmtree(self.work)
+        self.work.mkdir()
+        (self.work / "checkpoint").write_text("existing progress\n")
+        if phase != "prepare":
+            self.put(self.work / "src/.chromix-source-ready", "fixture\n")
+        self.output.write_text("")
+        self.calls.write_text("")
+        for path in self.root.glob("calls.*"):
+            path.unlink()
+        for name in ("timeout", "gtimeout"):
+            path = self.bindir / name
+            if path.exists():
+                path.unlink()
+        timeout_name = "gtimeout" if platform == "macos" else "timeout"
+        self.put(self.bindir / timeout_name,
+                 '#!/bin/sh\n'
+                 'printf "timeout\\n" >> "$CALL_LOG"\n'
+                 'printf "%s\\n" "$@" > "$CALL_LOG.timeout-args"\n'
+                 'shift 5\n'
+                 '"$@"\n'
+                 'rc=$?\n'
+                 '[ "$rc" -eq 0 ] || exit "$rc"\n'
+                 'exit 124\n')
+        minutes = 60 if phase in ("prepare", "ninja") else 300
+        env = {**os.environ, "FIXTURE_BIN": str(self.bindir),
+               "CHROMIX_USE_UPSTREAM_CACHE": "0", "CHROMIX_BUILD_PROFILE": profile,
+               "CHROMIX_RESERVE_MINUTES": "45", "GITHUB_OUTPUT": str(self.output),
+               "CALL_LOG": str(self.calls), "BUILD_RC": str(build_rc),
+               "SNAPSHOT_RC": str(snapshot_rc)}
+        result = subprocess.run(
+            [str(self.SHELL), "--norc", "-c",
+             'export PATH="$FIXTURE_BIN"; exec "$BASH" "$@"', "fixture",
+             str(self.stage), "--platform", platform, "--arch", arch,
+             "--workdir", str(self.work), "--stage-index", str(stage),
+             "--max-stages", str(maximum),
+             "--deadline-epoch", str(1700000000 + minutes * 60)],
+            env=env, capture_output=True, text=True, timeout=10)
+        return result
+
+    def assert_unfinished(self, upload=False):
+        expected = ["status=running", "finished=false"]
+        if upload:
+            expected.append("upload_snapshot=true")
+        self.assertEqual(self.output.read_text().splitlines(), expected)
+        self.assertFalse((self.work / "dist").exists())
+
+    def assert_checkpoint(self, stage, contents):
+        snapshot = self.work / f".snapshot-stage-{stage}"
+        self.assertEqual((snapshot / "p1/tree.tar.zst.001").read_text(), contents)
+        self.assertEqual((self.root / "calls.snapshot-args").read_text().splitlines(),
+                         [str(self.work), str(snapshot)])
+        self.assertEqual((self.root / "calls.snapshot-outputs").read_text().splitlines(),
+                         ["status=running", "finished=false"])
+
+    def test_final_timeout_preserves_checkpoint_but_fails(self):
+        for config in self.configurations():
+            for maximum in (1, 8):
+                with self.subTest(**config, maximum=maximum):
+                    result = self.run_stage(**config, stage=maximum, maximum=maximum)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("deadline reached after 255m", result.stderr)
+                    self.assertIn(f"stage {maximum} reached max-stages {maximum} without finishing",
+                                  result.stderr)
+                    self.assertEqual(self.calls.read_text().splitlines(),
+                                     ["timeout", f"build {config['platform']} {config['arch']} {config['profile']}",
+                                      "snapshot"])
+                    self.assertEqual((self.root / "calls.timeout-args").read_text().splitlines()[:5],
+                                     ["-k", "7m", "-s", "SIGTERM", "255m"])
+                    self.assert_checkpoint(maximum, "compile progress\n")
+                    self.assert_unfinished(upload=True)
+
+    def test_earlier_timeout_keeps_successful_unfinished_handoff(self):
+        for config in self.configurations():
+            for stage in (1, 7):
+                with self.subTest(**config, stage=stage):
+                    result = self.run_stage(**config, stage=stage)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("deadline reached after 255m", result.stderr)
+                    self.assertNotIn("without finishing", result.stderr)
+                    self.assertEqual(self.calls.read_text().splitlines(),
+                                     ["timeout", f"build {config['platform']} {config['arch']} {config['profile']}",
+                                      "snapshot"])
+                    self.assert_checkpoint(stage, "compile progress\n")
+                    self.assert_unfinished(upload=True)
+
+    def test_low_budget_handoffs_preserve_checkpoints(self):
+        for config in self.configurations():
+            for stage, maximum in ((1, 8), (8, 8), (1, 1)):
+                for phase in ("prepare", "ninja"):
+                    with self.subTest(**config, stage=stage, maximum=maximum, phase=phase):
+                        result = self.run_stage(**config, stage=stage, maximum=maximum, phase=phase)
+                        self.assertEqual(result.returncode, int(stage == maximum), result.stderr)
+                        self.assertIn("below minimum", result.stderr)
+                        self.assertEqual(self.calls.read_text().splitlines(), ["snapshot"])
+                        self.assert_checkpoint(stage, "existing progress\n")
+                        self.assert_unfinished(upload=True)
+
+    def test_compiler_failures_do_not_become_deadlines(self):
+        for config in self.configurations():
+            for stage in (1, 8):
+                for rc in (1, 2, 137):
+                    with self.subTest(**config, stage=stage, rc=rc):
+                        result = self.run_stage(**config, stage=stage, build_rc=rc)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(f"build script failed at stage {stage} (exit {rc})", result.stderr)
+                        self.assertNotIn("deadline reached", result.stderr)
+                        self.assertNotIn("without finishing", result.stderr)
+                        # The stub clock is past the deadline after the compiler exits.
+                        self.assertTrue((self.root / "calls.expired").is_file())
+                        self.assertEqual(self.calls.read_text().splitlines(),
+                                         ["timeout", f"build {config['platform']} {config['arch']} {config['profile']}"])
+                        self.assertFalse(list(self.work.glob(".snapshot-stage-*")))
+                        self.assert_unfinished()
+
+    def test_snapshot_failure_never_emits_upload_marker(self):
+        for config in self.configurations():
+            for stage, maximum in ((1, 8), (8, 8), (1, 1)):
+                with self.subTest(**config, stage=stage, maximum=maximum):
+                    result = self.run_stage(**config, stage=stage, maximum=maximum, snapshot_rc=23)
+                    self.assertEqual(result.returncode, 23, result.stderr)
+                    self.assertEqual(self.calls.read_text().splitlines()[-1], "snapshot")
+                    self.assertNotIn("without finishing", result.stderr)
+                    self.assert_checkpoint(stage, "compile progress\n")
+                    self.assert_unfinished()
+
+
+@unittest.skipUnless(BASH32.is_file(), "locally built bash 3.2 required")
+class PosixStageHandoffBash32ExecutionTest(PosixStageHandoffExecutionTest):
+    SHELL = str(BASH32)
+
+
 @unittest.skipUnless(shutil.which("zstd"), "zstd required")
 class PosixSnapshotRoundTripTest(unittest.TestCase):
     """ci-parts.sh must pack tar|zstd volumes that ci-stage.sh can restore."""
@@ -739,7 +930,7 @@ class GenPosixWorkflowTest(unittest.TestCase):
         self.assertEqual(len(restore), 1)
         self.assertGreaterEqual(checked, 32)
 
-    def test_every_stage_selects_sdk_and_only_uploads_successful_handoffs(self):
+    def test_every_stage_selects_sdk_and_uploads_ready_snapshots_unless_cancelled(self):
         import yaml
         data = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
         for index in range(1, 9):
@@ -753,7 +944,10 @@ class GenPosixWorkflowTest(unittest.TestCase):
             snapshot_steps.append(next(s for s in steps if s.get("name") == "Verify handoff snapshot"))
             self.assertEqual(len(snapshot_steps), 5)
             for step in snapshot_steps:
-                self.assertEqual(step["if"], "success() && steps.stage.outputs.upload_snapshot == 'true'")
+                expected = "!cancelled() && steps.stage.outputs.upload_snapshot == 'true'"
+                if step.get("name", "").startswith("Upload tree part"):
+                    expected += " && steps.checkpoint.outcome == 'success'"
+                self.assertEqual(step["if"], "${{ " + expected + " }}")
                 self.assertNotIn("ci-parts.sh", step.get("run", ""))
             logs = next(s for s in steps if s.get("name") == "Upload build diagnostics")
             self.assertEqual(logs["if"], "always()")

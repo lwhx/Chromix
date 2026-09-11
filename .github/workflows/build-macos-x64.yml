@@ -3,6 +3,22 @@ name: build-macos-x64
 on:
   workflow_dispatch:
     inputs:
+      resume_run_id:
+        description: 'Completed Mac x64 run whose exact checkpoint starts this new eight-stage build'
+        type: string
+        default: ''
+      resume_tree_stage:
+        description: 'Donor checkpoint stage (1-8)'
+        type: string
+        default: '7'
+      resume_artifact_ids:
+        description: 'Complete comma-separated artifact ID set recorded for the donor checkpoint'
+        type: string
+        default: ''
+      resume_attempt:
+        description: 'Exact attempt that uploaded the donor checkpoint'
+        type: string
+        default: '1'
       compile_jobs:
         description: 'Ninja jobs: auto uses CPU/memory limits, or a positive integer'
         type: string
@@ -67,5 +83,9 @@ jobs:
       max-stages: ${{ inputs.build_mode == 'single' && 1 || 8 }}
       build_profile: ${{ inputs.build_profile || 'fast' }}
       compile_jobs: ${{ inputs.compile_jobs || 'auto' }}
+      resume_run_id: ${{ inputs.resume_run_id || '' }}
+      resume_tree_stage: ${{ inputs.resume_tree_stage || '7' }}
+      resume_attempt: ${{ inputs.resume_attempt || '1' }}
+      resume_artifact_ids: ${{ inputs.resume_artifact_ids || '' }}
       use_upstream_cache: ${{ github.event_name != 'workflow_dispatch' || inputs.use_upstream_cache }}
     secrets: inherit

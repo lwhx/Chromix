@@ -81,13 +81,14 @@ remaining_min() {
 }
 
 handoff() {
-  if [ "$STAGE_INDEX" -ge "$MAX_STAGES" ]; then
-    die "stage $STAGE_INDEX reached max-stages $MAX_STAGES without finishing"
-  fi
-  log "stage $STAGE_INDEX: $*; handing off"
+  log "stage $STAGE_INDEX: $*; snapshotting unfinished work"
   mkdir -p "$SNAPSHOT_DIR"
   bash "$REPO/build/posix/ci-parts.sh" "$WORK" "$SNAPSHOT_DIR"
   emit upload_snapshot true
+  # Preserve the final checkpoint without reporting an unfinished build as success.
+  if [ "$STAGE_INDEX" -ge "$MAX_STAGES" ]; then
+    die "stage $STAGE_INDEX reached max-stages $MAX_STAGES without finishing"
+  fi
   exit 0
 }
 

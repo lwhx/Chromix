@@ -47,6 +47,22 @@ on:
         required: false
         type: string
         default: auto
+      resume_run_id:
+        required: false
+        type: string
+        default: ''
+      resume_tree_stage:
+        required: false
+        type: string
+        default: '7'
+      resume_artifact_ids:
+        required: false
+        type: string
+        default: ''
+      resume_attempt:
+        required: false
+        type: string
+        default: '1'
       use_upstream_cache:
         required: false
         type: boolean
@@ -178,6 +194,11 @@ NODE_PY = """      - name: Set up Node.js
           python-version: '3.13'
 """
 
+SDK_PREFLIGHT = """      - name: Verify complete Mac SDK contents
+        if: runner.os == 'macOS' && inputs.use_upstream_cache
+        run: python3 tools/inspect_macos_sdk.py --report "${RUNNER_TEMP}/chromix-logs/sdk-content.json"
+"""
+
 CACHE_RESTORE = """      # The pinned download cache is deliberately outside the tree snapshot;
       # re-warm it first so a resumed preparation does not redownload archives.
       - name: Restore pinned source downloads
@@ -235,8 +256,60 @@ DOWNLOAD_STEP = """      - name: Download tree from previous stage
           path: ${{ runner.temp }}/chromix-restore
 """
 
+RESUME_STEPS = """      - name: Validate selected Mac checkpoint
+        id: resume
+        if: inputs.resume_run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SNAPSHOT_RUN_ID: ${{ inputs.resume_run_id }}
+          SNAPSHOT_STAGE: ${{ inputs.resume_tree_stage }}
+          SNAPSHOT_ATTEMPT: ${{ inputs.resume_attempt }}
+          SNAPSHOT_ARTIFACT_IDS: ${{ inputs.resume_artifact_ids }}
+          BUILD_PLATFORM: ${{ inputs.platform }}
+          CACHE_REQUIRED: ${{ inputs.use_upstream_cache }}
+        run: |
+          set -euo pipefail
+          test "$BUILD_PLATFORM" = macos
+          test "$CACHE_REQUIRED" = true
+          python3 tools/validate_posix_snapshot.py --arch '${{ inputs.arch }}' \\
+            --report "${RUNNER_TEMP}/chromix-logs/snapshot-origin.json"
+      - name: Check out checkpoint patch definitions
+        if: inputs.resume_run_id != ''
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resume.outputs.head_sha }}
+          path: .chromix-previous-repo
+          persist-credentials: false
+      - name: Download selected Mac checkpoint
+        if: inputs.resume_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ steps.resume.outputs.pattern }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/chromix-restore
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.resume_run_id }}
+      - name: Restore and migrate selected Mac checkpoint
+        if: inputs.resume_run_id != ''
+        run: |
+          set -euo pipefail
+          RESTORE="${RUNNER_TEMP}/chromix-restore"
+          WORK="${RUNNER_TEMP}/chromix-build"
+          test ! -e "$WORK/src"
+          mkdir -p "$WORK"
+          find "$RESTORE" -name 'tree.tar.zst.*' -print -quit | grep -q .
+          find "$RESTORE" -name 'tree.tar.zst.*' -print0 | sort -z |
+            xargs -0 cat | zstd -d -T0 | tar -xpf - -C "$WORK"
+          rm -rf "$RESTORE"
+          python3 tools/migrate_restored_snapshot.py --workdir "$WORK" \\
+            --previous-repo "$GITHUB_WORKSPACE/.chromix-previous-repo" \\
+            --repo "$GITHUB_WORKSPACE" --platform macos --arch '${{ inputs.arch }}' \\
+            2>&1 | tee "${RUNNER_TEMP}/chromix-logs/snapshot-migration.log"
+"""
+
 SNAPSHOT_ENSURE = """      - name: Verify handoff snapshot
-        if: success() && steps.stage.outputs.upload_snapshot == 'true'
+        id: checkpoint
+        if: ${{ !cancelled() && steps.stage.outputs.upload_snapshot == 'true' }}
         run: |
           SNAP="${RUNNER_TEMP}/chromix-build/.snapshot-stage-%(stage)d"
           test -d "$SNAP/p1"
@@ -244,7 +317,7 @@ SNAPSHOT_ENSURE = """      - name: Verify handoff snapshot
 """
 
 UPLOAD_PARTS = """      - name: Upload tree part 1
-        if: success() && steps.stage.outputs.upload_snapshot == 'true'
+        if: ${{ !cancelled() && steps.stage.outputs.upload_snapshot == 'true' && steps.checkpoint.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact }}-tree-s%(stage)d-attempt-${{ github.run_attempt }}-part1
@@ -253,7 +326,7 @@ UPLOAD_PARTS = """      - name: Upload tree part 1
           retention-days: 3
           compression-level: 0
       - name: Upload tree part 2
-        if: success() && steps.stage.outputs.upload_snapshot == 'true'
+        if: ${{ !cancelled() && steps.stage.outputs.upload_snapshot == 'true' && steps.checkpoint.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact }}-tree-s%(stage)d-attempt-${{ github.run_attempt }}-part2
@@ -262,7 +335,7 @@ UPLOAD_PARTS = """      - name: Upload tree part 1
           retention-days: 3
           compression-level: 0
       - name: Upload tree part 3
-        if: success() && steps.stage.outputs.upload_snapshot == 'true'
+        if: ${{ !cancelled() && steps.stage.outputs.upload_snapshot == 'true' && steps.checkpoint.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact }}-tree-s%(stage)d-attempt-${{ github.run_attempt }}-part3
@@ -271,7 +344,7 @@ UPLOAD_PARTS = """      - name: Upload tree part 1
           retention-days: 3
           compression-level: 0
       - name: Upload tree part 4
-        if: success() && steps.stage.outputs.upload_snapshot == 'true'
+        if: ${{ !cancelled() && steps.stage.outputs.upload_snapshot == 'true' && steps.checkpoint.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact }}-tree-s%(stage)d-attempt-${{ github.run_attempt }}-part4
@@ -361,6 +434,9 @@ def job(stage: int) -> str:
     parts.append(LINUX_CLEAN)
     parts.append(MAC_STEPS)
     parts.append(NODE_PY)
+    parts.append(SDK_PREFLIGHT)
+    if stage == 1:
+        parts.append(RESUME_STEPS)
     if stage > 1:
         parts.append(DOWNLOAD_STEP % {"prev": stage - 1})
         parts.append("\n")

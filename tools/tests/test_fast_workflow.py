@@ -305,7 +305,7 @@ class SingleStageCompletionTest(unittest.TestCase):
                     self.assertFalse(work.exists())
                     self.assertFalse(self.output.exists())
 
-    def test_exhausted_stages_never_snapshot_or_report_completion(self):
+    def test_exhausted_stages_save_checkpoint_without_reporting_completion(self):
         for shell in SHELLS:
             for platform, arch in (("linux", "x64"), ("linux", "arm64"),
                                    ("macos", "x64"), ("macos", "arm64")):
@@ -316,8 +316,8 @@ class SingleStageCompletionTest(unittest.TestCase):
                             result = self.run_stage(shell, platform, arch, maximum, maximum, phase)
                             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                             self.assertIn("without finishing", result.stderr)
-                            self.assertFalse(list(self.work.glob(".snapshot-stage-*")))
-                            self.assertNotIn("upload_snapshot=true", self.output.read_text())
+                            self.assertTrue(list(self.work.glob(".snapshot-stage-*")))
+                            self.assertIn("upload_snapshot=true", self.output.read_text())
                             self.assertNotIn("finished=true", self.output.read_text())
 
     def test_staged_mode_still_hands_off_when_another_stage_is_available(self):

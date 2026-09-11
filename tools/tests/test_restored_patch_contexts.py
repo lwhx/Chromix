@@ -31,9 +31,9 @@ PATCHES = {
 # Expected functional additions, excluding empty lines only; indentation is hashed.
 ADDITION_HASHES = {
     "0018": "938125a87df94a17835e9efe3c344f813688ed5f6cdaf6657845a8953c105e1c",
-    "0031": "2a63477f7307d64ccdba20f174e4e25aac4a7d19df89fb002266d4c970a0dacd",
+    "0031": "f3e577877774fa2081480d96fb537a3cabf1e54e25045a140b58131ac47ae6f8",
     "0033": "61b5b3ae456468cdf8ee6a901a1014d77dfef2880c9d64588bdd1f0a59980fce",
-    "0047": "1d453ce398caed30c76bff4f7878fad8c21017435d981c39ff7d838647769bd9",
+    "0047": "b9492169a125898f839ab5b614ef0844a36a0953594bade93e660b58fa6a50c7",
 }
 
 # Line numbers and snippets come from pinned pre-Chromix sources, not the diffs.

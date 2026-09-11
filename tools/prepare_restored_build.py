@@ -20,12 +20,14 @@ import sys
 try:
     from .import_upstream_cache import CLANG, RUST, Miss, digest_file
     from .macos_runtime import bindgen_environment, runtime_environment
+    from .macos_sdk_identity import sdk_content_identity, validated_sdk_content
     from .restore_upstream_cache import linked, verify_restored
     from .upstream_object_cache import ninja_deps, ninja_log, write_json
     from .upstream_script_identity import ENDPOINTS
 except ImportError:
     from import_upstream_cache import CLANG, RUST, Miss, digest_file
     from macos_runtime import bindgen_environment, runtime_environment
+    from macos_sdk_identity import sdk_content_identity, validated_sdk_content
     from restore_upstream_cache import linked, verify_restored
     from upstream_object_cache import ninja_deps, ninja_log, write_json
     from upstream_script_identity import ENDPOINTS
@@ -277,16 +279,27 @@ def environment_identity(src: Path, platform: str) -> dict:
             result[" ".join(command)] = value
             if command[-1] == "--show-sdk-path":
                 sdk_paths.append(Path(value))
-    result["sdks"] = [{"root": _stat_identity(path), "settings": {
-        name: digest_file(path / name) for name in ("SDKSettings.json", "SDKSettings.plist", "System/Library/CoreServices/SystemVersion.plist")
-        if (path / name).is_file()}} for path in sdk_paths]
+    result["sdks"] = []
+    sdk_contents = {}
+    for path in sdk_paths:
+        root = _stat_identity(path)
+        entry = {"root": root, "settings": {
+            name: digest_file(path / name) for name in ("SDKSettings.json", "SDKSettings.plist", "System/Library/CoreServices/SystemVersion.plist")
+            if (path / name).is_file()}}
+        if platform == "macos":
+            # SDKROOT and xcrun often name the same tree; reuse only within this inspection.
+            key = root["path"]
+            if key not in sdk_contents:
+                sdk_contents[key] = sdk_content_identity(path)
+            entry["content"] = sdk_contents[key]
+        result["sdks"].append(entry)
     # Sysroot stamps, unlike GN-generated sdk links, survive graph regeneration.
     result["sysroots"] = {str(path.relative_to(src)): _stat_identity(path)
                           for path in sorted((src / "build/linux").glob("*sysroot/.stamp"))}
     return result
 
 
-def environments_compatible(previous: dict | None, current: dict) -> bool:
+def environments_compatible(previous: dict | None, current: dict, *, allow_sdk_drift=True) -> bool:
     """Compare build inputs without discarding stored scheduling provenance."""
     fields = {"host": list, "release": str, "version": str, "environment": dict,
               "sdks": list, "sysroots": dict}
@@ -301,9 +314,48 @@ def environments_compatible(previous: dict | None, current: dict) -> bool:
                 or not any(key not in ignored for key in identity["environment"])):
             return False
 
+    macos = previous["host"][0] == current["host"][0] == "macos"
+    if macos:
+        for identity in (previous, current):
+            for sdk in identity["sdks"]:
+                if not isinstance(sdk, dict):
+                    return False
+                if "content" in sdk and not validated_sdk_content(sdk["content"]):
+                    return False
+
+    def verified_sdks(identity):
+        commands = ("xcode-select --print-path", "xcrun --sdk macosx --show-sdk-path",
+                    "xcrun --sdk macosx --show-sdk-version", "xcrun --sdk macosx --show-sdk-build-version",
+                    "xcodebuild -version")
+        if (not identity["sdks"] or not identity["environment"].get("ImageVersion")
+                or any(not isinstance(identity.get(key), str) or not identity[key] for key in commands)):
+            return False
+        for sdk in identity["sdks"]:
+            root = sdk.get("root")
+            if (not validated_sdk_content(sdk.get("content")) or not isinstance(root, dict)
+                    or "missing" in root or not isinstance(root.get("path"), str)
+                    or not Path(root["path"]).is_absolute()
+                    or any(type(root.get(key)) is not int or root[key] < 0 for key in ("size", "mtime_ns"))
+                    or not isinstance(sdk.get("settings"), dict) or not sdk["settings"]
+                    or any(not isinstance(name, str) or not isinstance(value, str)
+                           or re.fullmatch(r"[0-9a-f]{64}", value) is None
+                           for name, value in sdk["settings"].items())):
+                return False
+        return True
+
+    matching_content = (allow_sdk_drift and macos and verified_sdks(previous) and verified_sdks(current)
+                        and [sdk["content"] for sdk in previous["sdks"]]
+                        == [sdk["content"] for sdk in current["sdks"]])
+    if matching_content:
+        ignored.add("ImageVersion")
+
     def compatibility(identity):
-        return dict(identity, environment={key: value for key, value in identity["environment"].items()
-                                           if key not in ignored})
+        result = dict(identity, environment={key: value for key, value in identity["environment"].items()
+                                             if key not in ignored})
+        if matching_content:
+            result["sdks"] = [dict(sdk, root={key: value for key, value in sdk["root"].items()
+                                              if key not in ("size", "mtime_ns")}) for sdk in identity["sdks"]]
+        return result
 
     return compatibility(previous) == compatibility(current)
 
@@ -388,8 +440,54 @@ def _remove_output(path: Path | None) -> bool:
     return False
 
 
+def _sdk_dependency_roots(src: Path, environment: dict, external_inputs) -> dict[Path, Path]:
+    """Map verified SDK spellings and restored aliases to their hashed roots."""
+    if not isinstance(environment.get("sdks"), list):
+        return {}
+    roots = {Path(sdk["root"]["path"]) for sdk in environment["sdks"]
+             if isinstance(sdk, dict) and validated_sdk_content(sdk.get("content"))
+             and isinstance(sdk.get("root"), dict) and isinstance(sdk["root"].get("path"), str)}
+    if not roots:
+        return {}
+    aliases = set(roots)
+    if environment["environment"].get("SDKROOT"):
+        aliases.add(Path(environment["environment"]["SDKROOT"]))
+    aliases.add(Path(environment["xcrun --sdk macosx --show-sdk-path"]))
+    link_root = Path("out/Default/sdk/xcode_links")
+    for value in external_inputs:
+        relative = Path(value)
+        if relative.parent == link_root and re.fullmatch(r"MacOSX(?:[0-9]+(?:\.[0-9]+)*)?\.sdk", relative.name):
+            alias = src / relative
+            if alias.is_symlink():
+                aliases.add(alias)
+    result = {}
+    for alias in sorted(aliases):
+        try:
+            target = alias.resolve(strict=True)
+            if alias.is_absolute() and target in roots and target.is_dir():
+                result[alias] = target
+        except (OSError, ValueError, RuntimeError):
+            continue
+    return result
+
+
+def _covered_sdk_dependency(candidate: Path, roots: dict[Path, Path]) -> bool:
+    # Reject lexical escapes and arbitrary external links into an SDK.
+    if ".." in candidate.parts:
+        return False
+    for alias, root in roots.items():
+        if not candidate.is_relative_to(alias):
+            continue
+        mapped = root / candidate.relative_to(alias)
+        resolved = candidate.resolve(strict=True)
+        if (alias.resolve(strict=True) == root and mapped.resolve(strict=True) == resolved
+                and resolved.is_relative_to(root) and resolved.is_file()):
+            return True
+    return False
+
+
 def invalidate_external_dependencies(src: Path, *, invalidate_all=False, recheck_external=True,
-                                     external_inputs=(), removed_generated=()) -> dict:
+                                     external_inputs=(), removed_generated=(), verified_sdk_roots=None) -> dict:
     out = src / "out/Default"
     if any(linked(parent) for parent in (out, *out.parents)):
         raise ValueError("linked output root")
@@ -416,11 +514,14 @@ def invalidate_external_dependencies(src: Path, *, invalidate_all=False, recheck
                     try:
                         lexical = Path(os.path.abspath(out / value))
                         omitted = any(lexical == root or lexical.is_relative_to(root) for root in external_roots)
-                        path = (out / value).resolve()
-                        outside = bool(Path(value).is_absolute() or PureWindowsPath(value).drive
-                                       or ":" in value or not path.is_relative_to(source_root) or omitted)
+                        candidate = out / value
+                        path = candidate.resolve()
+                        covered = (verified_sdk_roots and not PureWindowsPath(value).drive and ":" not in value
+                                   and _covered_sdk_dependency(candidate, verified_sdk_roots))
+                        outside = bool(not covered and (Path(value).is_absolute() or PureWindowsPath(value).drive
+                                       or ":" in value or not path.is_relative_to(source_root) or omitted))
                         absent = not outside and not path.is_file()
-                        reason = ("omitted_external_input" if omitted else "external_input" if outside else
+                        reason = ("omitted_external_input" if omitted and not covered else "external_input" if outside else
                                   "removed_generated_input" if absent and path.as_posix() in removed_generated else
                                   "missing_local_input" if absent else None)
                         inputs[dependency] = (outside, absent, reason)
@@ -688,6 +789,8 @@ def _prepare(workdir: Path, platform: str, arch: str, *, phase: str, repo: Path,
     fingerprint = tool_fingerprint(src, platform, arch)
     tool_changed = needs_invalidation or bool(old and old.get("tool_fingerprint") != fingerprint)
     environment_changed = not old or not environments_compatible(old.get("environment"), environment)
+    sdk_drift_recheck = (not environment_changed and not environments_compatible(
+        old.get("environment"), environment, allow_sdk_drift=False))
     first_finish = old is None
     data["operation"] = "invalidate_outputs"
     products = remove_final_products(src, platform) if first_finish else []
@@ -695,10 +798,23 @@ def _prepare(workdir: Path, platform: str, arch: str, *, phase: str, repo: Path,
     generated = (invalidate_generated_outputs(src, removed_paths=removed_generated)
                  if first_finish or generators_changed else {"removed_outputs": 0, "unknown_outputs": []})
     invalidate_all = tool_changed or sysroots_changed
+    full_recheck = environment_changed or generators_changed or bool(generated["removed_outputs"])
+    verified_sdk_roots = {}
+    if platform == "macos":
+        sdk_roots = _sdk_dependency_roots(src, environment, receipt["external_symlink_paths"])
+        binding_keys = {alias: alias.relative_to(src).as_posix() if alias.is_relative_to(src) else str(alias)
+                        for alias in sdk_roots}
+        data["sdk_dependency_roots"] = {binding_keys[alias]: str(root) for alias, root in sdk_roots.items()}
+        if sdk_drift_recheck and not full_recheck and not invalidate_all:
+            previous_roots = old.get("sdk_dependency_roots")
+            # Alias bindings are inputs too; legacy markers prove only canonical roots.
+            verified_sdk_roots = {alias: root for alias, root in sdk_roots.items()
+                                  if alias == root or isinstance(previous_roots, dict)
+                                  and previous_roots.get(binding_keys[alias]) == str(root)}
     dependencies = invalidate_external_dependencies(
-        src, invalidate_all=invalidate_all,
-        recheck_external=environment_changed or generators_changed or bool(generated["removed_outputs"]),
-        external_inputs=receipt["external_symlink_paths"], removed_generated=removed_generated)
+        src, invalidate_all=invalidate_all, recheck_external=full_recheck or sdk_drift_recheck,
+        external_inputs=receipt["external_symlink_paths"], removed_generated=removed_generated,
+        verified_sdk_roots=verified_sdk_roots)
     compiled = invalidate_compiled_outputs(src) if invalidate_all else {"removed_outputs": 0, "unknown_outputs": []}
     gn = inspection["tools"]["gn"]
     gn_path = _safe_file(src / "out/Default", Path(gn["path"]).name)
@@ -713,6 +829,7 @@ def _prepare(workdir: Path, platform: str, arch: str, *, phase: str, repo: Path,
                 dependencies=dependencies, compiled_outputs=compiled, generated_outputs=generated, removed_gn=removed_gn,
                 removed_final_products=products, counters={
                     "tool_swap_invalidations": int(tool_changed), "environment_rechecks": int(environment_changed),
+                    "sdk_drift_external_rechecks": int(sdk_drift_recheck),
                     "generator_rechecks": int(first_finish or generators_changed),
                     "toolchain_invalidated_outputs": dependencies["toolchain_invalidated_outputs"] + compiled["removed_outputs"],
                     "first_finish": int(first_finish)})

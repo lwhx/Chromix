@@ -3,7 +3,10 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
+import shutil
 import struct
+import subprocess
 import tempfile
 import unittest
 from contextlib import ExitStack, redirect_stdout
@@ -1446,16 +1449,442 @@ class PrepareRestoredBuildTest(unittest.TestCase):
                 self.assertEqual(result["counters"][counter], 1)
                 self.assertEqual(result["counters"]["environment_rechecks"], 0)
 
+    def macos_sdk(self):
+        sdk = self.work / "MacOSX.sdk"
+        for name, content in {"SDKSettings.json": '{"Version": "26.0"}',
+                              "usr/include/header.h": "sdk header",
+                              "usr/lib/libSystem.tbd": "sdk library",
+                              "System/Library/Frameworks/Kit.framework/Headers/Kit.h": "framework header",
+                              "System/Library/Frameworks/Kit.framework/Kit.tbd": "framework library"}.items():
+            self.write(sdk / name, content)
+        (sdk / "usr/include/alias.h").symlink_to("header.h")
+        return sdk
+
+    def macos_environment_context(self, sdk):
+        environment_identity = prepare.environment_identity
+        stack = ExitStack()
+        stack.enter_context(self.native_context())
+        stack.enter_context(mock.patch.dict(os.environ, {
+            "ImageOS": "macos15", "ImageVersion": "v1", "SDKROOT": str(sdk)}, clear=True))
+        values = {"--show-sdk-path": str(sdk), "--show-sdk-version": "26.0",
+                  "--show-sdk-build-version": "25A", "-version": "Xcode 26\nBuild version 17A",
+                  "--print-path": "/Applications/Xcode.app/Contents/Developer"}
+        stack.enter_context(mock.patch.object(prepare.subprocess, "run", side_effect=lambda command, **kwargs:
+            mock.Mock(stdout=values.get(command[-1], "native tool"), returncode=0)))
+        stack.enter_context(mock.patch.object(prepare, "environment_identity", side_effect=environment_identity))
+        return stack
+
+    def test_mac_content_identity_hashes_duplicate_sdk_roots_once_per_inspection(self):
+        sdk = self.macos_sdk()
+        alias = self.work / "SDK-alias"
+        alias.symlink_to(sdk, target_is_directory=True)
+        with self.macos_environment_context(sdk), mock.patch.dict(os.environ, {"SDKROOT": str(alias)}), \
+                mock.patch.object(prepare, "sdk_content_identity", wraps=prepare.sdk_content_identity) as identity:
+            first = prepare.environment_identity(self.src, "macos")
+            self.assertEqual(identity.call_count, 1)
+            second = prepare.environment_identity(self.src, "macos")
+            self.assertEqual(identity.call_count, 2)
+        self.assertEqual(first, second)
+        self.assertEqual(len(first["sdks"]), 2)
+        self.assertEqual(first["sdks"][0], first["sdks"][1])
+        self.assertTrue(prepare.validated_sdk_content(first["sdks"][0]["content"]))
+
+    def test_mac_verified_sdk_image_and_root_stat_drift_preserve_resumed_outputs(self):
+        self.fixture()
+        sdk = self.macos_sdk()
+        with self.macos_environment_context(sdk):
+            previous = prepare.prepare(self.work, "macos", "arm64")
+            internal = self.object("internal.o")
+            external = self.object("sdk.o")
+            reader = self.object("generated.o")
+            generated = self.write(self.out / "gen/header.h", "generated")
+            self.deps({"obj/internal.o": ["../../include/a.h"], "obj/sdk.o": [str(sdk / "usr/include/header.h")],
+                       "obj/generated.o": ["gen/header.h"]})
+            self.write(self.out / ".ninja_log", "# ninja log v5\n0\t1\t1\tgen/header.h\tabc\n")
+            preserved = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in (
+                internal, external, reader, generated, *(self.out / name for name in prepare.METADATA))}
+            for image in ("v2", "v3"):
+                info = sdk.stat()
+                os.utime(sdk, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000))
+                with mock.patch.dict(os.environ, {"ImageVersion": image, "GITHUB_JOB": image}):
+                    prepare.prepare(self.work, "macos", "arm64", phase="inspect")
+                    result = prepare.prepare(self.work, "macos", "arm64")
+                for counter in ("environment_rechecks", "tool_swap_invalidations", "generator_rechecks",
+                                "toolchain_invalidated_outputs", "first_finish"):
+                    self.assertEqual(result["counters"][counter], 0)
+                self.assertEqual(result["dependencies"]["removed_outputs"], 0)
+                self.assertEqual(result["counters"]["sdk_drift_external_rechecks"], 1)
+                self.assertEqual(result["generated_outputs"]["removed_outputs"], 0)
+                self.assertEqual(result["environment"]["environment"]["ImageVersion"], image)
+                self.assertNotEqual(previous["environment"], result["environment"])
+                self.assertEqual(previous["environment"]["sdks"][0]["content"],
+                                 result["environment"]["sdks"][0]["content"])
+                for path, state in preserved.items():
+                    self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), state)
+                self.assertEqual(json.loads((self.src / prepare.MARKER).read_text()), result)
+
+    def test_mac_sdk_drift_exempts_only_covered_dependencies_and_known_sdk_aliases(self):
+        receipt = self.fixture()
+        sdk = self.macos_sdk()
+        known = "out/Default/sdk/xcode_links/MacOSX26.0.sdk"
+        missing = "out/Default/sdk/xcode_links/MacOSX25.0.sdk"
+        toolchain = "out/Default/sdk/xcode_links/XcodeDefault.xctoolchain"
+        platform = "out/Default/sdk/xcode_links/MacOSX.platform"
+        receipt["external_symlink_paths"] = [known, missing, toolchain, platform]
+        self.write(self.src / restore.MARKER, json.dumps(receipt))
+        link = self.src / known
+        link.parent.mkdir(parents=True)
+        link.symlink_to(sdk, target_is_directory=True)
+        other = self.write(self.work / "external/header.h", "other one")
+        for relative in (toolchain, platform):
+            (self.src / relative).symlink_to(other.parent, target_is_directory=True)
+        arbitrary = self.work / "arbitrary.h"
+        arbitrary.symlink_to(sdk / "usr/include/header.h")
+        prefix = self.write(self.work / "MacOSX.sdk-other/usr/include/header.h", "prefix")
+        roots = self.work / "SDKROOT-alias"
+        roots.symlink_to(sdk, target_is_directory=True)
+        records = {
+            "obj/absolute.o": [str(sdk / "usr/include/header.h")],
+            "obj/internal-sdk-link.o": [str(sdk / "usr/include/alias.h")],
+            "obj/known.o": ["sdk/xcode_links/MacOSX26.0.sdk/usr/include/header.h"],
+            "obj/known-absolute.o": [str(link / "usr/include/header.h")],
+            "obj/sdkroot.o": [str(roots / "usr/include/header.h")],
+            "obj/source.o": ["../../include/a.h"],
+            "obj/other.o": [str(other)],
+            "obj/mixed.o": [str(sdk / "usr/include/header.h"), str(other)],
+            "obj/prefix.o": [str(prefix)],
+            "obj/arbitrary.o": [str(arbitrary)],
+            "obj/missing-link.o": ["sdk/xcode_links/MacOSX25.0.sdk/usr/include/header.h"],
+            "obj/missing-sdk-file.o": [str(sdk / "usr/include/missing.h")],
+            "obj/traversal.o": [str(sdk / "usr/include/../../../external/header.h")],
+            "obj/missing-source.o": ["../../include/missing.h"],
+            "obj/toolchain.o": ["sdk/xcode_links/XcodeDefault.xctoolchain/header.h"],
+            "obj/platform.o": ["sdk/xcode_links/MacOSX.platform/header.h"],
+        }
+        preserved = {"absolute.o", "internal-sdk-link.o", "known.o", "known-absolute.o", "sdkroot.o", "source.o"}
+        with self.macos_environment_context(sdk), mock.patch.dict(os.environ, {"SDKROOT": str(roots)}):
+            prepare.prepare(self.work, "macos", "arm64")
+            for drift in ("image", "root-stat"):
+                with self.subTest(drift=drift):
+                    for name in records:
+                        self.object(Path(name).name)
+                    self.deps(records)
+                    if drift == "root-stat":
+                        info = sdk.stat()
+                        os.utime(sdk, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000))
+                    with mock.patch.dict(os.environ, {"ImageVersion": "v2"}):
+                        result = prepare.prepare(self.work, "macos", "arm64")
+                    self.assertEqual(result["counters"]["environment_rechecks"], 0)
+                    self.assertEqual(result["counters"]["sdk_drift_external_rechecks"], 1)
+                    self.assertEqual(result["dependencies"]["removed_outputs"], len(records) - len(preserved))
+                    for name in records:
+                        self.assertEqual((self.out / name).exists(), Path(name).name in preserved, name)
+            self.assertEqual(other.read_text(), "other one")
+
+    def test_mac_sdk_drift_does_not_trust_retargeted_known_sdk_alias(self):
+        receipt = self.fixture()
+        sdk = self.macos_sdk()
+        name = "out/Default/sdk/xcode_links/MacOSX26.0.sdk"
+        receipt["external_symlink_paths"] = [name]
+        self.write(self.src / restore.MARKER, json.dumps(receipt))
+        link = self.src / name
+        link.parent.mkdir(parents=True)
+        link.symlink_to(sdk, target_is_directory=True)
+        with self.macos_environment_context(sdk):
+            prepare.prepare(self.work, "macos", "arm64")
+            other = self.write(self.work / "different-sdk/usr/include/header.h", "different")
+            link.unlink()
+            link.symlink_to(other.parents[2], target_is_directory=True)
+            output = self.object("retargeted.o")
+            self.deps({"obj/retargeted.o": ["sdk/xcode_links/MacOSX26.0.sdk/usr/include/header.h"]})
+            with mock.patch.dict(os.environ, {"ImageVersion": "v2"}):
+                result = prepare.prepare(self.work, "macos", "arm64")
+        self.assertFalse(output.exists())
+        self.assertEqual(result["dependencies"]["input_reason_outputs"], {"omitted_external_input": 1})
+
+    def test_mac_new_or_unrecorded_sdk_alias_mapping_is_not_an_exemption(self):
+        receipt = self.fixture()
+        sdk = self.macos_sdk()
+        name = "out/Default/sdk/xcode_links/MacOSX26.0.sdk"
+        receipt["external_symlink_paths"] = [name]
+        self.write(self.src / restore.MARKER, json.dumps(receipt))
+        link = self.src / name
+        link.parent.mkdir(parents=True)
+        other = self.write(self.work / "different-sdk/usr/include/header.h", "different")
+        for state in ("retargeted-in", "legacy"):
+            with self.subTest(state=state), self.macos_environment_context(sdk):
+                (self.src / prepare.MARKER).unlink(missing_ok=True)
+                link.unlink(missing_ok=True)
+                link.symlink_to(other.parents[2] if state == "retargeted-in" else sdk, target_is_directory=True)
+                previous = prepare.prepare(self.work, "macos", "arm64")
+                if state == "legacy":
+                    previous.pop("sdk_dependency_roots")
+                    self.write(self.src / prepare.MARKER, json.dumps(previous))
+                else:
+                    link.unlink()
+                    link.symlink_to(sdk, target_is_directory=True)
+                output = self.object("aliased.o")
+                canonical = self.object("canonical.o")
+                self.deps({"obj/aliased.o": ["sdk/xcode_links/MacOSX26.0.sdk/usr/include/header.h"],
+                           "obj/canonical.o": [str(sdk / "usr/include/header.h")]})
+                with mock.patch.dict(os.environ, {"ImageVersion": "v2"}):
+                    result = prepare.prepare(self.work, "macos", "arm64")
+                self.assertFalse(output.exists())
+                self.assertTrue(canonical.exists())
+                self.assertEqual(result["dependencies"]["removed_outputs"], 1)
+                self.assertEqual(result["sdk_dependency_roots"][name], str(sdk))
+
+    def test_mac_sdk_alias_binding_survives_source_workspace_relocation(self):
+        receipt = self.fixture()
+        sdk = self.macos_sdk()
+        name = "out/Default/sdk/xcode_links/MacOSX26.0.sdk"
+        receipt["external_symlink_paths"] = [name]
+        self.write(self.src / restore.MARKER, json.dumps(receipt))
+        link = self.src / name
+        link.parent.mkdir(parents=True)
+        link.symlink_to(sdk, target_is_directory=True)
+        with self.macos_environment_context(sdk):
+            previous = prepare.prepare(self.work, "macos", "arm64")
+            self.assertEqual(previous["sdk_dependency_roots"][name], str(sdk))
+            relocated = self.work / "relocated"
+            relocated.mkdir()
+            self.src.rename(relocated / "src")
+            self.work, self.src = relocated, relocated / "src"
+            self.out = self.src / "out/Default"
+            output = self.object("sdk.o")
+            self.deps({"obj/sdk.o": ["sdk/xcode_links/MacOSX26.0.sdk/usr/include/header.h"]})
+            with mock.patch.dict(os.environ, {"ImageVersion": "v2"}):
+                result = prepare.prepare(self.work, "macos", "arm64")
+            self.assertTrue(output.exists())
+            self.assertEqual(result["dependencies"]["removed_outputs"], 0)
+            self.assertEqual(result["counters"]["sdk_drift_external_rechecks"], 1)
+
+    @unittest.skipUnless(shutil.which("ninja") and shutil.which("cc"), "Ninja and C compiler required")
+    def test_mac_image_drift_rebuilds_real_ninja_object_for_unhashed_cpath_header(self):
+        self.fixture()
+        sdk = self.macos_sdk()
+        header = self.write(self.work / "external/include/value.h", "#define VALUE 1\n")
+        source = self.write(self.src / "input.c", '#include <value.h>\nint value(void) { return VALUE; }\n')
+        ninja, cc, run = shutil.which("ninja"), shutil.which("cc"), subprocess.run
+        self.write(self.out / "build.ninja", "rule cc\n"
+                   f"  command = {shlex.quote(cc)} -MMD -MF $out.d -c $in -o $out\n"
+                   "  depfile = $out.d\n  deps = gcc\n"
+                   f"build obj/cpath.o: cc {source}\n")
+        with self.macos_environment_context(sdk), mock.patch.dict(os.environ, {"CPATH": str(header.parent)}):
+            previous = prepare.prepare(self.work, "macos", "arm64")
+            run([ninja, "-C", str(self.out)], check=True, capture_output=True, text=True)
+            obj = self.out / "obj/cpath.o"
+            original = obj.read_bytes()
+            info = header.stat()
+            header.write_text("#define VALUE 2\n")
+            os.utime(header, ns=(info.st_atime_ns, info.st_mtime_ns))
+            self.assertEqual(header.stat().st_size, info.st_size)
+            before = run([ninja, "-C", str(self.out), "-n"], check=True, capture_output=True, text=True)
+            self.assertIn("no work to do", before.stdout)
+            with mock.patch.dict(os.environ, {"ImageVersion": "v2"}):
+                result = prepare.prepare(self.work, "macos", "arm64")
+                self.assertEqual(previous["environment"]["sdks"], result["environment"]["sdks"])
+                self.assertFalse(obj.exists(), "Image drift must not exempt an unhashed CPATH dependency")
+                planned = run([ninja, "-C", str(self.out), "-n"], check=True, capture_output=True, text=True)
+                self.assertNotIn("no work to do", planned.stdout)
+                run([ninja, "-C", str(self.out)], check=True, capture_output=True, text=True)
+                self.assertNotEqual(original, obj.read_bytes())
+                resumed = prepare.prepare(self.work, "macos", "arm64")
+                self.assertEqual(resumed["dependencies"]["removed_outputs"], 0)
+                self.assertEqual(resumed["counters"]["sdk_drift_external_rechecks"], 0)
+                self.assertTrue(obj.exists())
+            self.assertEqual(result["counters"]["sdk_drift_external_rechecks"], 1)
+            self.assertEqual(result["dependencies"]["removed_outputs"], 1)
+            self.assertEqual(result["dependencies"]["input_reason_outputs"], {"external_input": 1})
+
+    def test_mac_legacy_sdk_metadata_requires_one_recheck_even_without_stat_drift(self):
+        self.fixture()
+        sdk = self.macos_sdk()
+        with self.macos_environment_context(sdk):
+            for drift in (False, True):
+                with self.subTest(drift=drift):
+                    previous = prepare.prepare(self.work, "macos", "arm64")
+                    for entry in previous["environment"]["sdks"]:
+                        entry.pop("content")
+                    self.write(self.src / prepare.MARKER, json.dumps(previous))
+                    self.deps({"obj/sdk.o": [str(sdk / "usr/include/header.h")],
+                               "obj/internal.o": ["../../include/a.h"]})
+                    external = self.object("sdk.o")
+                    internal = self.object("internal.o")
+                    if drift:
+                        info = sdk.stat()
+                        os.utime(sdk, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000))
+                    with mock.patch.dict(os.environ, {"ImageVersion": "v2" if drift else "v1"}):
+                        result = prepare.prepare(self.work, "macos", "arm64")
+                        self.assertEqual(result["counters"]["environment_rechecks"], 1)
+                        self.assertEqual(result["dependencies"]["removed_outputs"], 1)
+                        self.assertFalse(external.exists())
+                        self.assertTrue(internal.exists())
+                        self.assertEqual(result["counters"]["toolchain_invalidated_outputs"], 0)
+                        self.assertTrue(all(prepare.validated_sdk_content(entry["content"])
+                                            for entry in result["environment"]["sdks"]))
+                        self.object("sdk.o")
+                        resumed = prepare.prepare(self.work, "macos", "arm64")
+                    self.assertEqual(resumed["counters"]["environment_rechecks"], 0)
+                    self.assertEqual(resumed["dependencies"]["removed_outputs"], 0)
+                    self.assertTrue(external.exists())
+
+    def test_mac_sdk_and_tool_content_changes_still_invalidate_with_stat_preserved(self):
+        root = self.work
+        for change in ("header", "library", "framework", "symlink", "tool", "generator"):
+            with self.subTest(change=change):
+                self.work = root / change
+                self.src = self.work / "src"
+                self.out = self.src / "out/Default"
+                self.fixture()
+                self.write(self.src / "include/a.h", "header")
+                sdk = self.macos_sdk()
+                generator = self.write(self.src / prepare.generator_paths("macos", "arm64")["go"], "generator")
+                with self.macos_environment_context(sdk):
+                    before = prepare.prepare(self.work, "macos", "arm64")
+                    external = self.object("sdk.o")
+                    internal = self.object("internal.o")
+                    reader = self.object("generated.o")
+                    generated = self.write(self.out / "gen/header.h", "generated")
+                    self.deps({"obj/sdk.o": [str(sdk / "usr/include/header.h")],
+                               "obj/internal.o": ["../../include/a.h"], "obj/generated.o": ["gen/header.h"]})
+                    self.write(self.out / ".ninja_log", "# ninja log v5\n0\t1\t1\tgen/header.h\tabc\n")
+                    if change == "symlink":
+                        link = sdk / "usr/include/alias.h"
+                        link.unlink()
+                        link.symlink_to("./header.h")
+                    else:
+                        path = {"header": sdk / "usr/include/header.h", "library": sdk / "usr/lib/libSystem.tbd",
+                                "framework": sdk / "System/Library/Frameworks/Kit.framework/Kit.tbd",
+                                "tool": self.src / prepare.CLANG / "bin/clang", "generator": generator}[change]
+                        content, info = path.read_bytes(), path.stat()
+                        self.write(path, content[:-1] + bytes([content[-1] ^ 1]))
+                        os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+                    with mock.patch.dict(os.environ, {"ImageVersion": "v2"}):
+                        result = prepare.prepare(self.work, "macos", "arm64")
+                sdk_changed = change not in ("tool", "generator")
+                self.assertFalse(external.exists())
+                self.assertEqual(internal.exists(), change != "tool")
+                self.assertEqual(reader.exists(), change not in ("tool", "generator"))
+                self.assertEqual(generated.exists(), change != "generator")
+                self.assertEqual(result["counters"]["environment_rechecks"], int(sdk_changed))
+                self.assertEqual(result["counters"]["tool_swap_invalidations"], int(change == "tool"))
+                self.assertEqual(result["counters"]["generator_rechecks"], int(change == "generator"))
+                self.assertEqual(before["environment"]["sdks"][0]["settings"],
+                                 result["environment"]["sdks"][0]["settings"])
+
+    def test_mac_normalization_preserves_all_other_inputs_and_unknown_fields(self):
+        sdk = self.macos_sdk()
+        with self.macos_environment_context(sdk):
+            identity = prepare.environment_identity(self.src, "macos")
+        original = json.dumps(identity, sort_keys=True)
+        changed = json.loads(original)
+        changed["environment"]["ImageVersion"] = "v2"
+        for entry in changed["sdks"]:
+            entry["root"].update(size=999, mtime_ns=123)
+        normalized = json.dumps(changed, sort_keys=True)
+        self.assertTrue(prepare.environments_compatible(identity, changed))
+        self.assertTrue(prepare.environments_compatible(changed, identity))
+        self.assertFalse(prepare.environments_compatible(identity, changed, allow_sdk_drift=False))
+        self.assertFalse(prepare.environments_compatible(changed, identity, allow_sdk_drift=False))
+        self.assertTrue(prepare.environments_compatible(identity, identity, allow_sdk_drift=False))
+        changes = [(('release',), 'new'), (('version',), 'new'), (('host',), ['macos', 'x64']),
+                   (('future',), 'new'), (('ImageVersion',), 'new'),
+                   (('sdks', 0, 'settings', 'SDKSettings.json'), 'new'),
+                   (('sdks', 0, 'root', 'path'), '/other/sdk'), (('sdks', 0, 'root', 'future'), 'new'),
+                   (('sdks', 0, 'future'), 'new'), (('sdks', 0, 'content', 'future'), 'new'),
+                   (('sdks', 0, 'content', 'sha256'), '0' * 64), (('sysroots', 'future'), {})]
+        changes.extend((("environment", key), "new") for key in (
+            "ImageOS", "RUNNER_OS", "RUNNER_ARCH", "SDKROOT", "DEVELOPER_DIR", "CPATH", "LIBRARY_PATH", "FUTURE_INPUT"))
+        changes.extend(((key,), "new") for key in identity if key.startswith(("xcrun", "xcode")))
+        for path, value in changes:
+            with self.subTest(path=path):
+                candidate = json.loads(normalized)
+                parent = candidate
+                for key in path[:-1]:
+                    parent = parent[key]
+                parent[path[-1]] = value
+                self.assertFalse(prepare.environments_compatible(identity, candidate))
+                self.assertFalse(prepare.environments_compatible(candidate, identity))
+        for size in (0, 1, 3):
+            candidate = json.loads(normalized)
+            candidate["sdks"] = (candidate["sdks"] * 2)[:size]
+            self.assertFalse(prepare.environments_compatible(identity, candidate))
+        for platform in ("linux", "windows"):
+            before, after = json.loads(original), json.loads(normalized)
+            before["host"][0] = after["host"][0] = platform
+            self.assertFalse(prepare.environments_compatible(before, after))
+        self.assertEqual(json.dumps(identity, sort_keys=True), original)
+        self.assertEqual(json.dumps(changed, sort_keys=True), normalized)
+
+    def test_mac_missing_or_invalid_fingerprints_never_normalize_image_or_root_stat(self):
+        sdk = self.macos_sdk()
+        with self.macos_environment_context(sdk):
+            identity = prepare.environment_identity(self.src, "macos")
+        for invalid in (None, {}, "0" * 64, {"sha256": "0" * 64},
+                        dict(identity["sdks"][0]["content"], complete=False),
+                        dict(identity["sdks"][0]["content"], schema_version=2)):
+            with self.subTest(content=invalid):
+                before = json.loads(json.dumps(identity))
+                before["sdks"][0]["content"] = invalid
+                self.assertFalse(prepare.environments_compatible(before, before))
+                after = json.loads(json.dumps(before))
+                after["environment"]["ImageVersion"] = "v2"
+                after["sdks"][0]["root"]["mtime_ns"] += 1
+                self.assertFalse(prepare.environments_compatible(before, after))
+                self.assertFalse(prepare.environments_compatible(identity, before))
+        for missing in ("content", "root", "settings"):
+            before = json.loads(json.dumps(identity))
+            before["sdks"][0].pop(missing)
+            after = json.loads(json.dumps(before))
+            after["environment"]["ImageVersion"] = "v2"
+            self.assertFalse(prepare.environments_compatible(before, after))
+        for path, value in ((("sdks", 0, "settings"), {}), (("sdks", 0, "settings"), {"SDKSettings.json": "bad"}),
+                            (("sdks", 0, "root", "missing"), True), (("sdks", 0, "root", "size"), True),
+                            (("sdks", 0, "root", "mtime_ns"), "1"), (("sdks", 0, "root", "path"), "relative"),
+                            (("environment", "ImageVersion"), "")):
+            with self.subTest(path=path, value=value):
+                before = json.loads(json.dumps(identity))
+                parent = before
+                for key in path[:-1]:
+                    parent = parent[key]
+                parent[path[-1]] = value
+                after = json.loads(json.dumps(before))
+                after["environment"]["ImageVersion"] = "v2"
+                self.assertFalse(prepare.environments_compatible(before, after))
+        for missing in ("xcodebuild -version", "xcrun --sdk macosx --show-sdk-path"):
+            before = json.loads(json.dumps(identity))
+            before.pop(missing)
+            after = json.loads(json.dumps(before))
+            after["environment"]["ImageVersion"] = "v2"
+            self.assertFalse(prepare.environments_compatible(before, after))
+
+    def test_mac_incomplete_sdk_scan_rechecks_each_time_without_unsafe_reuse(self):
+        self.fixture()
+        sdk = self.macos_sdk()
+        external_header = self.write(self.work / "external.h", "external")
+        (sdk / "usr/include/external.h").symlink_to(external_header)
+        self.deps({"obj/sdk.o": [str(sdk / "usr/include/header.h")]})
+        with self.macos_environment_context(sdk):
+            for _ in range(2):
+                output = self.object("sdk.o")
+                result = prepare.prepare(self.work, "macos", "arm64")
+                self.assertTrue(result["ready_for_gn"])
+                self.assertFalse(result["environment"]["sdks"][0]["content"]["complete"])
+                self.assertEqual(result["counters"]["environment_rechecks"], 1)
+                self.assertFalse(output.exists())
+        self.assertEqual(external_header.read_text(), "external")
+
     def test_environment_records_runner_image_and_sdk_build_not_generated_graph(self):
         self.fixture()
-        sdk = self.work / "SDK"
-        self.write(sdk / "SDKSettings.json", '{"Version": "26.0"}')
+        sdk = self.macos_sdk()
         def run(command, **kwargs):
             values = {"--show-sdk-path": str(sdk), "--show-sdk-version": "26.0",
                       "--show-sdk-build-version": "25A", "-version": "Xcode 26\nBuild version 17A",
                       "--print-path": "/Applications/Xcode.app/Contents/Developer"}
             return mock.Mock(stdout=values[command[-1]], returncode=0)
-        with mock.patch.dict(os.environ, {"ImageOS": "macos15", "ImageVersion": "v1", "GITHUB_JOB": "build-1"}), \
+        with mock.patch.dict(os.environ, {"ImageOS": "macos15", "ImageVersion": "v1", "GITHUB_JOB": "build-1"}, clear=True), \
+                mock.patch.object(prepare, "host_identity", return_value=("macos", "arm64")), \
                 mock.patch.object(prepare.subprocess, "run", side_effect=run):
             first = prepare.environment_identity(self.src, "macos")
             self.write(self.out / "build.ninja", "new graph")
@@ -1467,7 +1896,7 @@ class PrepareRestoredBuildTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {"ImageVersion": "v2"}):
                 changed = prepare.environment_identity(self.src, "macos")
                 self.assertNotEqual(first, changed)
-                self.assertFalse(prepare.environments_compatible(first, changed))
+                self.assertTrue(prepare.environments_compatible(first, changed))
         for key in ("xcode-select --print-path", "xcrun --sdk macosx --show-sdk-path",
                     "xcrun --sdk macosx --show-sdk-version", "xcrun --sdk macosx --show-sdk-build-version",
                     "xcodebuild -version"):
