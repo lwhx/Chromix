@@ -939,6 +939,9 @@ param($Out, $Dest)
 Add-Content -LiteralPath $env:MOCK_CALLS -Value "package"
 ''')
         self.put(self.root / "prepare-ungoogled.ps1", self.script.read_text())
+        # This harness stubs native tool execution; the real Node helper has
+        # its own Windows execution tests.
+        self.put(self.root / "configure-node.ps1", 'param($NodePath)\n')
         stage = STAGE.read_text()
         start = stage.index('$domainProgress = Join-Path $Src')
         body = stage[start:]

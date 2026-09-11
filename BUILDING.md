@@ -417,6 +417,18 @@ Checksum, native smoke, and object-retention evidence checks remain mandatory.
 Compare completed-run elapsed times, planned Ninja work, and retention reports
 before claiming a measured speedup.
 
+Windows build entrypoints configure the bundled `third_party/node/win/node.exe`
+before Chrome compilation, including checkpoint resumes. They append
+`--disable-wasm-trap-handler` to `NODE_OPTIONS`, preserving existing options, so
+Node uses explicit WebAssembly bounds checks for build tools such as Rollup.
+This is a build-only compatibility workaround for the native `0xC0000005` exit
+observed with Node 24.12.0 during DevTools highlighting bundling; the precise
+cause of that crash is not yet established. It neither disables WebAssembly
+nor replaces Node or changes Chromium build flags. A bundled-Node WASM probe
+must succeed before compilation starts; invalid options or missing Node fail
+the build rather than falling back to PATH or hiding compiler errors. Local
+probe tests cover Node 24.12.0; the original workload still requires CI retesting.
+
 The Windows reusable workflow retains its 12-stage snapshot/resume chain. Each
 stage uploads multi-volume 7-Zip snapshots with modification times preserved so
 Ninja can continue incrementally. Manual dispatch of

@@ -803,6 +803,7 @@ if ($env:CHROMIX_JOBS) {
   $CompileJobs = [int]$env:CHROMIX_JOBS
 }
 Write-Host "==> Ninja compile jobs: $CompileJobs"
+& "$PSScriptRoot\configure-node.ps1" -NodePath (Join-Path $Src 'third_party\node\win\node.exe')
 $rc = Invoke-Tracked -File $Ninja `
   -ArgList "-C `"$OutDir`" -j $CompileJobs chrome" -Cwd $Src -TimeoutSec ($ninjaBudget * 60)
 if ($RestoredUpstream) {

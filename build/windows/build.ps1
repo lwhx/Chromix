@@ -36,6 +36,7 @@ $env:DEPOT_TOOLS_COLLECT_METRICS = "0"
 
 $env:PATH = "$(Join-Path $Src 'third_party\ninja');$(Join-Path $Src 'third_party\node\win');$env:PATH"
 $Ninja = Join-Path $Src "third_party\ninja\ninja.exe"
+& "$PSScriptRoot\configure-node.ps1" -NodePath (Join-Path $Src 'third_party\node\win\node.exe')
 if (Test-Path (Join-Path $Src ".chromix-upstream-restored.json")) {
   $Out = Join-Path $Src "out\Default"
   $Ninja = & python (Join-Path $Repo "tools\restore_ninja.py") --workdir $WorkDir --platform windows --arch x64
