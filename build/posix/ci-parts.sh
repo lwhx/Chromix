@@ -35,8 +35,12 @@ esac
 rm -rf "${PARTS_DIR:?}"/*
 
 stage_dir="$PARTS_DIR/stage"
-archive="$stage_dir/tree.tar.zst"
 mkdir -p "$stage_dir"
+# A failed pipeline must never expose partial volumes in upload slots.
+trap 'rm -rf "$stage_dir"' EXIT
+# GNU split (gsplit on macOS) starts decimal suffixes at zero with -d.
+# Select before consuming stdin: a failed stream cannot be retried.
+if command -v gsplit >/dev/null 2>&1; then SPLIT=gsplit; else SPLIT=split; fi
 
 # BSD tar exclusions are unanchored: ./download_cache also drops the required
 # tooling/download_cache symlink. find -path matches the full relative path.
@@ -62,11 +66,18 @@ esac
   find . \( "${find_excludes[@]}" \) -prune -o -type d -print0 |
     TMPDIR="$stage_dir" LC_ALL=C sort -zr
 ) | tar --format=pax -cpf - --no-recursion --null -C "$ROOT" -T - |
-  zstd -f -T0 -3 -o "$archive"
+  zstd -T0 -3 -c |
+  "$SPLIT" -a 3 -d -b "$VOLUME_BYTES" - "$stage_dir/vol"
 
-total="$(stat -c %s "$archive" 2>/dev/null || stat -f %z "$archive")"
-volumes=$(( (total + VOLUME_BYTES - 1) / VOLUME_BYTES ))
-echo "==> packed ${total} bytes ($(du -h "$archive" | cut -f1)) as $volumes volumes"
+total=0
+volumes=0
+for vol in "$stage_dir"/vol*; do
+  [ -s "$vol" ] || { echo "empty snapshot volume" >&2; exit 1; }
+  size="$(stat -c %s "$vol" 2>/dev/null || stat -f %z "$vol")"
+  total=$((total + size))
+  volumes=$((volumes + 1))
+done
+echo "==> packed ${total} bytes as $volumes volumes (streaming)"
 
 if [ "$volumes" -gt "$MAX_VOLUMES" ]; then
   echo "ERROR: $volumes volumes exceed the ${MAX_VOLUMES}-volume handoff budget;" \
@@ -74,11 +85,6 @@ if [ "$volumes" -gt "$MAX_VOLUMES" ]; then
   rm -rf "$stage_dir"
   exit 1
 fi
-# BSD split lacks -d; Homebrew coreutils (gprefix) ships gsplit on macOS.
-if command -v gsplit >/dev/null 2>&1; then SPLIT=gsplit; else SPLIT=split; fi
-"$SPLIT" -a 3 -d -b "$VOLUME_BYTES" --numeric-suffixes=0 \
-  "$archive" "$stage_dir/vol" 2>/dev/null ||
-"$SPLIT" -a 3 -d -b "$VOLUME_BYTES" "$archive" "$stage_dir/vol"
 
 i=0
 for vol in "$stage_dir"/vol*; do

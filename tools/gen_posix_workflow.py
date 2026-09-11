@@ -251,7 +251,7 @@ DOWNLOAD_STEP = """      - name: Download tree from previous stage
         if: success()
         uses: actions/download-artifact@v4
         with:
-          pattern: ${{ inputs.artifact }}-tree-s%(prev)d-attempt-*-part*
+          pattern: ${{ inputs.artifact }}-tree-s%(prev)d-attempt-${{ needs.posix-%(prev)d.outputs.snapshot_attempt }}-part*
           merge-multiple: true
           path: ${{ runner.temp }}/chromix-restore
 """
@@ -416,6 +416,7 @@ def job(stage: int) -> str:
     parts.append("    timeout-minutes: 355\n")
     parts.append("    outputs:\n")
     parts.append("      finished: ${{ steps.stage.outputs.finished }}\n")
+    parts.append("      snapshot_attempt: ${{ steps.snapshot_origin.outputs.attempt }}\n")
     parts.append("    steps:\n")
     parts.append("      - name: Record runner resources\n")
     parts.append("""        run: |
@@ -433,6 +434,9 @@ def job(stage: int) -> str:
 
 """)
     parts.append("      - uses: actions/checkout@v4\n\n")
+    parts.append('      - name: Record snapshot producer attempt\n'
+                 '        id: snapshot_origin\n'
+                 '        run: echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"\n')
     parts.append(LINUX_CLEAN)
     parts.append(MAC_STEPS)
     parts.append(NODE_PY)
@@ -512,5 +516,5 @@ NATIVE_LINUX_ARM64 = """  verify-linux-arm64:
 """
 
 body = HEADER + "\n".join(job(s) for s in range(1, STAGES + 1)) + "\n" + NATIVE_LINUX_ARM64
-OUT.write_text(body)
+OUT.write_text(body, encoding="utf-8", newline="\n")
 print(f"wrote {OUT} ({len(body)} bytes, {STAGES} stages)")

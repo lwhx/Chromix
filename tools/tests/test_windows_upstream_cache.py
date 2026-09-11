@@ -40,7 +40,6 @@ class WindowsUpstreamCacheRegressionTest(unittest.TestCase):
         cls.stage = STAGE.read_text(encoding="utf-8")
         cls.prepare = PREPARE.read_text(encoding="utf-8")
         cls.workflow = WORKFLOW.read_text(encoding="utf-8")
-        cls.validate = workflow_job(cls.workflow, "validate")
         cls.build_one = workflow_job(cls.workflow, "build-1")
         start = cls.stage.index("if ($StageIndex -eq 1 -and -not $FromArtifact")
         end = cls.stage.index('\nif (-not (Test-Path (Join-Path $Src ".chromix-source-ready"))', start)
@@ -50,13 +49,13 @@ class WindowsUpstreamCacheRegressionTest(unittest.TestCase):
         end = cls.prepare.index('\nif (-not (Test-Marker ".chromix-source-unpacked"', start)
         cls.restored_prep = cls.prepare[start:end]
 
-    def test_clean_validation_still_gates_fresh_build(self):
-        self.assertIn("if: ${{ inputs.resume_run_id == '' }}", self.validate)
-        self.assertIn("GH_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_TOKEN || github.token }}", self.validate)
-        self.assertIn("-UpstreamRunId $env:UPSTREAM_RUN_ID", self.validate)
-        self.assertIn("-StageIndex 1 -MaxStages 12 -ValidateOnly", self.validate)
-        self.assertIn("needs: validate", self.build_one)
-        self.assertIn("inputs.resume_run_id == '' && needs.validate.result == 'success'", self.build_one)
+    def test_validation_runs_inline_before_compilation(self):
+        self.assertIn("if: ${{ inputs.resume_run_id == '' }}", self.build_one)
+        self.assertNotIn("  validate:", self.workflow)
+        self.assertNotIn("needs: validate", self.build_one)
+        self.assertIn("UpstreamRunId = $env:UPSTREAM_RUN_ID", self.build_one)
+        self.assertIn("if ($ValidateOnly -or ($StageIndex -eq 1 -and -not $FromArtifact)) {", self.stage)
+        self.assertLess(self.stage.index('V8 Torque validation failed'), self.stage.index('$ninjaBudget ='))
 
     def test_fetch_and_restore_only_fresh_opted_in_stage_one_before_preparation(self):
         self.assertRegex(self.cache, r"^if \(\$StageIndex -eq 1 -and -not \$FromArtifact -and\s+"
@@ -99,7 +98,6 @@ class WindowsUpstreamCacheRegressionTest(unittest.TestCase):
                 self.assertFalse(any("*" in path or "obj" in path or "parts" in path for path in paths))
                 self.assertLess(steps.index(upload), next(index for index, step in enumerate(steps)
                                                          if step.get("name") == "Ensure build tree snapshot"))
-        self.assertNotIn("upstream-reuse", self.validate)
 
     def test_snapshot_outputs_fail_closed_but_keep_small_diagnostics(self):
         import yaml
@@ -127,7 +125,7 @@ class WindowsUpstreamCacheRegressionTest(unittest.TestCase):
         built = self.stage.index('$rc = Invoke-Tracked -File $Ninja')
         after = self.stage.index('restored_reuse_evidence.py") --phase after')
         self.assertLess(self.stage.index('& $Ninja -C $OutDir -n chrome'), before)
-        self.assertLess(self.stage.rindex('if ($ValidateOnly) {'), before)
+        self.assertLess(self.stage.rindex('if ($ValidateOnly -or ($StageIndex -eq 1 -and -not $FromArtifact)) {'), before)
         self.assertLess(self.stage.index('if ($ninjaBudget -lt 20)'), before)
         self.assertLess(before, built)
         self.assertLess(built, after)
@@ -256,10 +254,10 @@ class WindowsUpstreamCacheRegressionTest(unittest.TestCase):
         self.assertNotIn('upstream-cache-preparation.json', self.stage)
 
     def test_user_input_and_optional_token_use_environment_not_interpolation(self):
-        runs = workflow_runs(self.validate)
+        runs = []
         for number in range(1, 13):
             runs.extend(workflow_runs(workflow_job(self.workflow, f"build-{number}")))
-        self.assertEqual(len(runs), 38)
+        self.assertEqual(len(runs), 48)
         for run in runs:
             self.assertNotIn("${{", run)
         self.assertIn("UPSTREAM_RUN_ID: ${{ inputs.upstream_run_id }}", self.build_one)
@@ -272,7 +270,7 @@ class WindowsUpstreamCacheRegressionTest(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("pwsh"), "pwsh is not installed")
     def test_powershell_scripts_and_workflow_commands_parse_without_execution(self):
-        commands = workflow_runs(self.validate)
+        commands = []
         for number in range(1, 13):
             commands.extend(workflow_runs(workflow_job(self.workflow, f"build-{number}")))
         commands.extend([self.stage, self.prepare])
@@ -316,9 +314,9 @@ ConvertTo-Json -Compress -InputObject @($rows)
         self.assertEqual(rows, [{"validate": True, "minutes": 230, "reserve": 15},
                                 {"validate": False, "minutes": 300, "reserve": 40}])
         jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
-        self.assertEqual(jobs["validate"]["timeout-minutes"], 240)
+        self.assertNotIn("validate", jobs)
         self.assertTrue(all(jobs[f"build-{number}"]["timeout-minutes"] == 355 for number in range(1, 13)))
-        self.assertLessEqual(rows[0]["minutes"], jobs["validate"]["timeout-minutes"] - 10)
+        self.assertLess(rows[0]["minutes"], jobs["build-1"]["timeout-minutes"])
         self.assertLess(rows[1]["minutes"], jobs["build-1"]["timeout-minutes"])
 
     def test_remaining_minutes_floors_instead_of_rounding_up(self):
@@ -378,7 +376,7 @@ Write-Output $fetchTimeoutSec
         self.assertEqual(int(result.stdout), 175 * 60)
 
     def test_actual_torque_call_is_bounded_and_insufficient_time_fails(self):
-        start = self.stage.rindex("\nif ($ValidateOnly) {")
+        start = self.stage.rindex("\nif ($ValidateOnly -or ($StageIndex -eq 1 -and -not $FromArtifact)) {")
         end = self.stage.index("\n$ninjaBudget =", start)
         for left, rc in ((15, 0), (14, 0), (0, 0), (16, 0), (35, 0), (139, 0), (35, 124)):
             with self.subTest(left=left, rc=rc):

@@ -484,6 +484,29 @@ class PosixSnapshotRoundTripTest(unittest.TestCase):
     def test_real_ninja_has_no_work_after_bsd_to_gnu_restore(self):
         self.ninja_round_trip("bsd", "gnu")
 
+    def test_compressor_failure_never_publishes_partial_volumes(self):
+        bindir = self.root / "broken-tools"
+        bindir.mkdir()
+        tool = bindir / "zstd"
+        tool.write_text("#!/bin/sh\nprintf 'partial archive'\nexit 23\n")
+        tool.chmod(0o755)
+        parts, result = self.snapshot({"PATH": str(bindir) + os.pathsep + os.environ["PATH"]})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(list(parts.rglob("tree.tar.zst.*")))
+        self.assertFalse((parts / "stage").exists())
+
+    def test_split_failure_never_publishes_partial_volumes(self):
+        bindir = self.root / "broken-split"
+        bindir.mkdir()
+        # gsplit takes precedence on Linux and macOS.
+        tool = bindir / "gsplit"
+        tool.write_text("#!/bin/sh\ncat >/dev/null\nexit 24\n")
+        tool.chmod(0o755)
+        parts, result = self.snapshot({"PATH": str(bindir) + os.pathsep + os.environ["PATH"]})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(list(parts.rglob("tree.tar.zst.*")))
+        self.assertFalse((parts / "stage").exists())
+
     def test_round_trip_preserves_modes_symlinks_and_markers(self):
         # ~384 KiB of random bytes against 64 KiB volumes exercises multi-volume
         # split, round-robin wraparound across all four slots, and ordered
@@ -922,7 +945,7 @@ class GenPosixWorkflowTest(unittest.TestCase):
         self.assertIn("--stage-index 8", last)
         download = next(s for s in jobs["posix-8"]["steps"]
                         if s.get("name") == "Download tree from previous stage")
-        self.assertIn("${{ inputs.artifact }}-tree-s7-attempt-*-part*",
+        self.assertIn("${{ inputs.artifact }}-tree-s7-attempt-${{ needs.posix-7.outputs.snapshot_attempt }}-part*",
                       download["with"]["pattern"])
         self.assertTrue(download["with"].get("merge-multiple"))
         restore = sorted(s for s in jobs["posix-3"]["steps"]

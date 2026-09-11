@@ -135,48 +135,19 @@ env:
   DEPOT_TOOLS_COLLECT_METRICS: '0'
 
 jobs:
-  validate:
-    name: validate (source prep + gn gen + V8 Torque)
-    if: ${{ inputs.resume_run_id == '' }}
-    runs-on: windows-2022
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@v4
-      - name: Select compile parallelism
-        shell: powershell
-        run: python tools/build_resources.py --github-env
-      - name: Run validation
-        id: stage
-        shell: powershell
-        env:
-          GH_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_TOKEN || github.token }}
-          UPSTREAM_RUN_ID: ${{ inputs.upstream_run_id }}
-        run: build\windows\ci-stage.ps1 -StageIndex 1 -MaxStages 12 -ValidateOnly -UpstreamRunId $env:UPSTREAM_RUN_ID
-      - name: Upload upstream cache diagnostics
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: upstream-cache-win-x64-validate-attempt-${{ github.run_attempt }}
-          include-hidden-files: true
-          path: |
-            C:\u\result.json
-            C:\c\chromix\upstream-cache-restore.json
-            C:\c\chromix\upstream-cache-ninja.json
-            C:\c\chromix\upstream-cache-preparation.json
-            C:\c\chromix\src\.chromix-upstream-restored.json
-            C:\c\chromix\src\.chromix-restored-patches.json
-            C:\c\chromix\src\out\Default\args.gn
-          if-no-files-found: ignore
-          retention-days: 3
   build-1:
     name: stage 1 (fetch + sync + first compile)
-    needs: validate
-    if: ${{ always() && inputs.resume_run_id == '' && needs.validate.result == 'success' }}
+    if: ${{ inputs.resume_run_id == '' }}
     runs-on: windows-2022
     timeout-minutes: 355
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
+      snapshot_attempt: ${{ steps.snapshot_origin.outputs.attempt }}
     steps:
+      - name: Record snapshot producer attempt
+        id: snapshot_origin
+        shell: powershell
+        run: Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "attempt=$env:GITHUB_RUN_ATTEMPT"
       - uses: actions/checkout@v4
       - name: Select compile parallelism
         shell: powershell
@@ -277,13 +248,18 @@ jobs:
     timeout-minutes: 355
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
+      snapshot_attempt: ${{ steps.snapshot_origin.outputs.attempt }}
     steps:
+      - name: Record snapshot producer attempt
+        id: snapshot_origin
+        shell: powershell
+        run: Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "attempt=$env:GITHUB_RUN_ATTEMPT"
       - uses: actions/checkout@v4
       - name: Download tree from previous stage
         if: ${{ inputs.resume_run_id == '' || inputs.resume_stage != '2' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: tree-s1-attempt-${{ github.run_attempt }}-part*
+          pattern: tree-s1-attempt-${{ needs.build-1.outputs.snapshot_attempt }}-part*
           merge-multiple: true
           path: C:\restore
       - name: Download tree from previous run
@@ -373,13 +349,18 @@ jobs:
     timeout-minutes: 355
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
+      snapshot_attempt: ${{ steps.snapshot_origin.outputs.attempt }}
     steps:
+      - name: Record snapshot producer attempt
+        id: snapshot_origin
+        shell: powershell
+        run: Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "attempt=$env:GITHUB_RUN_ATTEMPT"
       - uses: actions/checkout@v4
       - name: Download tree from previous stage
         if: ${{ inputs.resume_run_id == '' || inputs.resume_stage != '3' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: tree-s2-attempt-${{ github.run_attempt }}-part*
+          pattern: tree-s2-attempt-${{ needs.build-2.outputs.snapshot_attempt }}-part*
           merge-multiple: true
           path: C:\restore
       - name: Download tree from previous run
@@ -469,13 +450,18 @@ jobs:
     timeout-minutes: 355
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
+      snapshot_attempt: ${{ steps.snapshot_origin.outputs.attempt }}
     steps:
+      - name: Record snapshot producer attempt
+        id: snapshot_origin
+        shell: powershell
+        run: Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "attempt=$env:GITHUB_RUN_ATTEMPT"
       - uses: actions/checkout@v4
       - name: Download tree from previous stage
         if: ${{ inputs.resume_run_id == '' || inputs.resume_stage != '4' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: tree-s3-attempt-${{ github.run_attempt }}-part*
+          pattern: tree-s3-attempt-${{ needs.build-3.outputs.snapshot_attempt }}-part*
           merge-multiple: true
           path: C:\restore
       - name: Download tree from previous run
@@ -565,13 +551,18 @@ jobs:
     timeout-minutes: 355
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
+      snapshot_attempt: ${{ steps.snapshot_origin.outputs.attempt }}
     steps:
+      - name: Record snapshot producer attempt
+        id: snapshot_origin
+        shell: powershell
+        run: Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "attempt=$env:GITHUB_RUN_ATTEMPT"
       - uses: actions/checkout@v4
       - name: Download tree from previous stage
         if: ${{ inputs.resume_run_id == '' || inputs.resume_stage != '5' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: tree-s4-attempt-${{ github.run_attempt }}-part*
+          pattern: tree-s4-attempt-${{ needs.build-4.outputs.snapshot_attempt }}-part*
           merge-multiple: true
           path: C:\restore
       - name: Download tree from previous run
@@ -661,13 +652,18 @@ jobs:
     timeout-minutes: 355
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
+      snapshot_attempt: ${{ steps.snapshot_origin.outputs.attempt }}
     steps:
+      - name: Record snapshot producer attempt
+        id: snapshot_origin
+        shell: powershell
+        run: Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "attempt=$env:GITHUB_RUN_ATTEMPT"
       - uses: actions/checkout@v4
       - name: Download tree from previous stage
         if: ${{ inputs.resume_run_id == '' || inputs.resume_stage != '6' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: tree-s5-attempt-${{ github.run_attempt }}-part*
+          pattern: tree-s5-attempt-${{ needs.build-5.outputs.snapshot_attempt }}-part*
           merge-multiple: true
           path: C:\restore
       - name: Download tree from previous run
@@ -757,13 +753,18 @@ jobs:
     timeout-minutes: 355
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
+      snapshot_attempt: ${{ steps.snapshot_origin.outputs.attempt }}
     steps:
+      - name: Record snapshot producer attempt
+        id: snapshot_origin
+        shell: powershell
+        run: Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "attempt=$env:GITHUB_RUN_ATTEMPT"
       - uses: actions/checkout@v4
       - name: Download tree from previous stage
         if: ${{ inputs.resume_run_id == '' || inputs.resume_stage != '7' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: tree-s6-attempt-${{ github.run_attempt }}-part*
+          pattern: tree-s6-attempt-${{ needs.build-6.outputs.snapshot_attempt }}-part*
           merge-multiple: true
           path: C:\restore
       - name: Download tree from previous run
@@ -853,13 +854,18 @@ jobs:
     timeout-minutes: 355
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
+      snapshot_attempt: ${{ steps.snapshot_origin.outputs.attempt }}
     steps:
+      - name: Record snapshot producer attempt
+        id: snapshot_origin
+        shell: powershell
+        run: Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "attempt=$env:GITHUB_RUN_ATTEMPT"
       - uses: actions/checkout@v4
       - name: Download tree from previous stage
         if: ${{ inputs.resume_run_id == '' || inputs.resume_stage != '8' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: tree-s7-attempt-${{ github.run_attempt }}-part*
+          pattern: tree-s7-attempt-${{ needs.build-7.outputs.snapshot_attempt }}-part*
           merge-multiple: true
           path: C:\restore
       - name: Download tree from previous run
@@ -949,13 +955,18 @@ jobs:
     timeout-minutes: 355
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
+      snapshot_attempt: ${{ steps.snapshot_origin.outputs.attempt }}
     steps:
+      - name: Record snapshot producer attempt
+        id: snapshot_origin
+        shell: powershell
+        run: Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "attempt=$env:GITHUB_RUN_ATTEMPT"
       - uses: actions/checkout@v4
       - name: Download tree from previous stage
         if: ${{ inputs.resume_run_id == '' || inputs.resume_stage != '9' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: tree-s8-attempt-${{ github.run_attempt }}-part*
+          pattern: tree-s8-attempt-${{ needs.build-8.outputs.snapshot_attempt }}-part*
           merge-multiple: true
           path: C:\restore
       - name: Download tree from previous run
@@ -1045,13 +1056,18 @@ jobs:
     timeout-minutes: 355
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
+      snapshot_attempt: ${{ steps.snapshot_origin.outputs.attempt }}
     steps:
+      - name: Record snapshot producer attempt
+        id: snapshot_origin
+        shell: powershell
+        run: Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "attempt=$env:GITHUB_RUN_ATTEMPT"
       - uses: actions/checkout@v4
       - name: Download tree from previous stage
         if: ${{ inputs.resume_run_id == '' || inputs.resume_stage != '10' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: tree-s9-attempt-${{ github.run_attempt }}-part*
+          pattern: tree-s9-attempt-${{ needs.build-9.outputs.snapshot_attempt }}-part*
           merge-multiple: true
           path: C:\restore
       - name: Download tree from previous run
@@ -1141,13 +1157,18 @@ jobs:
     timeout-minutes: 355
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
+      snapshot_attempt: ${{ steps.snapshot_origin.outputs.attempt }}
     steps:
+      - name: Record snapshot producer attempt
+        id: snapshot_origin
+        shell: powershell
+        run: Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "attempt=$env:GITHUB_RUN_ATTEMPT"
       - uses: actions/checkout@v4
       - name: Download tree from previous stage
         if: ${{ inputs.resume_run_id == '' || inputs.resume_stage != '11' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: tree-s10-attempt-${{ github.run_attempt }}-part*
+          pattern: tree-s10-attempt-${{ needs.build-10.outputs.snapshot_attempt }}-part*
           merge-multiple: true
           path: C:\restore
       - name: Download tree from previous run
@@ -1237,13 +1258,18 @@ jobs:
     timeout-minutes: 355
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
+      snapshot_attempt: ${{ steps.snapshot_origin.outputs.attempt }}
     steps:
+      - name: Record snapshot producer attempt
+        id: snapshot_origin
+        shell: powershell
+        run: Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "attempt=$env:GITHUB_RUN_ATTEMPT"
       - uses: actions/checkout@v4
       - name: Download tree from previous stage
         if: ${{ inputs.resume_run_id == '' || inputs.resume_stage != '12' }}
         uses: actions/download-artifact@v4
         with:
-          pattern: tree-s11-attempt-${{ github.run_attempt }}-part*
+          pattern: tree-s11-attempt-${{ needs.build-11.outputs.snapshot_attempt }}-part*
           merge-multiple: true
           path: C:\restore
       - name: Download tree from previous run
@@ -1328,7 +1354,7 @@ jobs:
 
   complete:
     name: ensure build finished
-    needs: [validate, build-1, build-2, build-3, build-4, build-5, build-6, build-7, build-8, build-9, build-10, build-11, build-12]
+    needs: [build-1, build-2, build-3, build-4, build-5, build-6, build-7, build-8, build-9, build-10, build-11, build-12]
     runs-on: ubuntu-latest
     if: ${{ !cancelled() }}
     steps:

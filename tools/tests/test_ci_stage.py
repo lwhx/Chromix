@@ -44,7 +44,7 @@ def invoke_tracked_source() -> str:
 
 def validate_only_source() -> str:
     script = CI_STAGE.read_text(encoding="utf-8")
-    start = script.rindex("\nif ($ValidateOnly) {")
+    start = script.rindex("\nif ($ValidateOnly -or ($StageIndex -eq 1 -and -not $FromArtifact)) {")
     end = script.index("$ninjaBudget =", start)
     return script[start:end]
 
@@ -497,6 +497,30 @@ class ValidateOnlyRegressionTest(unittest.TestCase):
         )
         self.assertNotIn("Test-Path", source)
 
+    @unittest.skipUnless(shutil.which("pwsh"), "pwsh required")
+    def test_inline_validation_continues_without_reporting_finished(self):
+        source = validate_only_source()
+        for stage, artifact, calls in ((1, "$false", 1), (2, "$true", 0)):
+            for rc in (0, 1):
+                with self.subTest(stage=stage, artifact=artifact, rc=rc):
+                    setup = f"$StageIndex={stage}; $FromArtifact={artifact}; $ValidateOnly=$false; $rc={rc}\n"
+                    setup += '''
+$ErrorActionPreference = "Stop"
+$PackReserveMin = 40
+$Ninja = "fixture-ninja"
+$OutDir = "fixture-out"
+$Src = "fixture-src"
+function Get-RemainingMin { return 100 }
+function Invoke-Tracked { Write-Host "TORQUE"; return $rc }
+function Write-OutVar($key, $value) { throw "inline validation must not report finished" }
+'''
+                    result = subprocess.run([shutil.which("pwsh"), "-NoProfile", "-Command",
+                                             setup + source + '\nWrite-Host "CONTINUE"'],
+                                            capture_output=True, text=True, encoding="utf-8", timeout=20)
+                    self.assertEqual(result.stdout.count("TORQUE"), calls)
+                    self.assertEqual(result.returncode == 0, not (calls and rc), result.stderr)
+                    self.assertEqual("CONTINUE" in result.stdout, not (calls and rc))
+
 
 class DomainSubstitutionRegressionTest(unittest.TestCase):
     def setUp(self):
@@ -731,12 +755,12 @@ class ResumeWorkflowRegressionTest(unittest.TestCase):
     def test_upstream_cache_is_required_for_validation_and_all_resumes(self):
         self.assertIn("upstream_run_id:", self.source)
         self.assertIn("use_upstream_cache:", self.source)
-        self.assertIn("inputs.resume_run_id == '' && needs.validate.result == 'success'", self.source)
+        self.assertNotIn('needs: validate', self.source)
         self.assertIn("GH_TOKEN: ${{ secrets.UPSTREAM_ACTIONS_TOKEN || github.token }}", self.source)
         self.assertIn("UPSTREAM_RUN_ID: ${{ inputs.upstream_run_id }}", self.source)
         self.assertEqual(self.source.count("UseUpstreamCache ="), 1)
         self.assertIn("CHROMIX_USE_UPSTREAM_CACHE: ${{ (github.event_name == 'push' || inputs.use_upstream_cache || inputs.upstream_run_id != '') && '1' || '0' }}", self.source)
-        self.assertIn("-ValidateOnly -UpstreamRunId $env:UPSTREAM_RUN_ID", self.source)
+        self.assertNotIn("-ValidateOnly", self.source)
         self.assertNotIn("-UpstreamArtifactPath", self.source)
 
     def test_resume_uses_official_cross_run_artifact_download(self):

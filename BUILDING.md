@@ -204,6 +204,38 @@ can themselves invalidate cached work; keep the donor's configuration for a
 first resume, then benchmark a separate fast build if link time dominates.
 The four POSIX defaults remain `fast` and `staged`.
 
+### Five-platform handoff optimization (2026-09-11)
+
+All five platforms record the snapshot producer attempt in a step output.
+A same-run successor selects `needs.<previous-job>.outputs.snapshot_attempt`,
+not a wildcard or the retrying consumer's current attempt. This preserves the
+producer identity when only failed jobs are rerun. Cross-run resumes keep their
+explicit `resume_attempt` selection. Missing artifacts remain an error; there is
+no fallback that merges attempts.
+
+Linux x64/ARM64 and macOS x64/ARM64 share the streaming packer:
+`tar --format=pax | zstd -T0 -3 -c | split`. It writes temporary volumes directly,
+rather than writing a complete compressed archive and copying it into volumes.
+This removes approximately one compressed-archive-sized temporary allocation and
+one compressed-archive read/write pass during slicing. Compression level, volume
+limits, tar metadata and upload format are unchanged. Pipeline failure removes
+temporary volumes before any upload slots are published; split is not retried
+against an already consumed input stream. GNU `gsplit` selection on macOS is
+retained.
+
+These changes do not increase compiler parallelism, change GN profiles, weaken
+cache identity checks, or claim a measured end-to-end speedup. Validate runner
+timings and bundle smoke checks on the next native runs. Existing runs continue
+to use the workflow revision with which they started.
+
+Local validation for this change: Windows focused tests passed (85 tests,
+97 subtests; 20 environment-specific skips) with `PYTHONUTF8=1`. WSL Debian
+POSIX tests passed (129 tests, 1,239 subtests; 15 skips), including real GNU/BSD
+tar, zstd and Ninja round trips and compressor/split failure injection. Bash 3.2
+and unavailable native tooling tests remain skipped. `actionlint` passed all five
+entrypoints and the reusable workflow with external shellcheck/pyflakes disabled.
+No full Chromium build or new cloud workflow was dispatched in this pass.
+
 ### Resume the supplied Windows snapshot
 
 At the 2026-09-10 metadata check, run `34080799322` is successful and its source
@@ -383,10 +415,12 @@ The Windows reusable workflow retains its 12-stage snapshot/resume chain. Each
 stage uploads multi-volume 7-Zip snapshots with modification times preserved so
 Ninja can continue incrementally. Manual dispatch of
 `.github/workflows/build-win-x64-github.yml` supports Windows-only retries and
-cross-run resume independently of the other four workflows. Windows validation requires
-restoration when requested. Its internal deadline is 230 minutes within the
-240-minute job, with 15 minutes reserved for diagnostics; normal build stages
-retain a 300-minute internal deadline and 40-minute handoff reserve. Windows
+cross-run resume independently of the other four workflows. Fresh Windows builds
+now validate V8 Torque inside build-1 after preparation and GN generation, then
+continue Chrome compilation on the same runner. Build stages retain a 300-minute
+internal deadline and 40-minute handoff reserve within the 355-minute job.
+The standalone `-ValidateOnly` option retains its 230-minute deadline and
+15-minute diagnostic reserve, but is no longer invoked by the workflow. Windows
 full-cache fetching is capped at 180 minutes and further limited by the actual
 remaining budget, preserving the reserve and another 30 minutes for preparation.
 The downloader's shared retry deadline remains 45 minutes. The previous 60-minute
@@ -413,9 +447,10 @@ An incompatible executable fails before a patch-in-progress marker is written;
 preparation share this selection. An existing interrupted-patch marker still
 requires a clean restored work directory.
 
-V8 Torque validation uses only the remaining non-reserved time. The
-validation runner currently uploads diagnostics rather than its build tree, so
-stage 1 repeats restoration on its own runner.
+V8 Torque validation uses only the remaining non-reserved time, remains serial
+and verbose, and fails before Chrome compilation on error. Inline validation
+does not report `finished=true`; only the completed bundle path may do so.
+Artifact-resume stages continue through the normal Ninja dependency graph.
 
 The POSIX reusable workflow follows the upstream ungoogled-chromium CI model:
 portablelinux's `prep` + `build_part_01..10` chain and macOS'

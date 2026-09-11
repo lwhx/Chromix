@@ -29,7 +29,7 @@ $RestoredUpstream = $false
 $RequireUpstreamCache = $UseUpstreamCache -or $UpstreamRunId -or ($env:CHROMIX_USE_UPSTREAM_CACHE -eq "1")
 $PartsDir = "C:\parts"
 $UpstreamCacheDir = "C:\u"
-# Validation runs in a 240-minute job and does not upload a build-tree snapshot.
+# Standalone validation remains available; CI validates inside the first build job.
 $StageMinutes = if ($ValidateOnly) { 230 } else { 300 }
 $Deadline = (Get-Date).AddMinutes($StageMinutes)
 $PackReserveMin = if ($ValidateOnly) { 15 } else { 40 }
@@ -768,17 +768,20 @@ for relative, keys in RESTORED.items():
   Pop-Location
 }
 
-if ($ValidateOnly) {
-  Write-Host "==> validate-only: building V8 Torque generation target"
+if ($ValidateOnly -or ($StageIndex -eq 1 -and -not $FromArtifact)) {
+  # Keep validation and compilation on the same prepared tree and runner.
+  Write-Host "==> validating V8 Torque generation target"
   $validationBudget = (Get-RemainingMin) - $PackReserveMin
   if ($validationBudget -lt 1) { throw "validate-only: insufficient V8 Torque budget" }
   $validationRc = Invoke-Tracked -File $Ninja `
     -ArgList "-C `"$OutDir`" -j 1 -v gen/v8/torque-generated/bit-field-asserts.cc" `
     -Cwd $Src -TimeoutSec ($validationBudget * 60) -FullFailureOutput
   if ($validationRc -ne 0) { throw "V8 Torque validation failed (exit $validationRc)" }
-  Write-Host "==> validate-only: gn gen and V8 Torque generation passed"
-  Write-OutVar finished true
-  return
+  Write-Host "==> gn gen and V8 Torque generation passed"
+  if ($ValidateOnly) {
+    Write-OutVar finished true
+    return
+  }
 }
 
 $ninjaBudget = (Get-RemainingMin) - $PackReserveMin

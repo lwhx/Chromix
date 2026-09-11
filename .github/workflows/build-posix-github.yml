@@ -80,6 +80,7 @@ jobs:
     timeout-minutes: 355
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
+      snapshot_attempt: ${{ steps.snapshot_origin.outputs.attempt }}
     steps:
       - name: Record runner resources
         run: |
@@ -97,6 +98,9 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      - name: Record snapshot producer attempt
+        id: snapshot_origin
+        run: echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - name: Free Linux disk space
         if: runner.os == 'Linux'
         run: |
@@ -372,6 +376,7 @@ jobs:
     timeout-minutes: 355
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
+      snapshot_attempt: ${{ steps.snapshot_origin.outputs.attempt }}
     steps:
       - name: Record runner resources
         run: |
@@ -389,6 +394,9 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      - name: Record snapshot producer attempt
+        id: snapshot_origin
+        run: echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - name: Free Linux disk space
         if: runner.os == 'Linux'
         run: |
@@ -495,7 +503,7 @@ jobs:
         if: success()
         uses: actions/download-artifact@v4
         with:
-          pattern: ${{ inputs.artifact }}-tree-s1-attempt-*-part*
+          pattern: ${{ inputs.artifact }}-tree-s1-attempt-${{ needs.posix-1.outputs.snapshot_attempt }}-part*
           merge-multiple: true
           path: ${{ runner.temp }}/chromix-restore
 
@@ -622,6 +630,7 @@ jobs:
     timeout-minutes: 355
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
+      snapshot_attempt: ${{ steps.snapshot_origin.outputs.attempt }}
     steps:
       - name: Record runner resources
         run: |
@@ -639,6 +648,9 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      - name: Record snapshot producer attempt
+        id: snapshot_origin
+        run: echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - name: Free Linux disk space
         if: runner.os == 'Linux'
         run: |
@@ -745,7 +757,7 @@ jobs:
         if: success()
         uses: actions/download-artifact@v4
         with:
-          pattern: ${{ inputs.artifact }}-tree-s2-attempt-*-part*
+          pattern: ${{ inputs.artifact }}-tree-s2-attempt-${{ needs.posix-2.outputs.snapshot_attempt }}-part*
           merge-multiple: true
           path: ${{ runner.temp }}/chromix-restore
 
@@ -872,6 +884,7 @@ jobs:
     timeout-minutes: 355
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
+      snapshot_attempt: ${{ steps.snapshot_origin.outputs.attempt }}
     steps:
       - name: Record runner resources
         run: |
@@ -889,6 +902,9 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      - name: Record snapshot producer attempt
+        id: snapshot_origin
+        run: echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - name: Free Linux disk space
         if: runner.os == 'Linux'
         run: |
@@ -995,7 +1011,7 @@ jobs:
         if: success()
         uses: actions/download-artifact@v4
         with:
-          pattern: ${{ inputs.artifact }}-tree-s3-attempt-*-part*
+          pattern: ${{ inputs.artifact }}-tree-s3-attempt-${{ needs.posix-3.outputs.snapshot_attempt }}-part*
           merge-multiple: true
           path: ${{ runner.temp }}/chromix-restore
 
@@ -1122,6 +1138,7 @@ jobs:
     timeout-minutes: 355
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
+      snapshot_attempt: ${{ steps.snapshot_origin.outputs.attempt }}
     steps:
       - name: Record runner resources
         run: |
@@ -1139,6 +1156,9 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      - name: Record snapshot producer attempt
+        id: snapshot_origin
+        run: echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - name: Free Linux disk space
         if: runner.os == 'Linux'
         run: |
@@ -1245,7 +1265,7 @@ jobs:
         if: success()
         uses: actions/download-artifact@v4
         with:
-          pattern: ${{ inputs.artifact }}-tree-s4-attempt-*-part*
+          pattern: ${{ inputs.artifact }}-tree-s4-attempt-${{ needs.posix-4.outputs.snapshot_attempt }}-part*
           merge-multiple: true
           path: ${{ runner.temp }}/chromix-restore
 
@@ -1372,6 +1392,7 @@ jobs:
     timeout-minutes: 355
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
+      snapshot_attempt: ${{ steps.snapshot_origin.outputs.attempt }}
     steps:
       - name: Record runner resources
         run: |
@@ -1389,6 +1410,9 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      - name: Record snapshot producer attempt
+        id: snapshot_origin
+        run: echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - name: Free Linux disk space
         if: runner.os == 'Linux'
         run: |
@@ -1495,7 +1519,7 @@ jobs:
         if: success()
         uses: actions/download-artifact@v4
         with:
-          pattern: ${{ inputs.artifact }}-tree-s5-attempt-*-part*
+          pattern: ${{ inputs.artifact }}-tree-s5-attempt-${{ needs.posix-5.outputs.snapshot_attempt }}-part*
           merge-multiple: true
           path: ${{ runner.temp }}/chromix-restore
 
@@ -1622,6 +1646,7 @@ jobs:
     timeout-minutes: 355
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
+      snapshot_attempt: ${{ steps.snapshot_origin.outputs.attempt }}
     steps:
       - name: Record runner resources
         run: |
@@ -1639,6 +1664,9 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      - name: Record snapshot producer attempt
+        id: snapshot_origin
+        run: echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - name: Free Linux disk space
         if: runner.os == 'Linux'
         run: |
@@ -1745,7 +1773,7 @@ jobs:
         if: success()
         uses: actions/download-artifact@v4
         with:
-          pattern: ${{ inputs.artifact }}-tree-s6-attempt-*-part*
+          pattern: ${{ inputs.artifact }}-tree-s6-attempt-${{ needs.posix-6.outputs.snapshot_attempt }}-part*
           merge-multiple: true
           path: ${{ runner.temp }}/chromix-restore
 
@@ -1872,6 +1900,7 @@ jobs:
     timeout-minutes: 355
     outputs:
       finished: ${{ steps.stage.outputs.finished }}
+      snapshot_attempt: ${{ steps.snapshot_origin.outputs.attempt }}
     steps:
       - name: Record runner resources
         run: |
@@ -1889,6 +1918,9 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      - name: Record snapshot producer attempt
+        id: snapshot_origin
+        run: echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - name: Free Linux disk space
         if: runner.os == 'Linux'
         run: |
@@ -1995,7 +2027,7 @@ jobs:
         if: success()
         uses: actions/download-artifact@v4
         with:
-          pattern: ${{ inputs.artifact }}-tree-s7-attempt-*-part*
+          pattern: ${{ inputs.artifact }}-tree-s7-attempt-${{ needs.posix-7.outputs.snapshot_attempt }}-part*
           merge-multiple: true
           path: ${{ runner.temp }}/chromix-restore
 

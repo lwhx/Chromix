@@ -165,7 +165,7 @@ class CrossPlatformBuildRegressionTest(unittest.TestCase):
         import yaml
 
         for filename, jobs in (("build-posix-github.yml", [f"posix-{n}" for n in range(1, 9)]),
-                               ("build-win-x64-github.yml", ["validate", "build-1"])):
+                               ("build-win-x64-github.yml", ["build-1"])):
             workflow = yaml.safe_load((REPO / ".github/workflows" / filename).read_text())
             for job in jobs:
                 with self.subTest(workflow=filename, job=job):
