@@ -69,7 +69,7 @@ def newest_workflow_runs(repo: str, workflow: str):
     raise ValueError(f'Release discovery limit reached for {workflow}; no partial publication attempted')
 
 
-def discover_runs(repo: str, version: str) -> dict[str, dict]:
+def discover_runs(repo: str, version: str, *, include_build_only: bool = False) -> dict[str, dict]:
     versions = {}
     selected = {}
     for workflow in release.WORKFLOWS:
@@ -79,6 +79,11 @@ def discover_runs(repo: str, version: str) -> dict[str, dict]:
             if sha in seen_shas:
                 continue
             seen_shas.add(sha)
+            if run.get('event') == 'workflow_dispatch' and not include_build_only:
+                commit = run.get('head_commit')
+                message = commit.get('message') if isinstance(commit, dict) else None
+                if not isinstance(message, str) or '[skip ci]' in message.lower():
+                    continue
             if sha not in versions:
                 if len(versions) >= MAX_VERSION_LOOKUPS:
                     raise ValueError('Release source-version lookup limit reached; narrow the catch-up scope')
@@ -101,9 +106,9 @@ def published_slots(repo: str, tag: str, root: Path) -> set[str]:
     return set(hashes) & release.ASSETS
 
 
-def reconcile(repo: str, version: str) -> None:
+def reconcile(repo: str, version: str, *, include_build_only: bool = False) -> None:
     # Discover all platforms before downloads or writes, so bounds cannot yield a partial scan.
-    runs = discover_runs(repo, version)
+    runs = discover_runs(repo, version, include_build_only=include_build_only)
     tag = 'v' + version
     with tempfile.TemporaryDirectory(prefix='chromix-release-catch-up-') as directory:
         root = Path(directory)
@@ -145,7 +150,10 @@ def main(argv: list[str] | None = None) -> None:
         with Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as output:
             output.write(f'ready=true\nversion={version}\n')
         return
-    reconcile(repo, version)
+    if os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch':
+        reconcile(repo, version, include_build_only=True)
+    else:
+        reconcile(repo, version)
 
 
 if __name__ == '__main__':

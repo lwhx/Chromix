@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import urllib.error
 import urllib.request
 
 LIMIT = 2 * 1024 * 1024
@@ -18,6 +19,16 @@ def positive(value: str, label: str) -> int:
     return int(value)
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+
 class Client:
     def __init__(self, repository: str, token: str):
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
@@ -26,6 +37,7 @@ class Client:
             raise ValueError("GitHub token is required")
         self.base = f"https://api.github.com/repos/{repository}"
         self.token = token
+        self.opener = urllib.request.build_opener(NoRedirect)
 
     def get(self, path: str) -> dict:
         request = urllib.request.Request(self.base + path, headers={
@@ -33,7 +45,7 @@ class Client:
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         })
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with self.opener.open(request, timeout=30) as response:
             data = response.read(LIMIT + 1)
         if len(data) > LIMIT:
             raise ValueError("GitHub metadata response exceeds size limit")
@@ -102,6 +114,9 @@ def validate(client, repository: str, run_id: int, stage: int, attempt: int, arc
             raise ValueError("invalid or duplicate snapshot part")
         if item.get("expired") is not False or not isinstance(item.get("size_in_bytes"), int) or item["size_in_bytes"] <= 0:
             raise ValueError("snapshot part expired or empty")
+        digest = item.get("digest")
+        if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+            raise ValueError("snapshot artifact has no verified SHA-256 digest")
         if steps.get(f"Upload tree part {suffix}") != "success":
             raise ValueError("snapshot upload did not succeed")
         origin = item.get("workflow_run", {})
@@ -111,9 +126,10 @@ def validate(client, repository: str, run_id: int, stage: int, attempt: int, arc
     if set(by_part) != {str(index) for index in range(1, len(artifacts) + 1)}:
         raise ValueError("snapshot parts are not contiguous")
     return {
+        "repository": repository,
         "run_id": run_id, "attempt": attempt, "stage": stage, "arch": arch,
         "head_sha": run["head_sha"], "job_id": job["id"], "pattern": prefix + "*",
-        "artifacts": [{key: item[key] for key in ("id", "name", "size_in_bytes", "expired")}
+        "artifacts": [{key: item[key] for key in ("id", "name", "size_in_bytes", "expired", "digest")}
                       for _, item in sorted(by_part.items())],
     }
 

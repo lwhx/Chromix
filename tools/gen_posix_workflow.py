@@ -282,13 +282,13 @@ RESUME_STEPS = """      - name: Validate selected Mac checkpoint
           persist-credentials: false
       - name: Download selected Mac checkpoint
         if: inputs.resume_run_id != ''
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ${{ steps.resume.outputs.pattern }}
-          merge-multiple: true
-          path: ${{ runner.temp }}/chromix-restore
-          github-token: ${{ github.token }}
-          run-id: ${{ inputs.resume_run_id }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 tools/download_posix_snapshot.py \\
+            --manifest "${RUNNER_TEMP}/chromix-logs/snapshot-origin.json" \\
+            --destination "${RUNNER_TEMP}/chromix-restore" \\
+            --report "${RUNNER_TEMP}/chromix-logs/snapshot-download.json"
       - name: Restore and migrate selected Mac checkpoint
         if: inputs.resume_run_id != ''
         run: |
@@ -296,8 +296,10 @@ RESUME_STEPS = """      - name: Validate selected Mac checkpoint
           RESTORE="${RUNNER_TEMP}/chromix-restore"
           WORK="${RUNNER_TEMP}/chromix-build"
           test ! -e "$WORK/src"
-          mkdir -p "$WORK"
           find "$RESTORE" -name 'tree.tar.zst.*' -print -quit | grep -q .
+          find "$RESTORE" -name 'tree.tar.zst.*' -print0 | sort -z |
+            xargs -0 cat | zstd -t
+          mkdir -p "$WORK"
           find "$RESTORE" -name 'tree.tar.zst.*' -print0 | sort -z |
             xargs -0 cat | zstd -d -T0 | tar -xpf - -C "$WORK"
           rm -rf "$RESTORE"

@@ -1,5 +1,8 @@
 import copy
 import unittest
+from unittest.mock import patch
+import urllib.error
+import urllib.request
 
 from tools import validate_posix_snapshot as snapshot
 
@@ -20,7 +23,7 @@ class Client:
                           {'name': 'Verify handoff snapshot', 'conclusion': 'success'},
                           *[{'name': f'Upload tree part {n}', 'conclusion': 'success'} for n in range(1, 5)]]}]
         self.artifacts = [{'id': 100 + n, 'name': f'chromix-mac-arm64-tree-s7-attempt-1-part{n}',
-                           'size_in_bytes': 1024, 'expired': False,
+                           'size_in_bytes': 1024, 'expired': False, 'digest': 'sha256:' + 'b' * 64,
                            'workflow_run': {'id': 123, 'head_sha': SHA}} for n in (1, 2)]
         self.calls = []
 
@@ -73,6 +76,20 @@ class SnapshotValidationTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.validate(client)
 
+    def test_snapshot_digest_is_required_and_preserved(self):
+        for digest in (None, 123, '', 'sha256:bad', 'sha512:' + 'b' * 64, 'sha256:' + 'B' * 64):
+            client = Client()
+            client.artifacts[0]['digest'] = digest
+            with self.subTest(digest=digest), self.assertRaisesRegex(ValueError, 'SHA-256'):
+                self.validate(client)
+        client = Client()
+        del client.artifacts[0]['digest']
+        with self.assertRaisesRegex(ValueError, 'SHA-256'):
+            self.validate(client)
+        report = self.validate(Client())
+        self.assertEqual(report['repository'], REPO)
+        self.assertEqual(report['artifacts'][0]['digest'], 'sha256:' + 'b' * 64)
+
     def test_unverified_or_failed_upload_rejected(self):
         for index in range(5):
             client = Client()
@@ -85,6 +102,30 @@ class SnapshotValidationTest(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 snapshot.positive(value, 'input')
         self.assertEqual(snapshot.positive('123', 'input'), 123)
+
+    def test_metadata_redirects_are_rejected_without_forwarding_token(self):
+        redirect = snapshot.NoRedirect()
+        request = urllib.request.Request('https://api.github.com/repos/' + REPO,
+                                         headers={'Authorization': 'Bearer fixture'})
+        self.assertIsNone(redirect.redirect_request(request, None, 302, 'Found', {}, 'https://foreign.invalid/'))
+        for code in (301, 302, 303, 307, 308):
+            with self.subTest(code=code), self.assertRaises(urllib.error.HTTPError):
+                getattr(redirect, f'http_error_{code}')(request, None, code, 'Found', {'Location': 'https://['})
+        client = snapshot.Client(REPO, 'fixture')
+        self.assertTrue(any(isinstance(handler, snapshot.NoRedirect) for handler in client.opener.handlers))
+        error = urllib.error.HTTPError(request.full_url, 302, 'Found', {}, None)
+        with patch.object(client.opener, 'open', side_effect=error) as opened:
+            with self.assertRaises(urllib.error.HTTPError):
+                client.get('/actions/runs/123')
+        self.assertEqual(opened.call_count, 1)
+        self.assertEqual(opened.call_args.args[0].get_header('Authorization'), 'Bearer fixture')
+
+    def test_distinct_recorded_ids_cannot_hide_noncontiguous_or_duplicate_parts(self):
+        for part, error in ((3, 'not contiguous'), (1, 'duplicate snapshot part')):
+            client = Client()
+            client.artifacts[1]['name'] = f'chromix-mac-arm64-tree-s7-attempt-1-part{part}'
+            with self.subTest(part=part), self.assertRaisesRegex(ValueError, error):
+                self.validate(client)
 
     def test_pagination_is_bounded_and_complete(self):
         client = snapshot.Client(REPO, 'test')

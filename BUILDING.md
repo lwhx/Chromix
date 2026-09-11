@@ -270,12 +270,24 @@ gh workflow run build-macos-arm64.yml --ref main \
   -f use_upstream_cache=true -f build_profile=fast -f build_mode=staged -f compile_jobs=auto
 ```
 
-These historical snapshots expire; availability is checked before download. The
-validator requires the same repository, architecture-specific workflow, `main`,
+These historical snapshots expire; availability is checked before download.
+For a build-only repair, push the fix with `[skip ci]` and manually dispatch only
+the failed architecture. Manual builds at such a commit do not trigger automatic
+Release reconciliation; publishing still requires a separate explicit release
+workflow dispatch. This keeps existing assets and unrelated builds untouched.
+
+The validator requires the same repository, architecture-specific workflow, `main`,
 a terminal donor run, verified checkpoint and successful upload steps, and an
 unexpired, contiguous artifact set matching the complete recorded IDs from that
 exact attempt. Record every part ID when the snapshot is uploaded; listing only
-surviving artifacts cannot prove the original set is complete. A failure stops the
+surviving artifacts cannot prove the original set is complete. Each selected
+artifact must include GitHub's SHA-256 digest. The downloader verifies its byte
+count and SHA-256 before extracting ZIP members, checks ZIP CRCs and contiguous
+volume names, and publishes the restore directory only after every artifact
+passes. Interrupted transfers use bounded retries with fresh temporary files;
+existing restore directories are never overwritten. Download and volume hashes
+are recorded in `chromix-logs/snapshot-download.json`. The concatenated zstd
+stream is integrity-tested before any work-tree extraction. A failure stops the
 build rather than falling back to a cold build.
 
 The selected checkpoint starts at stage 1 of the new run, leaving all eight jobs
@@ -326,8 +338,9 @@ gh workflow run build-linux-x64.yml --ref main \
 
 Use `single` only when a representative build fits the hosted job budget or a
 failed time-boxed experiment is acceptable. It increases available compilation
-time by reducing the handoff reserve, not by increasing CPU resources. It does
-not preserve an unfinished tree for a later stage. Existing active runs continue
+time by reducing the handoff reserve, not by increasing CPU resources. An
+unfinished build still saves a checkpoint before failing at its stage limit.
+Existing active runs continue
 using their original source revision and are unaffected by these settings.
 
 The speed work borrows Camoufox's independent parallel targets, reduced costly

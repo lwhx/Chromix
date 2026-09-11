@@ -1,5 +1,7 @@
 """Mac cross-run checkpoints must migrate before normal build verification."""
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -41,16 +43,23 @@ class MacCheckpointWorkflowTest(unittest.TestCase):
         checkout = names[ordered[1]]['with']
         self.assertEqual(checkout['ref'], '${{ steps.resume.outputs.head_sha }}')
         self.assertFalse(checkout['persist-credentials'])
-        download = names[ordered[2]]['with']
-        self.assertEqual(download['pattern'], '${{ steps.resume.outputs.pattern }}')
-        self.assertEqual(download['run-id'], '${{ inputs.resume_run_id }}')
-        self.assertTrue(download['merge-multiple'])
+        download = names[ordered[2]]
+        self.assertNotIn('uses', download)
+        self.assertEqual(download['env']['GH_TOKEN'], '${{ github.token }}')
+        self.assertIn('tools/download_posix_snapshot.py', download['run'])
+        self.assertIn('--manifest "${RUNNER_TEMP}/chromix-logs/snapshot-origin.json"', download['run'])
+        self.assertIn('--destination "${RUNNER_TEMP}/chromix-restore"', download['run'])
+        self.assertIn('--report "${RUNNER_TEMP}/chromix-logs/snapshot-download.json"', download['run'])
         validate = names[ordered[0]]
+        self.assertEqual(validate['env']['GH_TOKEN'], '${{ github.token }}')
+        self.assertNotIn('UPSTREAM_ACTIONS_TOKEN', str(validate) + str(download))
         self.assertEqual(validate['env']['SNAPSHOT_ATTEMPT'], '${{ inputs.resume_attempt }}')
         self.assertIn('test "$BUILD_PLATFORM" = macos', validate['run'])
         self.assertIn('test "$CACHE_REQUIRED" = true', validate['run'])
         migrate = names[ordered[3]]['run']
         self.assertIn('set -euo pipefail', migrate)
+        self.assertLess(migrate.index('zstd -t'), migrate.index('mkdir -p "$WORK"'))
+        self.assertLess(migrate.index('zstd -t'), migrate.index('tar -xpf'))
         self.assertLess(migrate.index('zstd -d'), migrate.index('migrate_restored_snapshot.py'))
         self.assertNotIn('.chromix-previous-repo/tools/', migrate)
         for number in range(2, 9):
@@ -83,8 +92,36 @@ class MacCheckpointWorkflowTest(unittest.TestCase):
             self.assertEqual(inspect['if'], "runner.os == 'macOS' && inputs.use_upstream_cache")
             self.assertIn('inspect_macos_sdk.py', inspect['run'])
             for step in steps:
-                if step.get('uses') == 'actions/download-artifact@v4':
+                if step.get('uses') == 'actions/download-artifact@v4' or step.get('name') == 'Download selected Mac checkpoint':
                     self.assertLess(steps.index(inspect), steps.index(step))
+
+    def test_build_only_manual_repairs_do_not_trigger_automatic_release(self):
+        release = workflow('release-browser.yml')
+        guard = release['jobs']['readiness']['if']
+        self.assertIn("github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'", guard)
+        self.assertIn("!(github.event.workflow_run.event == 'workflow_dispatch' &&", guard)
+        self.assertIn("contains(github.event.workflow_run.head_commit.message, '[skip ci]')", guard)
+        self.assertEqual(release['permissions']['contents'], 'read')
+        self.assertEqual(release['jobs']['release']['if'], "needs.readiness.outputs.ready == 'true'")
+
+    def test_truncated_zstd_fails_before_creating_work_tree(self):
+        if not shutil.which('zstd'):
+            self.skipTest('zstd unavailable')
+        steps = workflow('build-posix-github.yml')['jobs']['posix-1']['steps']
+        script = next(step['run'] for step in steps if step.get('name') == 'Restore and migrate selected Mac checkpoint')
+        script = script.split('python3 tools/migrate_restored_snapshot.py')[0]
+        compressed = subprocess.check_output(['zstd', '-q', '-c'], input=b'restore fixture' * 1024)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            restore = root / 'chromix-restore'
+            restore.mkdir()
+            volume = restore / 'tree.tar.zst.001'
+            volume.write_bytes(compressed[:-5])
+            result = subprocess.run(['bash', '-c', script], capture_output=True, text=True,
+                                    env=dict(os.environ, RUNNER_TEMP=temp))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((root / 'chromix-build').exists())
+            self.assertEqual(volume.read_bytes(), compressed[:-5])
 
     def test_resume_shell_parses_under_bash32(self):
         shell = Path.home() / '.local/bash-3.2-for-ci/bash'

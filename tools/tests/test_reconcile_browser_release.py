@@ -60,6 +60,45 @@ class ReconcileReleaseTest(unittest.TestCase):
         self.assertEqual(reconcile.discover_runs(REPO, VERSION), self.runs)
         self.assertEqual(len({item['head_sha'] for item in self.runs.values()}), 5)
 
+    def test_automatic_discovery_excludes_build_only_and_unknown_manual_commits(self):
+        name = 'build-macos-x64'
+        for head_commit in ({'message': 'Repair [skip ci]'}, {'message': 'Repair [SKIP CI]'},
+                            {'message': None}, {'message': 123}, None, {}, 'bad', ['bad']):
+            candidate = run(name, 999, event='workflow_dispatch', head_commit=head_commit)
+            self.listings[name] = [candidate]
+            with self.subTest(head_commit=head_commit):
+                self.assertNotIn(name, reconcile.discover_runs(REPO, VERSION))
+                self.assertEqual(reconcile.discover_runs(REPO, VERSION, include_build_only=True)[name], candidate)
+
+    def test_build_only_latest_run_blocks_same_sha_fallback_in_automatic_discovery(self):
+        name = 'build-macos-x64'
+        old = self.runs[name]
+        self.listings[name] = [run(name, 999, head_sha=old['head_sha'], event='workflow_dispatch',
+                                  head_commit={'message': 'Repair [skip ci]'}), old]
+        self.assertNotIn(name, reconcile.discover_runs(REPO, VERSION))
+
+    def test_normal_manual_build_remains_eligible_for_automatic_discovery(self):
+        name = 'build-macos-x64'
+        candidate = run(name, 999, event='workflow_dispatch', head_commit={'message': 'Normal build'})
+        self.listings[name] = [candidate]
+        self.assertEqual(reconcile.discover_runs(REPO, VERSION)[name], candidate)
+
+    def test_explicit_manual_release_includes_build_only_candidates(self):
+        with patch.object(reconcile, 'reconcile') as publish:
+            self.run_main({}, 'workflow_dispatch', version=VERSION)
+        publish.assert_called_once_with(REPO, VERSION, include_build_only=True)
+
+    def test_other_build_event_does_not_enable_build_only_candidates(self):
+        name = 'build-macos-x64'
+        self.listings[name] = [run(name, 999, event='workflow_dispatch', head_commit={'message': 'Repair [skip ci]'})]
+        with patch.object(reconcile, 'published_slots', return_value=set()), \
+                patch.object(release, 'ready_run', side_effect=lambda repo, candidate: candidate), \
+                patch.object(release, 'collect', return_value={}) as collect, \
+                patch.object(release, 'publish') as publish:
+            self.run_main({'workflow_run': self.runs['build-linux-x64']}, 'workflow_run')
+        self.assertNotIn(name, [call.args[1]['name'] for call in collect.call_args_list])
+        self.assertNotIn(name, [call.args[1]['name'] for call in publish.call_args_list])
+
     def test_newer_other_sha_failure_or_running_run_does_not_hide_success(self):
         name = next(iter(self.runs))
         for status, conclusion in (('completed', 'failure'), ('in_progress', None), ('queued', None)):
