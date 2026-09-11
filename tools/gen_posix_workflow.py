@@ -296,13 +296,7 @@ RESUME_STEPS = """      - name: Validate selected Mac checkpoint
           RESTORE="${RUNNER_TEMP}/chromix-restore"
           WORK="${RUNNER_TEMP}/chromix-build"
           test ! -e "$WORK/src"
-          find "$RESTORE" -name 'tree.tar.zst.*' -print -quit | grep -q .
-          find "$RESTORE" -name 'tree.tar.zst.*' -print0 | sort -z |
-            xargs -0 cat | zstd -t
-          mkdir -p "$WORK"
-          find "$RESTORE" -name 'tree.tar.zst.*' -print0 | sort -z |
-            xargs -0 cat | zstd -d -T0 | tar -xpf - -C "$WORK"
-          rm -rf "$RESTORE"
+          bash build/posix/restore-snapshot.sh "$RESTORE" "$WORK"
           python3 tools/migrate_restored_snapshot.py --workdir "$WORK" \\
             --previous-repo "$GITHUB_WORKSPACE/.chromix-previous-repo" \\
             --repo "$GITHUB_WORKSPACE" --platform macos --arch '${{ inputs.arch }}' \\
@@ -313,9 +307,11 @@ SNAPSHOT_ENSURE = """      - name: Verify handoff snapshot
         id: checkpoint
         if: ${{ !cancelled() && steps.stage.outputs.upload_snapshot == 'true' }}
         run: |
+          set -euo pipefail
           SNAP="${RUNNER_TEMP}/chromix-build/.snapshot-stage-%(stage)d"
           test -d "$SNAP/p1"
-          find "$SNAP" -type f -name 'tree.tar.zst.*' -print -quit | grep -q .
+          python3 tools/snapshot_volumes.py "$SNAP" |
+            xargs -0 cat | zstd -d -T0 | tar -tf - >/dev/null
 """
 
 UPLOAD_PARTS = """      - name: Upload tree part 1

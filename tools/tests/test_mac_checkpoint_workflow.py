@@ -58,9 +58,8 @@ class MacCheckpointWorkflowTest(unittest.TestCase):
         self.assertIn('test "$CACHE_REQUIRED" = true', validate['run'])
         migrate = names[ordered[3]]['run']
         self.assertIn('set -euo pipefail', migrate)
-        self.assertLess(migrate.index('zstd -t'), migrate.index('mkdir -p "$WORK"'))
-        self.assertLess(migrate.index('zstd -t'), migrate.index('tar -xpf'))
-        self.assertLess(migrate.index('zstd -d'), migrate.index('migrate_restored_snapshot.py'))
+        self.assertIn('bash build/posix/restore-snapshot.sh "$RESTORE" "$WORK"', migrate)
+        self.assertLess(migrate.index('restore-snapshot.sh'), migrate.index('migrate_restored_snapshot.py'))
         self.assertNotIn('.chromix-previous-repo/tools/', migrate)
         for number in range(2, 9):
             self.assertNotIn('migrate_restored_snapshot.py', str(stages[f'posix-{number}']))
@@ -73,6 +72,9 @@ class MacCheckpointWorkflowTest(unittest.TestCase):
             build = next(step for step in steps if step.get('id') == 'stage')
             self.assertNotIn('continue-on-error', build)
             verify = next(step for step in steps if step.get('id') == 'checkpoint')
+            self.assertIn('set -euo pipefail', verify['run'])
+            self.assertIn('python3 tools/snapshot_volumes.py "$SNAP"', verify['run'])
+            self.assertIn('zstd -d -T0 | tar -tf -', verify['run'])
             self.assertIn('!cancelled()', verify['if'])
             self.assertIn("steps.stage.outputs.upload_snapshot == 'true'", verify['if'])
             self.assertNotIn('success()', verify['if'])

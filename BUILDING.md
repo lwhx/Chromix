@@ -319,8 +319,14 @@ volume names, and publishes the restore directory only after every artifact
 passes. Interrupted transfers use bounded retries with fresh temporary files;
 existing restore directories are never overwritten. Download and volume hashes
 are recorded in `chromix-logs/snapshot-download.json`. The concatenated zstd
-stream is integrity-tested before any work-tree extraction. A failure stops the
-build rather than falling back to a cold build.
+stream is decompressed and extracted into a temporary sibling tree. Both zstd
+and tar must exit successfully before that tree replaces the build directory;
+failed extraction leaves the prior tree, pinned download cache, and input
+volumes intact. A failure stops the build rather than falling back to a cold build.
+This detects incomplete compressed streams and truncated tar members, but cannot
+reconstruct missing bytes in an already corrupt donor; select an intact checkpoint
+or create a new one. A `premature end` / `Truncated tar archive` log alone does
+not establish whether the corruption originated during packing or transfer.
 
 The selected checkpoint starts at stage 1 of the new run, leaving all eight jobs
 available. Current trusted tooling validates the old source-ready key and patch
@@ -473,10 +479,20 @@ uploads. Setup and snapshot download time therefore reduce the remaining budget:
    so incremental Ninja state survives; the packer
    excludes all snapshot staging directories and the separately cached
    `download_cache`, preventing the archive from reading its own output;
-6. verify the handoff contains at least one numbered volume, then upload up to
+6. validate regular, nonempty, unique, contiguous numbered volumes and stream
+   the complete zstd archive through `tar -t`, then upload up to
    four volume artifacts; the next stage downloads them with
-   `actions/download-artifact@v4` (`merge-multiple: true`, sorted part order)
+   `actions/download-artifact@v4` (`merge-multiple: true`, numeric volume order)
    and resumes.
+
+Both same-run and selected Mac checkpoint restores use
+`build/posix/restore-snapshot.sh`. Volume order depends on `.001`, `.002`, etc.,
+never on upload slot directory names: round-robin slots contain `.001/.005`,
+`.002/.006`, etc. Restores stage extraction before publishing, preserving the
+separately restored root `download_cache`. Publication uses checked directory
+renames with rollback on failure; replacing an existing tree is not a single
+atomic swap. If rollback itself fails, the staging path is reported and retained
+for recovery rather than deleting the original data.
 
 Compile failures fail the job immediately. Insufficient preparation/compile
 budget and timeout exit 124 save an unfinished checkpoint. Earlier stages hand

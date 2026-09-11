@@ -100,12 +100,8 @@ if [ -n "$FROM_SNAPSHOT" ] && [ ! -d "$FROM_SNAPSHOT" ] && [ "$STAGE_INDEX" -gt 
   die "resume snapshot directory does not exist: $FROM_SNAPSHOT"
 fi
 if [ -n "$FROM_SNAPSHOT" ] && [ -d "$FROM_SNAPSHOT" ]; then
-  command -v zstd >/dev/null 2>&1 || die "zstd is required to restore a POSIX build snapshot"
-  find "$FROM_SNAPSHOT" -name 'tree.tar.zst*' -print -quit | grep -q . ||
-    die "snapshot has no tree archive: $FROM_SNAPSHOT"
-  find "$FROM_SNAPSHOT" -name 'tree.tar.zst*' -print0 | sort -z |
-    xargs -0 cat | zstd -d -T0 | tar -xpf - -C "$WORK"
-  rm -rf "$FROM_SNAPSHOT"
+  bash "$REPO/build/posix/restore-snapshot.sh" "$FROM_SNAPSHOT" "$WORK" ||
+    die "POSIX build snapshot restore failed"
 fi
 
 # Cache opt-in is mandatory in CI; helper APIs still report optional misses.

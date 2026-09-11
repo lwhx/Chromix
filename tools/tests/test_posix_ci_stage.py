@@ -72,6 +72,13 @@ class PosixRequiredCacheTest(FullCacheFixture, unittest.TestCase):
         self.env.pop("CHROMIX_RESERVE_MINUTES", None)
         self.stage = self.repo / "build/posix/ci-stage.sh"
         self.put(self.stage, (REPO / "build/posix/ci-stage.sh").read_bytes())
+        # The stage now delegates snapshot extraction to the shared helper;
+        # mirror the production tool layout in this isolated fixture.
+        for relative in ("build/posix/restore-snapshot.sh",
+                         "tools/restore_posix_snapshot.py",
+                         "tools/snapshot_volumes.py",
+                         "tools/download_posix_snapshot.py"):
+            self.put(self.repo / relative, (REPO / relative).read_bytes())
         self.put(self.repo / "build/posix/fetch-upstream-cache.sh",
                  '#!/bin/sh\nprintf "fetch\\n" >> "$CALL_LOG"\n'
                  'printf "%s\\n" "$CHROMIX_CACHE_TIMEOUT_SECONDS" > "$CALL_LOG.timeout"\n'
