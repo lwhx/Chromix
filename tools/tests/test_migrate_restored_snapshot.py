@@ -1,4 +1,4 @@
-"""Small restored Mac snapshots exercise real receipt validation and GNU patch."""
+"""Small restored POSIX snapshots exercise real receipt validation and GNU patch."""
 from __future__ import annotations
 
 import hashlib
@@ -21,6 +21,11 @@ ROOT = Path(__file__).resolve().parents[2]
 PATCH_BIN = shutil.which("gpatch") or shutil.which("patch")
 pytestmark = pytest.mark.skipif(PATCH_BIN is None or shutil.which("git") is None,
                                 reason="host GNU patch and Git are required")
+
+
+@pytest.fixture(params=["macos", "linux"], autouse=True)
+def platform_fixture(request, monkeypatch):
+    monkeypatch.setattr(Fixture, "platform", request.param)
 
 
 def put(root, name, data):
@@ -73,27 +78,39 @@ def commit(root):
 
 
 class Fixture:
+    platform = "macos"
+
     def __init__(self, root, arch="x64"):
         self.previous, self.repo, self.work = (root / name for name in ("previous", "current", "work"))
         self.src = self.work / "src"
         self.core = self.work / "tooling/ungoogled-chromium"
-        self.tooling = self.work / "tooling/ungoogled-chromium-macos"
+        platform_name = ("ungoogled-chromium-macos" if self.platform == "macos"
+                         else "ungoogled-chromium-portablelinux")
+        self.tooling = self.work / "tooling" / platform_name
         self.arch = arch
         put(self.core, "domain_regex.list", rb"example\.com#blocked.test" + b"\n")
         put(self.core, "domain_substitution.list", "listed.txt\nlite.txt\n")
         put(self.core, "utils/domain_substitution.py", "raise RuntimeError('do not execute')\n")
         put(self.tooling, "retrieve_and_unpack_resource.py", "raise RuntimeError('do not execute')\n")
-        core_commit, platform_commit = commit(self.core), commit(self.tooling)
+        core_commit = commit(self.core)
+        commit(self.tooling)
+        git(self.tooling, "update-index", "--add", "--cacheinfo",
+            f"160000,{core_commit},ungoogled-chromium")
+        git(self.tooling, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "-c", "core.hooksPath=" + os.devnull, "commit", "-qm", "pin core submodule")
+        platform_commit = git(self.tooling, "rev-parse", "HEAD").decode().strip()
         for repo in (self.previous, self.repo):
             for name in (*migration.PIN_FILES, *migration.SCRIPT_FILES):
                 put(repo, name, (ROOT / name).read_bytes())
             pins = (repo / migration.PIN_FILES[1]).read_text()
             pins = pins.replace("e71b91c6e336d0f25cfc6b9ef09298a9d2506e24", core_commit)
-            pins = pins.replace("038db2b41f7aeb00bbceb2f5a56912b26eb5b284", platform_commit)
+            old_platform_commit = ("038db2b41f7aeb00bbceb2f5a56912b26eb5b284" if self.platform == "macos"
+                                   else "02c59ed68d1963a647bb478064823d114e466ffb")
+            pins = pins.replace(old_platform_commit, platform_commit)
             put(repo, migration.PIN_FILES[1], pins)
             manifest = json.loads((repo / migration.PIN_FILES[2]).read_bytes())
             manifest["ungoogled_commit"] = core_commit
-            manifest["sources"]["macos"]["head_sha"] = platform_commit
+            manifest["sources"][self.platform]["head_sha"] = platform_commit
             put(repo, migration.PIN_FILES[2], json.dumps(manifest))
             series(repo, patch())
         put(self.src, "listed.txt", "base blocked.test\n")
@@ -109,27 +126,27 @@ class Fixture:
         self.receipt()
 
     def receipt(self):
-        identity, _, manifest = restore.identities(self.previous, "macos", self.arch)
+        identity, _, manifest = restore.identities(self.previous, self.platform, self.arch)
         put(self.src, restore.MARKER, arp._json({
             "schema_version": 1, "owner": restore.OWNER, "status": "restored",
             "extraction_scope": restore.fetcher.SOURCE_SCOPE, "identity": identity,
-            "manifest": manifest, "platform": "macos", "arch": self.arch,
+            "manifest": manifest, "platform": self.platform, "arch": self.arch,
             "original_args": restore.source_args(self.src, identity), "external_symlink_paths": [],
         }))
 
     def prepare(self):
-        arp.run_apply(self.src, self.previous, self.core, self.tooling, "macos", PATCH_BIN)
-        put(self.src, migration.READY, migration.source_ready_key(self.previous, "macos", self.arch) + "\n")
+        arp.run_apply(self.src, self.previous, self.core, self.tooling, self.platform, PATCH_BIN)
+        put(self.src, migration.READY, migration.source_ready_key(self.previous, self.platform, self.arch) + "\n")
 
     def run(self, **kwargs):
-        return migration.migrate(self.work, self.previous, self.repo, "macos", self.arch,
+        return migration.migrate(self.work, self.previous, self.repo, self.platform, self.arch,
                                  patch_bin=PATCH_BIN, **kwargs)
 
     def check(self):
-        assert arp.run_apply(self.src, self.repo, self.core, self.tooling, "macos", PATCH_BIN,
+        assert arp.run_apply(self.src, self.repo, self.core, self.tooling, self.platform, PATCH_BIN,
                              check=True)["status"] == "checked"
         assert (self.src / migration.READY).read_text().strip() == migration.source_ready_key(
-            self.repo, "macos", self.arch)
+            self.repo, self.platform, self.arch)
         assert not (self.src / migration.TRANSACTION).exists()
         assert not (self.src / arp.IN_PROGRESS).exists()
 
@@ -327,7 +344,10 @@ def test_key_matches_shell_hash_recipe_without_executing_previous_scripts(tmp_pa
         if path.is_file():
             digest.update(str(path.relative_to(fx.previous)).encode())
             digest.update(path.read_bytes())
-    assert migration.source_ready_key(fx.previous, "macos", "x64").split("|")[-1] == digest.hexdigest()
+    assert migration.source_ready_key(fx.previous, fx.platform, fx.arch) == "|".join((
+        fx.platform, fx.arch, (fx.previous / "CHROMIUM_VERSION").read_text().strip(),
+        git(fx.core, "rev-parse", "HEAD").decode().strip(),
+        git(fx.tooling, "rev-parse", "HEAD").decode().strip(), digest.hexdigest()))
 
 
 def test_only_host_git_and_patch_execute_and_staging_is_external(tmp_path, monkeypatch):
@@ -362,7 +382,7 @@ def test_rejects_donor_patch_executable_before_execution(tmp_path, location):
     program.chmod(0o755)
     before = snapshot(fx.src)
     with pytest.raises(arp.ApplyError, match="donor code"):
-        migration.migrate(fx.work, fx.previous, fx.repo, "macos", "x64", patch_bin=str(program))
+        migration.migrate(fx.work, fx.previous, fx.repo, fx.platform, fx.arch, patch_bin=str(program))
     assert snapshot(fx.src) == before
 
 
@@ -372,7 +392,7 @@ def test_cli_requires_explicit_arguments_and_runs_migration(tmp_path):
     series(fx.repo, patch(new="current example.com"))
     result = subprocess.run([sys.executable, migration.__file__, "--workdir", str(fx.work),
                              "--previous-repo", str(fx.previous), "--repo", str(fx.repo),
-                             "--platform", "macos", "--arch", fx.arch, "--patch-bin", PATCH_BIN],
+                             "--platform", fx.platform, "--arch", fx.arch, "--patch-bin", PATCH_BIN],
                             text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["changed_files"] == ["listed.txt"]
@@ -403,15 +423,38 @@ def test_create_followed_by_modify_reverses_and_preserves_identical_output(tmp_p
     fx.check()
 
 
+def test_wrong_core_submodule_pin_is_rejected_before_writes(tmp_path):
+    fx = Fixture(tmp_path)
+    old = git(fx.tooling, "rev-parse", "HEAD").decode().strip()
+    git(fx.tooling, "update-index", "--cacheinfo", "160000," + "1" * 40 + ",ungoogled-chromium")
+    git(fx.tooling, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+        "-c", "core.hooksPath=" + os.devnull, "commit", "-qm", "wrong core pin")
+    new = git(fx.tooling, "rev-parse", "HEAD").decode().strip()
+    for repo in (fx.previous, fx.repo):
+        for name in ("build/ungoogled-revisions.psd1", "build/upstream-cache.json"):
+            put(repo, name, (repo / name).read_text().replace(old, new))
+    fx.receipt()
+    fx.prepare()
+    before = snapshot(fx.src)
+    with pytest.raises(arp.ApplyError, match="unsupported pinned tooling entry"):
+        fx.run()
+    assert snapshot(fx.src) == before
+
+
 def test_pinned_tooling_never_runs_configured_git_filters(tmp_path):
     fx = Fixture(tmp_path)
     sentinel = tmp_path / "executed"
     put(fx.core, ".gitattributes", "*.list filter=evil diff=evil\n")
     old = git(fx.core, "rev-parse", "HEAD").decode().strip()
     new = commit(fx.core)
+    old_platform = git(fx.tooling, "rev-parse", "HEAD").decode().strip()
+    git(fx.tooling, "update-index", "--cacheinfo", f"160000,{new},ungoogled-chromium")
+    git(fx.tooling, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+        "-c", "core.hooksPath=" + os.devnull, "commit", "-qm", "update core pin")
+    new_platform = git(fx.tooling, "rev-parse", "HEAD").decode().strip()
     for repo in (fx.previous, fx.repo):
         for name in ("build/ungoogled-revisions.psd1", "build/upstream-cache.json"):
-            put(repo, name, (repo / name).read_text().replace(old, new))
+            put(repo, name, (repo / name).read_text().replace(old, new).replace(old_platform, new_platform))
     for key in ("filter.evil.clean", "diff.evil.command", "diff.evil.textconv", "core.fsmonitor"):
         git(fx.core, "config", key, f"touch {sentinel}; exit 1")
     fx.receipt()

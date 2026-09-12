@@ -256,7 +256,7 @@ DOWNLOAD_STEP = """      - name: Download tree from previous stage
           path: ${{ runner.temp }}/chromix-restore
 """
 
-RESUME_STEPS = """      - name: Validate selected Mac checkpoint
+RESUME_STEPS = """      - name: Validate selected POSIX checkpoint
         id: resume
         if: inputs.resume_run_id != ''
         env:
@@ -269,9 +269,8 @@ RESUME_STEPS = """      - name: Validate selected Mac checkpoint
           CACHE_REQUIRED: ${{ inputs.use_upstream_cache }}
         run: |
           set -euo pipefail
-          test "$BUILD_PLATFORM" = macos
           test "$CACHE_REQUIRED" = true
-          python3 tools/validate_posix_snapshot.py --arch '${{ inputs.arch }}' \\
+          python3 tools/validate_posix_snapshot.py --platform "$BUILD_PLATFORM" --arch '${{ inputs.arch }}' \\
             --report "${RUNNER_TEMP}/chromix-logs/snapshot-origin.json"
       - name: Check out checkpoint patch definitions
         if: inputs.resume_run_id != ''
@@ -280,7 +279,7 @@ RESUME_STEPS = """      - name: Validate selected Mac checkpoint
           ref: ${{ steps.resume.outputs.head_sha }}
           path: .chromix-previous-repo
           persist-credentials: false
-      - name: Download selected Mac checkpoint
+      - name: Download selected POSIX checkpoint
         if: inputs.resume_run_id != ''
         env:
           GH_TOKEN: ${{ github.token }}
@@ -289,7 +288,7 @@ RESUME_STEPS = """      - name: Validate selected Mac checkpoint
             --manifest "${RUNNER_TEMP}/chromix-logs/snapshot-origin.json" \\
             --destination "${RUNNER_TEMP}/chromix-restore" \\
             --report "${RUNNER_TEMP}/chromix-logs/snapshot-download.json"
-      - name: Restore and migrate selected Mac checkpoint
+      - name: Restore and migrate selected POSIX checkpoint
         if: inputs.resume_run_id != ''
         run: |
           set -euo pipefail
@@ -299,7 +298,7 @@ RESUME_STEPS = """      - name: Validate selected Mac checkpoint
           bash build/posix/restore-snapshot.sh "$RESTORE" "$WORK"
           python3 tools/migrate_restored_snapshot.py --workdir "$WORK" \\
             --previous-repo "$GITHUB_WORKSPACE/.chromix-previous-repo" \\
-            --repo "$GITHUB_WORKSPACE" --platform macos --arch '${{ inputs.arch }}' \\
+            --repo "$GITHUB_WORKSPACE" --platform '${{ inputs.platform }}' --arch '${{ inputs.arch }}' \\
             2>&1 | tee "${RUNNER_TEMP}/chromix-logs/snapshot-migration.log"
 """
 

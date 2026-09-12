@@ -203,7 +203,7 @@ jobs:
       - name: Verify complete Mac SDK contents
         if: runner.os == 'macOS' && inputs.use_upstream_cache
         run: python3 tools/inspect_macos_sdk.py --report "${RUNNER_TEMP}/chromix-logs/sdk-content.json"
-      - name: Validate selected Mac checkpoint
+      - name: Validate selected POSIX checkpoint
         id: resume
         if: inputs.resume_run_id != ''
         env:
@@ -216,9 +216,8 @@ jobs:
           CACHE_REQUIRED: ${{ inputs.use_upstream_cache }}
         run: |
           set -euo pipefail
-          test "$BUILD_PLATFORM" = macos
           test "$CACHE_REQUIRED" = true
-          python3 tools/validate_posix_snapshot.py --arch '${{ inputs.arch }}' \
+          python3 tools/validate_posix_snapshot.py --platform "$BUILD_PLATFORM" --arch '${{ inputs.arch }}' \
             --report "${RUNNER_TEMP}/chromix-logs/snapshot-origin.json"
       - name: Check out checkpoint patch definitions
         if: inputs.resume_run_id != ''
@@ -227,7 +226,7 @@ jobs:
           ref: ${{ steps.resume.outputs.head_sha }}
           path: .chromix-previous-repo
           persist-credentials: false
-      - name: Download selected Mac checkpoint
+      - name: Download selected POSIX checkpoint
         if: inputs.resume_run_id != ''
         env:
           GH_TOKEN: ${{ github.token }}
@@ -236,7 +235,7 @@ jobs:
             --manifest "${RUNNER_TEMP}/chromix-logs/snapshot-origin.json" \
             --destination "${RUNNER_TEMP}/chromix-restore" \
             --report "${RUNNER_TEMP}/chromix-logs/snapshot-download.json"
-      - name: Restore and migrate selected Mac checkpoint
+      - name: Restore and migrate selected POSIX checkpoint
         if: inputs.resume_run_id != ''
         run: |
           set -euo pipefail
@@ -246,7 +245,7 @@ jobs:
           bash build/posix/restore-snapshot.sh "$RESTORE" "$WORK"
           python3 tools/migrate_restored_snapshot.py --workdir "$WORK" \
             --previous-repo "$GITHUB_WORKSPACE/.chromix-previous-repo" \
-            --repo "$GITHUB_WORKSPACE" --platform macos --arch '${{ inputs.arch }}' \
+            --repo "$GITHUB_WORKSPACE" --platform '${{ inputs.platform }}' --arch '${{ inputs.arch }}' \
             2>&1 | tee "${RUNNER_TEMP}/chromix-logs/snapshot-migration.log"
       # The pinned download cache is deliberately outside the tree snapshot;
       # re-warm it first so a resumed preparation does not redownload archives.

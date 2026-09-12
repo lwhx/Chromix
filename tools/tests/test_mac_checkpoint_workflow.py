@@ -1,4 +1,4 @@
-"""Mac cross-run checkpoints must migrate before normal build verification."""
+"""POSIX cross-run checkpoints must migrate before normal build verification."""
 import os
 from pathlib import Path
 import shutil
@@ -15,15 +15,15 @@ def workflow(name):
     return yaml.safe_load((REPO / '.github/workflows' / name).read_text())
 
 
-class MacCheckpointWorkflowTest(unittest.TestCase):
-    def test_only_mac_entries_expose_checkpoint_selection(self):
+class PosixCheckpointWorkflowTest(unittest.TestCase):
+    def test_supported_entries_expose_checkpoint_selection(self):
         for platform in ('macos', 'linux'):
             for arch in ('x64', 'arm64'):
                 entry = workflow(f'build-{platform}-{arch}.yml')
                 events = entry.get('on', entry.get(True))
                 inputs = events['workflow_dispatch']['inputs']
                 for field, default in (('resume_run_id', ''), ('resume_tree_stage', '7'), ('resume_attempt', '1'), ('resume_artifact_ids', '')):
-                    if platform == 'macos':
+                    if (platform, arch) in (('macos', 'x64'), ('macos', 'arm64'), ('linux', 'arm64')):
                         self.assertEqual(inputs[field]['type'], 'string')
                         self.assertEqual(inputs[field]['default'], default)
                         self.assertIn(f'inputs.{field}', entry['jobs']['build']['with'][field])
@@ -35,8 +35,8 @@ class MacCheckpointWorkflowTest(unittest.TestCase):
         stages = workflow('build-posix-github.yml')['jobs']
         steps = stages['posix-1']['steps']
         names = {step.get('name'): step for step in steps}
-        ordered = ['Validate selected Mac checkpoint', 'Check out checkpoint patch definitions',
-                   'Download selected Mac checkpoint', 'Restore and migrate selected Mac checkpoint', 'Run stage 1']
+        ordered = ['Validate selected POSIX checkpoint', 'Check out checkpoint patch definitions',
+                   'Download selected POSIX checkpoint', 'Restore and migrate selected POSIX checkpoint', 'Run stage 1']
         self.assertEqual(sorted(ordered, key=lambda name: steps.index(names[name])), ordered)
         for name in ordered[:-1]:
             self.assertEqual(names[name]['if'], "inputs.resume_run_id != ''")
@@ -54,7 +54,8 @@ class MacCheckpointWorkflowTest(unittest.TestCase):
         self.assertEqual(validate['env']['GH_TOKEN'], '${{ github.token }}')
         self.assertNotIn('UPSTREAM_ACTIONS_TOKEN', str(validate) + str(download))
         self.assertEqual(validate['env']['SNAPSHOT_ATTEMPT'], '${{ inputs.resume_attempt }}')
-        self.assertIn('test "$BUILD_PLATFORM" = macos', validate['run'])
+        self.assertIn('--platform "$BUILD_PLATFORM"', validate['run'])
+        self.assertNotIn('test "$BUILD_PLATFORM" = macos', validate['run'])
         self.assertIn('test "$CACHE_REQUIRED" = true', validate['run'])
         migrate = names[ordered[3]]['run']
         self.assertIn('set -euo pipefail', migrate)
@@ -94,7 +95,7 @@ class MacCheckpointWorkflowTest(unittest.TestCase):
             self.assertEqual(inspect['if'], "runner.os == 'macOS' && inputs.use_upstream_cache")
             self.assertIn('inspect_macos_sdk.py', inspect['run'])
             for step in steps:
-                if step.get('uses') == 'actions/download-artifact@v4' or step.get('name') == 'Download selected Mac checkpoint':
+                if step.get('uses') == 'actions/download-artifact@v4' or step.get('name') == 'Download selected POSIX checkpoint':
                     self.assertLess(steps.index(inspect), steps.index(step))
 
     def test_build_only_manual_repairs_do_not_trigger_automatic_release(self):
@@ -110,7 +111,7 @@ class MacCheckpointWorkflowTest(unittest.TestCase):
         if not shutil.which('zstd'):
             self.skipTest('zstd unavailable')
         steps = workflow('build-posix-github.yml')['jobs']['posix-1']['steps']
-        script = next(step['run'] for step in steps if step.get('name') == 'Restore and migrate selected Mac checkpoint')
+        script = next(step['run'] for step in steps if step.get('name') == 'Restore and migrate selected POSIX checkpoint')
         script = script.split('python3 tools/migrate_restored_snapshot.py')[0]
         compressed = subprocess.check_output(['zstd', '-q', '-c'], input=b'restore fixture' * 1024)
         with tempfile.TemporaryDirectory() as temp:

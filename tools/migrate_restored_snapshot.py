@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Explicitly migrate a verified, already-patched restored Mac source snapshot.
+"""Explicitly migrate a verified, already-patched restored POSIX source snapshot.
 
 The caller must authenticate previous-repo's exact original head_sha separately.
 Only current Python helpers and trusted host Git/GNU patch are executed. Interrupted
@@ -33,6 +33,10 @@ TRANSACTION = ".chromix-domain-substitution-in-progress"
 PIN_FILES = ("CHROMIUM_VERSION", "build/ungoogled-revisions.psd1", "build/upstream-cache.json")
 SCRIPT_FILES = ("build/prepare-ungoogled.sh", "build/apply-patches.sh",
                 "tools/apply_restored_patches.py")
+PLATFORM_TOOLING = {
+    "linux": ("ungoogled-chromium-portablelinux", "UngoogledLinuxCommit"),
+    "macos": ("ungoogled-chromium-macos", "UngoogledMacOSCommit"),
+}
 
 
 def _same_inputs(previous: Path, repo: Path) -> None:
@@ -62,7 +66,7 @@ def source_ready_key(repo: Path, platform: str, arch: str) -> str:
         digest.update(name.encode())
         digest.update(arp._read(repo, name))
     return "|".join((platform, arch, pins["ChromiumVersion"], pins["UngoogledCommit"],
-                     pins["UngoogledMacOSCommit"], digest.hexdigest()))
+                     pins[PLATFORM_TOOLING[platform][1]], digest.hexdigest()))
 
 
 def _host_program(name: str, roots: tuple[Path, ...]) -> str:
@@ -75,7 +79,7 @@ def _host_program(name: str, roots: tuple[Path, ...]) -> str:
     return str(path)
 
 
-def _verify_tooling(work: Path, repo: Path, roots: tuple[Path, ...]) -> None:
+def _verify_tooling(work: Path, repo: Path, roots: tuple[Path, ...], platform: str) -> None:
     """Hash tracked files against pinned Git objects without invoking worktree filters."""
     git = _host_program("git", roots)
     pins = dict(re.findall(r'^\s*(\w+) = "([^"\n]+)"',
@@ -84,8 +88,9 @@ def _verify_tooling(work: Path, repo: Path, roots: tuple[Path, ...]) -> None:
     environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                        GIT_OPTIONAL_LOCKS="0", GIT_NO_REPLACE_OBJECTS="1", GIT_NO_LAZY_FETCH="1",
                        LC_ALL="C")
+    platform_name, platform_pin = PLATFORM_TOOLING[platform]
     for name, commit in (("ungoogled-chromium", pins["UngoogledCommit"]),
-                         ("ungoogled-chromium-macos", pins["UngoogledMacOSCommit"])):
+                         (platform_name, pins[platform_pin])):
         root = restore.local_path(work / "tooling" / name)
         command = [git, "--no-pager", "-c", "core.fsmonitor=false", "-c",
                    "core.hooksPath=" + os.devnull, "-C", str(root)]
@@ -107,7 +112,7 @@ def _verify_tooling(work: Path, repo: Path, roots: tuple[Path, ...]) -> None:
             metadata, filename = entry.split(b"\t", 1)
             mode, kind, digest = metadata.decode().split()
             filename = filename.decode("utf-8")
-            if (name == "ungoogled-chromium-macos" and filename == "ungoogled-chromium"
+            if (name == platform_name and filename == "ungoogled-chromium"
                     and (mode, kind, digest) == ("160000", "commit", pins["UngoogledCommit"])):
                 continue
             if kind != "blob" or mode not in ("100644", "100755"):
@@ -185,12 +190,12 @@ def _unchanged(src: Path, before: dict) -> None:
 def migrate(workdir: Path | str, previous_repo: Path | str, repo: Path | str,
             platform: str, arch: str, *, patch_bin: str | None = None) -> dict:
     """Verify, stage, and publish only net source changes, retaining Ninja state."""
-    if platform != "macos" or arch not in ("x64", "arm64"):
-        raise arp.ApplyError("migration supports only macos x64/arm64")
+    if platform not in PLATFORM_TOOLING or arch not in ("x64", "arm64"):
+        raise arp.ApplyError("migration supports only linux/macos x64/arm64")
     work, previous, repo = (restore.local_path(p) for p in (workdir, previous_repo, repo))
     src = restore.local_path(work / "src")
     core = restore.local_path(work / "tooling/ungoogled-chromium")
-    tooling = restore.local_path(work / "tooling/ungoogled-chromium-macos")
+    tooling = restore.local_path(work / "tooling" / PLATFORM_TOOLING[platform][0])
     roots = (work, previous, repo)
     for root in (*roots, src, core, tooling):
         if not root.is_dir():
@@ -205,7 +210,7 @@ def migrate(workdir: Path | str, previous_repo: Path | str, repo: Path | str,
     receipt = restore.verify_restored(work, platform, arch, repo=repo)
     if old_receipt != receipt:
         raise arp.ApplyError("restore receipt changed during validation")
-    _verify_tooling(work, repo, roots)
+    _verify_tooling(work, repo, roots, platform)
     old_identity, old_patches, old_lite = arp._load(previous, core, tooling, platform)
     identity, patches, lite = arp._load(repo, core, tooling, platform)
     if old_identity["lite"] != identity["lite"] or old_lite != lite:
@@ -251,7 +256,7 @@ def migrate(workdir: Path | str, previous_repo: Path | str, repo: Path | str,
         arp.run_apply(stage, repo, core, tooling, platform, program, check=True)
         after = arp._snapshot(stage, old_names | names)
         _same_inputs(previous, repo)
-        _verify_tooling(work, repo, roots)
+        _verify_tooling(work, repo, roots, platform)
         if (arp._load(previous, core, tooling, platform) != (old_identity, old_patches, old_lite)
                 or arp._load(repo, core, tooling, platform) != (identity, patches, lite)
                 or source_ready_key(previous, platform, arch) != old_key
@@ -290,7 +295,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     for flag in ("workdir", "previous-repo", "repo"):
         parser.add_argument("--" + flag, type=Path, required=True)
-    parser.add_argument("--platform", choices=("macos",), required=True)
+    parser.add_argument("--platform", choices=("linux", "macos"), required=True)
     parser.add_argument("--arch", choices=("x64", "arm64"), required=True)
     parser.add_argument("--patch-bin", help="trusted host GNU patch (otherwise PATCH_BIN/gpatch/patch)")
     args = parser.parse_args(argv)

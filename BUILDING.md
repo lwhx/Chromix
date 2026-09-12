@@ -283,9 +283,9 @@ gh workflow run build-linux-x64.yml --ref main \
 The same inputs apply to `build-linux-arm64.yml`, `build-macos-x64.yml` and
 `build-macos-arm64.yml`. The Windows snapshot is not portable to those targets.
 
-### Resume a Mac checkpoint on current code
+### Resume a POSIX checkpoint on current code
 
-Mac entrypoints additionally accept `resume_run_id`, `resume_tree_stage` (1–8),
+Mac entrypoints and the Linux ARM64 entrypoint additionally accept `resume_run_id`, `resume_tree_stage` (1–8),
 `resume_attempt`, and `resume_artifact_ids` (the complete recorded artifact ID
 set). Select the exact attempt that **uploaded** all parts, not
 necessarily the latest run attempt. For example:
@@ -299,6 +299,11 @@ gh workflow run build-macos-x64.yml --ref main \
 gh workflow run build-macos-arm64.yml --ref main \
   -f resume_run_id=34329648981 -f resume_tree_stage=7 -f resume_attempt=1 \
   -f resume_artifact_ids=10162582694,10162583992 \
+  -f use_upstream_cache=true -f build_profile=fast -f build_mode=staged -f compile_jobs=auto
+
+gh workflow run build-linux-arm64.yml --ref main \
+  -f resume_run_id=34603635882 -f resume_tree_stage=2 -f resume_attempt=1 \
+  -f resume_artifact_ids=10284610558 \
   -f use_upstream_cache=true -f build_profile=fast -f build_mode=staged -f compile_jobs=auto
 ```
 
@@ -497,7 +502,7 @@ uploads. Setup and snapshot download time therefore reduce the remaining budget:
    `actions/download-artifact@v4` (`merge-multiple: true`, numeric volume order)
    and resumes.
 
-Both same-run and selected Mac checkpoint restores use
+Both same-run and selected POSIX checkpoint restores use
 `build/posix/restore-snapshot.sh`. Volume order depends on `.001`, `.002`, etc.,
 never on upload slot directory names: round-robin slots contain `.001/.005`,
 `.002/.006`, etc. Restores stage extraction before publishing, preserving the
@@ -512,7 +517,7 @@ off successfully; the final allowed stage fails **after** packing and setting th
 upload marker. Snapshot verification/upload steps run after this failure unless
 the job is cancelled, while final bundle upload still requires completion. Failed
 packing emits no upload marker. A saved terminal checkpoint can be selected in a
-new Mac run without throwing away that last stage's compilation progress.
+new Mac or Linux ARM64 run without throwing away that last stage's compilation progress.
 The POSIX stage scripts stay compatible with the system `/bin/bash` 3.2 that
 runs GitHub's macOS workflow steps (no nested quoted command substitution
 inside `$(( ))`, no bare GNU `timeout`/`split` - both resolve through a

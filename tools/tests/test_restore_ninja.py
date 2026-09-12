@@ -446,6 +446,8 @@ class RestoreNinjaShellTest(unittest.TestCase):
     @unittest.skipUnless(PWSH.exists(), "PowerShell required")
     def test_powershell_selection_blocks_stop_on_failure_and_use_path_with_spaces(self):
         (self.src / ".chromix-upstream-restored.json").touch()
+        # Native Node execution is covered by test_windows_node.py.
+        (self.root / "configure-node.ps1").write_text('param($NodePath)\n')
         for name in ("build", "ci-stage"):
             source = (REPO / f"build/windows/{name}.ps1").read_text()
             start = source.index('$Ninja = Join-Path $Src "third_party\\ninja\\ninja.exe"')
@@ -523,6 +525,8 @@ class DirectWindowsRestoredBuildTest(unittest.TestCase):
             destination = repo / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REPO / relative, destination)
+        # Native Node execution is covered by test_windows_node.py.
+        put(repo / "build/windows/configure-node.ps1", 'param($NodePath)\n')
         put(repo / "build/args.windows.gn", "symbol_level = 0\n")
         for directory, name in (("ungoogled-chromium", "flags.gn"), ("ungoogled-chromium-windows", "flags.windows.gn")):
             put(work / "tooling" / directory / name, "symbol_level = 1\n")
