@@ -27,7 +27,7 @@ index c6f066cce474..b3d904850ec0 100644
 +    }                                                                         \
 +    if ((limitName == "minUniformBufferOffsetAlignment" ||                    \
 +         limitName == "minStorageBufferOffsetAlignment") &&                   \
-+        !std::has_single_bit(value.ValueOrDie())) {                            \
++        !std::has_single_bit(static_cast<T>(value.ValueOrDie()))) {           \
 +      resolver->RejectWithDOMException(                                       \
 +          DOMExceptionCode::kOperationError,                                  \
 +          "Required " #name " limit must be a power of two.");                \

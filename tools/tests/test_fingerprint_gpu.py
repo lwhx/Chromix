@@ -180,7 +180,8 @@ def test_limits_constructor_is_native_for_adapter_and_device(patched_sources):
     assert "static_cast<decltype(limits_.name)>" not in source
     assert "base::CheckedNumeric<T> value{limitRawIntegerValue}" in source
     assert "value.ValueOrDie() == UndefinedLimitValue<T>()" in source
-    assert source.index("limitRawValue->IsUndefined()") < source.index("std::has_single_bit")
+    assert source.index("limitRawValue->IsUndefined()") < source.index(
+        "std::has_single_bit(static_cast<T>(value.ValueOrDie()))")
 
 
 @pytest.fixture(scope="module")
@@ -871,10 +872,23 @@ std::vector<std::string> SplitString(const std::string& raw, const char*, int, i
   }
   return out;
 }
+namespace base::numerics_internal {
+template <typename T> class StrictNumeric {
+ public:
+  constexpr StrictNumeric(T value) : value_(value) {}
+  constexpr operator T() const { return value_; }
+
+ private:
+  T value_;
+};
+}
 template <typename T> struct CheckedNumeric {
   uint64_t value;
   bool IsValid() const { return value <= std::numeric_limits<T>::max(); }
-  T ValueOrDie() const { assert(IsValid()); return static_cast<T>(value); }
+  base::numerics_internal::StrictNumeric<T> ValueOrDie() const {
+    assert(IsValid());
+    return static_cast<T>(value);
+  }
 };
 }
 template <typename T, typename... Args> T* MakeGarbageCollected(Args&&... args) {
