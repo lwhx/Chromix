@@ -23,13 +23,9 @@ class PosixCheckpointWorkflowTest(unittest.TestCase):
                 events = entry.get('on', entry.get(True))
                 inputs = events['workflow_dispatch']['inputs']
                 for field, default in (('resume_run_id', ''), ('resume_tree_stage', '7'), ('resume_attempt', '1'), ('resume_artifact_ids', '')):
-                    if (platform, arch) in (('macos', 'x64'), ('macos', 'arm64'), ('linux', 'arm64')):
-                        self.assertEqual(inputs[field]['type'], 'string')
-                        self.assertEqual(inputs[field]['default'], default)
-                        self.assertIn(f'inputs.{field}', entry['jobs']['build']['with'][field])
-                    else:
-                        self.assertNotIn(field, inputs)
-                        self.assertNotIn(field, entry['jobs']['build']['with'])
+                    self.assertEqual(inputs[field]['type'], 'string')
+                    self.assertEqual(inputs[field]['default'], default)
+                    self.assertIn(f'inputs.{field}', entry['jobs']['build']['with'][field])
 
     def test_donor_validation_precedes_exact_checkout_download_and_migration(self):
         stages = workflow('build-posix-github.yml')['jobs']

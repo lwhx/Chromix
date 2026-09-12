@@ -12,19 +12,19 @@ SHA = 'a' * 40
 
 
 class Client:
-    def __init__(self, platform='macos'):
+    def __init__(self, platform='macos', arch='arm64'):
         self.platform = platform
-        self.run = {'id': 123, 'name': f'build-{platform}-arm64',
-                    'path': f'.github/workflows/build-{platform}-arm64.yml',
+        self.run = {'id': 123, 'name': f'build-{platform}-{arch}',
+                    'path': f'.github/workflows/build-{platform}-{arch}.yml',
                     'head_branch': 'main', 'event': 'workflow_dispatch',
                     'repository': {'full_name': REPO}, 'head_repository': {'full_name': REPO},
                     'status': 'completed', 'head_sha': SHA, 'run_attempt': 2}
-        self.jobs = [{'id': 456, 'name': f'build / {platform}-arm64 stage 7 (resume compile)',
+        self.jobs = [{'id': 456, 'name': f'build / {platform}-{arch} stage 7 (resume compile)',
                       'status': 'completed', 'conclusion': 'success', 'steps': [
                           {'name': 'Verify handoff snapshot', 'conclusion': 'success'},
                           *[{'name': f'Upload tree part {n}', 'conclusion': 'success'} for n in range(1, 5)]]}]
         artifact_platform = 'mac' if platform == 'macos' else platform
-        self.artifacts = [{'id': 100 + n, 'name': f'chromix-{artifact_platform}-arm64-tree-s7-attempt-1-part{n}',
+        self.artifacts = [{'id': 100 + n, 'name': f'chromix-{artifact_platform}-{arch}-tree-s7-attempt-1-part{n}',
                            'size_in_bytes': 1024, 'expired': False, 'digest': 'sha256:' + 'b' * 64,
                            'workflow_run': {'id': 123, 'head_sha': SHA}} for n in (1, 2)]
         self.calls = []
@@ -61,6 +61,15 @@ class SnapshotValidationTest(unittest.TestCase):
         self.assertEqual(report['pattern'], 'chromix-linux-arm64-tree-s7-attempt-1-part*')
         self.assertEqual(report['job_id'], 456)
         self.assertEqual([item['id'] for item in report['artifacts']], [101, 102])
+
+    def test_linux_x64_snapshot_cannot_be_used_for_arm64(self):
+        client = Client(platform='linux', arch='x64')
+        report = snapshot.validate(client, REPO, 123, 7, 1, 'x64', [101, 102], platform='linux')
+        self.assertEqual(report['workflow'], 'build-linux-x64')
+        self.assertEqual(report['arch'], 'x64')
+        self.assertEqual(report['pattern'], 'chromix-linux-x64-tree-s7-attempt-1-part*')
+        with self.assertRaisesRegex(ValueError, 'identity'):
+            self.validate_linux(client)
 
     def test_wrong_origin_platform_or_unfinished_run_rejected(self):
         for key, value in {'id': 456, 'name': 'build-macos-x64', 'head_branch': 'feature',
